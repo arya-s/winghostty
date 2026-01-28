@@ -9,6 +9,7 @@ pub const canvas_mod = @import("sprite/canvas.zig");
 pub const Canvas = canvas_mod.Canvas;
 pub const Color = canvas_mod.Color;
 pub const box = @import("sprite/draw/box.zig");
+pub const braille = @import("sprite/draw/braille.zig");
 pub const common = @import("sprite/draw/common.zig");
 
 /// Metrics needed for sprite rendering
@@ -21,6 +22,8 @@ pub fn isSprite(codepoint: u32) bool {
         0x2500...0x257F => true,
         // Block elements (U+2580 - U+259F)
         0x2580...0x259F => true,
+        // Braille patterns (U+2800 - U+28FF)
+        0x2800...0x28FF => true,
         // Powerline symbols
         0xE0B0...0xE0B3 => true,
         else => false,
@@ -63,6 +66,7 @@ pub fn renderSprite(
     switch (codepoint) {
         0x2500...0x257F => try box.draw(codepoint, &canvas, metrics),
         0x2580...0x259F => drawBlockElement(codepoint, &canvas, metrics),
+        0x2800...0x28FF => braille.draw(codepoint, &canvas, metrics),
         0xE0B0...0xE0B3 => try drawPowerline(codepoint, &canvas, metrics),
         else => return null,
     }
