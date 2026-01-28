@@ -460,8 +460,24 @@ fn preloadCharacters(face: freetype.Face) void {
 
     // Calculate cell dimensions FIRST from font metrics (like Ghostty)
     // This must happen before loading sprites so they use correct dimensions
-    if (loadGlyph('M')) |m_char| {
-        cell_width = @floatFromInt(@as(i64, @intCast(m_char.advance)) >> 6);
+    //
+    // Cell width is the maximum advance of all visible ASCII characters (like Ghostty)
+    // This ensures proper spacing for monospace fonts
+    {
+        var max_advance: f64 = 0;
+        var ascii_char: u8 = ' ';
+        while (ascii_char < 127) : (ascii_char += 1) {
+            if (loadGlyph(ascii_char)) |char| {
+                const advance = @as(f64, @floatFromInt(char.advance)) / 64.0; // 26.6 fixed point
+                max_advance = @max(max_advance, advance);
+            }
+        }
+        if (max_advance > 0) {
+            cell_width = @floatCast(max_advance);
+        }
+    }
+
+    if (loadGlyph('M')) |_| {
 
         // Get metrics like Ghostty does - from font tables with fallback to FreeType
         const size_metrics = face.handle.*.size.*.metrics;
