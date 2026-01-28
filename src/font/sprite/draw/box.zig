@@ -207,47 +207,107 @@ fn linesChar(metrics: Metrics, canvas: *Canvas, lines: Lines) void {
     const v_double_left: i32 = v_light_left - light_px;
     const v_double_right: i32 = v_light_right + light_px;
 
-    // Draw left segment (from left edge toward center, overlapping center)
-    switch (lines.left) {
-        .none => {},
-        .light => canvas.box(0, h_light_top, v_light_right, h_light_bottom, .on),
-        .heavy => canvas.box(0, h_heavy_top, v_heavy_right, h_heavy_bottom, .on),
-        .double => {
-            canvas.box(0, h_double_top, v_light_right, h_double_top + light_px, .on);
-            canvas.box(0, h_double_bottom - light_px, v_light_right, h_double_bottom, .on);
-        },
-    }
+    // Calculate where vertical lines should stop based on horizontal connections
+    // This handles corners properly for double lines (like Ghostty)
+    const up_bottom: i32 = if (lines.left == .heavy or lines.right == .heavy)
+        h_heavy_bottom
+    else if (lines.left != lines.right or lines.down == lines.up)
+        if (lines.left == .double or lines.right == .double)
+            h_double_bottom
+        else
+            h_light_bottom
+    else if (lines.left == .none and lines.right == .none)
+        h_light_bottom
+    else
+        h_light_top;
 
-    // Draw right segment (from center toward right edge, overlapping center)
-    switch (lines.right) {
-        .none => {},
-        .light => canvas.box(v_light_left, h_light_top, w, h_light_bottom, .on),
-        .heavy => canvas.box(v_heavy_left, h_heavy_top, w, h_heavy_bottom, .on),
-        .double => {
-            canvas.box(v_light_left, h_double_top, w, h_double_top + light_px, .on);
-            canvas.box(v_light_left, h_double_bottom - light_px, w, h_double_bottom, .on);
-        },
-    }
+    const down_top: i32 = if (lines.left == .heavy or lines.right == .heavy)
+        h_heavy_top
+    else if (lines.left != lines.right or lines.up == lines.down)
+        if (lines.left == .double or lines.right == .double)
+            h_double_top
+        else
+            h_light_top
+    else if (lines.left == .none and lines.right == .none)
+        h_light_top
+    else
+        h_light_bottom;
 
-    // Draw up segment (from top edge toward center, overlapping center)
+    // Calculate where horizontal lines should stop based on vertical connections
+    const left_right: i32 = if (lines.up == .heavy or lines.down == .heavy)
+        v_heavy_right
+    else if (lines.up != lines.down or lines.left == lines.right)
+        if (lines.up == .double or lines.down == .double)
+            v_double_right
+        else
+            v_light_right
+    else if (lines.up == .none and lines.down == .none)
+        v_light_right
+    else
+        v_light_left;
+
+    const right_left: i32 = if (lines.up == .heavy or lines.down == .heavy)
+        v_heavy_left
+    else if (lines.up != lines.down or lines.right == lines.left)
+        if (lines.up == .double or lines.down == .double)
+            v_double_left
+        else
+            v_light_left
+    else if (lines.up == .none and lines.down == .none)
+        v_light_left
+    else
+        v_light_right;
+
+    // Draw up segment
     switch (lines.up) {
         .none => {},
-        .light => canvas.box(v_light_left, 0, v_light_right, h_light_bottom, .on),
-        .heavy => canvas.box(v_heavy_left, 0, v_heavy_right, h_heavy_bottom, .on),
+        .light => canvas.box(v_light_left, 0, v_light_right, up_bottom, .on),
+        .heavy => canvas.box(v_heavy_left, 0, v_heavy_right, up_bottom, .on),
         .double => {
-            canvas.box(v_double_left, 0, v_double_left + light_px, h_light_bottom, .on);
-            canvas.box(v_double_right - light_px, 0, v_double_right, h_light_bottom, .on);
+            // For double lines at corners, each line stops at the inner edge
+            const left_bottom = if (lines.left == .double) h_light_top else up_bottom;
+            const right_bottom = if (lines.right == .double) h_light_top else up_bottom;
+            canvas.box(v_double_left, 0, v_double_left + light_px, left_bottom, .on);
+            canvas.box(v_double_right - light_px, 0, v_double_right, right_bottom, .on);
         },
     }
 
-    // Draw down segment (from center toward bottom edge, overlapping center)
+    // Draw down segment
     switch (lines.down) {
         .none => {},
-        .light => canvas.box(v_light_left, h_light_top, v_light_right, h, .on),
-        .heavy => canvas.box(v_heavy_left, h_heavy_top, v_heavy_right, h, .on),
+        .light => canvas.box(v_light_left, down_top, v_light_right, h, .on),
+        .heavy => canvas.box(v_heavy_left, down_top, v_heavy_right, h, .on),
         .double => {
-            canvas.box(v_double_left, h_light_top, v_double_left + light_px, h, .on);
-            canvas.box(v_double_right - light_px, h_light_top, v_double_right, h, .on);
+            const left_top = if (lines.left == .double) h_light_bottom else down_top;
+            const right_top = if (lines.right == .double) h_light_bottom else down_top;
+            canvas.box(v_double_left, left_top, v_double_left + light_px, h, .on);
+            canvas.box(v_double_right - light_px, right_top, v_double_right, h, .on);
+        },
+    }
+
+    // Draw left segment
+    switch (lines.left) {
+        .none => {},
+        .light => canvas.box(0, h_light_top, left_right, h_light_bottom, .on),
+        .heavy => canvas.box(0, h_heavy_top, left_right, h_heavy_bottom, .on),
+        .double => {
+            const top_right = if (lines.up == .double) v_light_left else left_right;
+            const bottom_right = if (lines.down == .double) v_light_left else left_right;
+            canvas.box(0, h_double_top, top_right, h_double_top + light_px, .on);
+            canvas.box(0, h_double_bottom - light_px, bottom_right, h_double_bottom, .on);
+        },
+    }
+
+    // Draw right segment
+    switch (lines.right) {
+        .none => {},
+        .light => canvas.box(right_left, h_light_top, w, h_light_bottom, .on),
+        .heavy => canvas.box(right_left, h_heavy_top, w, h_heavy_bottom, .on),
+        .double => {
+            const top_left = if (lines.up == .double) v_light_right else right_left;
+            const bottom_left = if (lines.down == .double) v_light_right else right_left;
+            canvas.box(top_left, h_double_top, w, h_double_top + light_px, .on);
+            canvas.box(bottom_left, h_double_bottom - light_px, w, h_double_bottom, .on);
         },
     }
 }

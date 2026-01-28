@@ -133,6 +133,7 @@ var cell_width: f32 = 10;
 var cell_height: f32 = 20;
 var cell_baseline: f32 = 4; // Distance from bottom of cell to baseline
 var cursor_height: f32 = 16; // Height of cursor (ascender portion)
+var box_thickness: u32 = 1; // Thickness for box drawing characters
 var window_focused: bool = true; // Track window focus state
 
 // Font fallback system
@@ -369,7 +370,7 @@ fn loadSpriteGlyph(codepoint: u32, alloc: std.mem.Allocator) ?Character {
     const metrics = sprite.Metrics{
         .cell_width = @intFromFloat(cell_width),
         .cell_height = @intFromFloat(cell_height),
-        .box_thickness = @max(1, @as(u32, @intFromFloat(cell_width / 8.0))),
+        .box_thickness = box_thickness,
     };
 
     var result = sprite.renderSprite(alloc, codepoint, metrics) catch return null;
@@ -588,8 +589,21 @@ fn preloadCharacters(face: freetype.Face) void {
         // Cursor height is the ascender
         cursor_height = @floatCast(@round(ascent));
 
-        std.debug.print("Cell dimensions: {d:.0}x{d:.0} (ascent={d:.1}, descent={d:.1}, line_gap={d:.1}, baseline={d:.0})\n", .{
-            cell_width, cell_height, ascent, descent, line_gap, cell_baseline,
+        // Get underline thickness from post table for box drawing (like Ghostty)
+        const underline_thickness: f64 = ul_thick: {
+            if (face.getSfntTable(.post)) |post| {
+                if (post.underlineThickness != 0) {
+                    break :ul_thick @as(f64, @floatFromInt(post.underlineThickness)) * px_per_unit;
+                }
+            }
+            // Fallback: use a reasonable default based on cell height
+            break :ul_thick @max(1.0, @round(cell_height / 16.0));
+        };
+        // Use ceiling like Ghostty
+        box_thickness = @max(1, @as(u32, @intFromFloat(@ceil(underline_thickness))));
+
+        std.debug.print("Cell dimensions: {d:.0}x{d:.0} (ascent={d:.1}, descent={d:.1}, line_gap={d:.1}, baseline={d:.0}, box_thick={})\n", .{
+            cell_width, cell_height, ascent, descent, line_gap, cell_baseline, box_thickness,
         });
     } else {
         std.debug.print("ERROR: Could not load 'M' glyph!\n", .{});
