@@ -714,7 +714,24 @@ fn renderTerminal(terminal: *ghostty_vt.Terminal, window_height: f32, offset_x: 
             if (cell_data) |cd| {
                 const cell = cd.cell;
 
-                // Get style if available
+                // Check for background-only cells (used by erase operations like \e[K)
+                // These cells have no text but store a background color directly
+                switch (cell.content_tag) {
+                    .bg_color_palette => {
+                        bg_color = indexToRgb(cell.content.color_palette);
+                    },
+                    .bg_color_rgb => {
+                        const rgb = cell.content.color_rgb;
+                        bg_color = .{
+                            @as(f32, @floatFromInt(rgb.r)) / 255.0,
+                            @as(f32, @floatFromInt(rgb.g)) / 255.0,
+                            @as(f32, @floatFromInt(rgb.b)) / 255.0,
+                        };
+                    },
+                    else => {},
+                }
+
+                // Get style if available (for text cells with styling)
                 if (cell.hasStyling()) {
                     const style = cd.node.data.styles.get(
                         cd.node.data.memory,
@@ -730,7 +747,7 @@ fn renderTerminal(terminal: *ghostty_vt.Terminal, window_height: f32, offset_x: 
                             @as(f32, @floatFromInt(rgb.b)) / 255.0,
                         },
                     }
-                    // Background color
+                    // Background color from style (overrides bg-only cell color)
                     switch (style.bg_color) {
                         .none => {},
                         .palette => |idx| bg_color = indexToRgb(idx),
