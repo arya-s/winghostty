@@ -1,0 +1,34 @@
+.{
+    .name = .phantty,
+    .version = "0.1.0",
+    .fingerprint = 0x3b92d6b5a730cbd9,
+    .minimum_zig_version = "0.15.2",
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "pkg",
+        "vendor",
+    },
+
+    .dependencies = .{
+        .ghostty = .{
+            .url = "https://github.com/ghostty-org/ghostty/archive/main.tar.gz",
+            .hash = "12203f18dfe2932affd09af3dff0abef664e947a3ae40cb218f33ad6b5954f8072ca",
+        },
+        .glfw = .{
+            .url = "https://github.com/Games-by-Mason/glfw-zig/archive/refs/heads/main.tar.gz",
+            .hash = "1220a831fd939efac62e3aa746c600c0dcef6a53a968ce73b517f72b4d94be8ea40a",
+        },
+        .z2d = .{
+            .url = "https://github.com/vancluever/z2d/archive/refs/tags/v0.10.0.tar.gz",
+            .hash = "z2d-0.10.0-j5P_Hu-6FgBsZNgwphIqh17jDnj8_yPtD8yzjO6PpHRQ",
+        },
+        .freetype = .{ .path = "pkg/freetype" },
+        .opengl = .{ .path = "pkg/opengl" },
+        .zlib = .{ .path = "pkg/zlib" },
+        .libpng = .{ .path = "pkg/libpng" },
+        .@"apple-sdk" = .{ .path = "pkg/apple-sdk" },
+    },
+}
