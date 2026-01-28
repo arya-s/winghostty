@@ -105,7 +105,8 @@ var g_click_x: f64 = 0; // X position of initial click (for threshold calculatio
 var g_click_y: f64 = 0; // Y position of initial click
 
 // Embed the font
-const font_data = @embedFile("fonts/JetBrainsMono-Regular.ttf");
+// Embedded fallback font (JetBrains Mono, like Ghostty)
+const embedded = @import("font/embedded.zig");
 
 // Terminal dimensions (initial, will be updated on resize)
 var term_cols: u16 = 80;
@@ -1353,18 +1354,11 @@ pub fn main() !void {
     g_ft_lib = ft_lib;
     defer g_ft_lib = null;
 
-    // Try to find the font using DirectWrite, fall back to embedded font
-    const FontSource = union(enum) {
-        system: directwrite.FontDiscovery.FontResult,
-        embedded: void,
-    };
-    var font_source: FontSource = .embedded;
-
     std.debug.print("Requested font: {s} (weight: {})\n", .{ requested_font, @intFromEnum(requested_weight) });
 
     // Initialize DirectWrite for font discovery (keep alive for fallback lookups)
     var dw_discovery: ?directwrite.FontDiscovery = directwrite.FontDiscovery.init() catch |err| blk: {
-        std.debug.print("DirectWrite init failed: {}, fallback fonts disabled\n", .{err});
+        std.debug.print("DirectWrite init failed: {}\n", .{err});
         break :blk null;
     };
     defer if (dw_discovery) |*dw| dw.deinit();
@@ -1382,44 +1376,34 @@ pub fn main() !void {
         g_fallback_faces.deinit(allocator);
     }
 
-    // Try to find the requested font
+    // Try to find the requested font via DirectWrite
+    var font_result: ?directwrite.FontDiscovery.FontResult = null;
+
     if (dw_discovery) |*dw| {
-        if (dw.findFontFilePath(
-            allocator,
-            requested_font,
-            requested_weight,
-            .NORMAL, // italic style
-        )) |maybe_result| {
-            if (maybe_result) |result| {
-                font_source = .{ .system = result };
-                std.debug.print("Found system font: {s}\n", .{result.path});
-            } else {
-                std.debug.print("Font '{s}' not found on system, using embedded font\n", .{requested_font});
-            }
-        } else |err| {
-            std.debug.print("Font discovery failed: {}, using embedded font\n", .{err});
+        if (dw.findFontFilePath(allocator, requested_font, requested_weight, .NORMAL) catch null) |result| {
+            font_result = result;
+            std.debug.print("Found system font: {s}\n", .{result.path});
+        } else {
+            std.debug.print("Font '{s}' not found, will use embedded fallback\n", .{requested_font});
         }
     }
-    defer if (font_source == .system) {
-        var s = font_source.system;
-        s.deinit();
-    };
+
+    defer if (font_result) |*fr| fr.deinit();
 
     // Load the font with FreeType
     const face: freetype.Face = blk: {
-        switch (font_source) {
-            .system => |info| {
-                if (ft_lib.initFace(info.path, @intCast(info.face_index))) |f| {
-                    break :blk f;
-                } else |err| {
-                    std.debug.print("Failed to load system font: {}, falling back to embedded\n", .{err});
-                    // Fall through to embedded
-                }
-            },
-            .embedded => {},
+        // Try system font first
+        if (font_result) |fr| {
+            if (ft_lib.initFace(fr.path, @intCast(fr.face_index))) |f| {
+                break :blk f;
+            } else |err| {
+                std.debug.print("Failed to load system font: {}, using embedded fallback\n", .{err});
+            }
         }
-        // Load embedded font (either as fallback or primary)
-        break :blk ft_lib.initMemoryFace(font_data, 0) catch |err| {
+        
+        // Fall back to embedded JetBrains Mono
+        std.debug.print("Using embedded JetBrains Mono as fallback\n", .{});
+        break :blk ft_lib.initMemoryFace(embedded.regular, 0) catch |err| {
             std.debug.print("Failed to load embedded font: {}\n", .{err});
             return err;
         };

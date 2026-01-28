@@ -23,11 +23,16 @@ zig build
 phantty.exe [options]
 
 Options:
-  --font <name>           Set font (default: Consolas)
+  --font, -f <name>       Set font (default: JetBrains Mono)
+  --font-style <style>    Font weight (default: semi-bold)
+                          Options: thin, extra-light, light, regular, medium,
+                                   semi-bold, bold, extra-bold, black
   --list-fonts            List available system fonts
   --test-font-discovery   Test DirectWrite font discovery
   --help                  Show help
 ```
+
+If the requested font is not found, Phantty will try fallback fonts (Consolas, Courier New, Lucida Console).
 
 ## License
 
