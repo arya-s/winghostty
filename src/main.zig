@@ -1200,6 +1200,7 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     var requested_font: []const u8 = "JetBrains Mono"; // default
+    var requested_weight: directwrite.DWRITE_FONT_WEIGHT = .SEMI_BOLD; // default to SemiBold
 
     var i: usize = 1; // skip program name
     while (i < args.len) : (i += 1) {
@@ -1222,6 +1223,38 @@ pub fn main() !void {
                 return;
             }
         }
+        if (std.mem.eql(u8, arg, "--font-style")) {
+            i += 1;
+            if (i < args.len) {
+                const style = args[i];
+                if (std.mem.eql(u8, style, "thin")) {
+                    requested_weight = .THIN;
+                } else if (std.mem.eql(u8, style, "extra-light") or std.mem.eql(u8, style, "extralight")) {
+                    requested_weight = .EXTRA_LIGHT;
+                } else if (std.mem.eql(u8, style, "light")) {
+                    requested_weight = .LIGHT;
+                } else if (std.mem.eql(u8, style, "regular") or std.mem.eql(u8, style, "normal")) {
+                    requested_weight = .NORMAL;
+                } else if (std.mem.eql(u8, style, "medium")) {
+                    requested_weight = .MEDIUM;
+                } else if (std.mem.eql(u8, style, "semi-bold") or std.mem.eql(u8, style, "semibold")) {
+                    requested_weight = .SEMI_BOLD;
+                } else if (std.mem.eql(u8, style, "bold")) {
+                    requested_weight = .BOLD;
+                } else if (std.mem.eql(u8, style, "extra-bold") or std.mem.eql(u8, style, "extrabold")) {
+                    requested_weight = .EXTRA_BOLD;
+                } else if (std.mem.eql(u8, style, "black") or std.mem.eql(u8, style, "heavy")) {
+                    requested_weight = .BLACK;
+                } else {
+                    std.debug.print("Unknown font style: {s}\n", .{style});
+                    std.debug.print("Valid styles: thin, extra-light, light, regular, medium, semi-bold, bold, extra-bold, black\n", .{});
+                    return;
+                }
+            } else {
+                std.debug.print("Error: --font-style requires a style argument\n", .{});
+                return;
+            }
+        }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             std.debug.print(
                 \\Phantty - A terminal emulator
@@ -1230,13 +1263,17 @@ pub fn main() !void {
                 \\
                 \\Options:
                 \\  --font, -f <name>       Use specified font (default: "JetBrains Mono")
+                \\  --font-style <style>    Font weight/style (default: "semi-bold")
+                \\                          Options: thin, extra-light, light, regular, medium,
+                \\                                   semi-bold, bold, extra-bold, black
                 \\  --list-fonts            List all available system fonts
                 \\  --test-font-discovery   Test font discovery for common fonts
                 \\  --help, -h              Show this help message
                 \\
                 \\Examples:
                 \\  phantty --font "Cascadia Code"
-                \\  phantty -f Consolas
+                \\  phantty --font "JetBrains Mono" --font-style bold
+                \\  phantty -f Consolas --font-style regular
                 \\  phantty --list-fonts
                 \\
             , .{});
@@ -1323,7 +1360,7 @@ pub fn main() !void {
     };
     var font_source: FontSource = .embedded;
 
-    std.debug.print("Requested font: {s}\n", .{requested_font});
+    std.debug.print("Requested font: {s} (weight: {})\n", .{ requested_font, @intFromEnum(requested_weight) });
 
     // Initialize DirectWrite for font discovery (keep alive for fallback lookups)
     var dw_discovery: ?directwrite.FontDiscovery = directwrite.FontDiscovery.init() catch |err| blk: {
@@ -1350,8 +1387,8 @@ pub fn main() !void {
         if (dw.findFontFilePath(
             allocator,
             requested_font,
-            .NORMAL, // weight
-            .NORMAL, // style
+            requested_weight,
+            .NORMAL, // italic style
         )) |maybe_result| {
             if (maybe_result) |result| {
                 font_source = .{ .system = result };
