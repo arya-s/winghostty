@@ -105,6 +105,10 @@ pub fn draw(cp: u32, canvas: *Canvas, metrics: Metrics) void {
         y_px_left -= 4;
     }
 
+    // Center the pattern by adding half of remaining pixels to margins
+    x_margin += @divFloor(x_px_left, 2);
+    y_margin += @divFloor(y_px_left, 2);
+
     // Calculate positions for the 2 columns
     const x = [2]i32{ x_margin, x_margin + w + x_spacing };
 

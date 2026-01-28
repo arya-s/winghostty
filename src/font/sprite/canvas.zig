@@ -84,6 +84,12 @@ pub const Canvas = struct {
     padding_x: u32,
     padding_y: u32,
 
+    /// Clipping bounds (set by trim())
+    clip_top: u32 = 0,
+    clip_bottom: u32 = 0,
+    clip_left: u32 = 0,
+    clip_right: u32 = 0,
+
     alloc: Allocator,
 
     pub fn init(
@@ -130,6 +136,60 @@ pub const Canvas = struct {
 
     pub fn getSurfaceHeight(self: *const Canvas) u32 {
         return @intCast(self.sfc.getHeight());
+    }
+
+    /// Trim empty rows/columns from the canvas bounds.
+    /// This finds the actual bounding box of drawn content.
+    /// Used by Ghostty to calculate proper glyph offsets.
+    pub fn trim(self: *Canvas) void {
+        const surf_width: u32 = @intCast(self.sfc.getWidth());
+        const surf_height: u32 = @intCast(self.sfc.getHeight());
+
+        const buf = std.mem.sliceAsBytes(self.sfc.image_surface_alpha8.buf);
+
+        // Trim from top
+        top: while (self.clip_top < surf_height - self.clip_bottom) {
+            const y = self.clip_top;
+            const x0 = self.clip_left;
+            const x1 = surf_width - self.clip_right;
+            for (buf[y * surf_width ..][x0..x1]) |v| {
+                if (v != 0) break :top;
+            }
+            self.clip_top += 1;
+        }
+
+        // Trim from bottom
+        bottom: while (self.clip_bottom < surf_height - self.clip_top) {
+            const y = surf_height - self.clip_bottom -| 1;
+            const x0 = self.clip_left;
+            const x1 = surf_width - self.clip_right;
+            for (buf[y * surf_width ..][x0..x1]) |v| {
+                if (v != 0) break :bottom;
+            }
+            self.clip_bottom += 1;
+        }
+
+        // Trim from left
+        left: while (self.clip_left < surf_width - self.clip_right) {
+            const x = self.clip_left;
+            const y0 = self.clip_top;
+            const y1 = surf_height - self.clip_bottom;
+            for (y0..y1) |y| {
+                if (buf[y * surf_width + x] != 0) break :left;
+            }
+            self.clip_left += 1;
+        }
+
+        // Trim from right
+        right: while (self.clip_right < surf_width - self.clip_left) {
+            const x = surf_width - self.clip_right -| 1;
+            const y0 = self.clip_top;
+            const y1 = surf_height - self.clip_bottom;
+            for (y0..y1) |y| {
+                if (buf[y * surf_width + x] != 0) break :right;
+            }
+            self.clip_right += 1;
+        }
     }
 
     /// Return a transformation representing the translation for our padding.

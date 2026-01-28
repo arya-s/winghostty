@@ -44,6 +44,16 @@ fn needsPadding(codepoint: u32) bool {
     };
 }
 
+/// Check if a codepoint should skip trimming (use full cell size)
+fn skipTrim(codepoint: u32) bool {
+    return switch (codepoint) {
+        // Braille patterns must all use the same size for consistent positioning
+        // Different patterns have different dots filled, but should align the same
+        0x2800...0x28FF => true,
+        else => false,
+    };
+}
+
 /// Render a sprite to a pixel buffer
 /// Returns the pixel data as grayscale or null if not a sprite
 pub fn renderSprite(
@@ -71,25 +81,52 @@ pub fn renderSprite(
         else => return null,
     }
 
+    // Trim empty rows/columns to find actual content bounds (like Ghostty)
+    // But skip trimming for certain sprites that need consistent sizing (e.g., braille)
+    if (!skipTrim(codepoint)) {
+        canvas.trim();
+    }
+
+    const surface_width = canvas.getSurfaceWidth();
+    const surface_height = canvas.getSurfaceHeight();
+    const region_width = surface_width - canvas.clip_left - canvas.clip_right;
+    const region_height = surface_height - canvas.clip_top - canvas.clip_bottom;
+
     return .{
-        .width = canvas.getSurfaceWidth(),
-        .height = canvas.getSurfaceHeight(),
+        .surface_width = surface_width,
+        .surface_height = surface_height,
+        .width = region_width,
+        .height = region_height,
         .cell_width = metrics.cell_width,
         .cell_height = metrics.cell_height,
         .padding_x = padding_x,
         .padding_y = padding_y,
+        .clip_top = canvas.clip_top,
+        .clip_bottom = canvas.clip_bottom,
+        .clip_left = canvas.clip_left,
+        .clip_right = canvas.clip_right,
         .data = canvas.getPixels(),
         .canvas = canvas,
     };
 }
 
 pub const SpriteResult = struct {
+    /// Full surface dimensions (including padding)
+    surface_width: u32,
+    surface_height: u32,
+    /// Trimmed region dimensions (actual content)
     width: u32,
     height: u32,
     cell_width: u32,
     cell_height: u32,
     padding_x: u32,
     padding_y: u32,
+    /// Clipping bounds from trim()
+    clip_top: u32,
+    clip_bottom: u32,
+    clip_left: u32,
+    clip_right: u32,
+    /// Full pixel data (caller must extract trimmed region)
     data: []const u8,
     canvas: Canvas,
 

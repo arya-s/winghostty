@@ -377,7 +377,22 @@ fn loadSpriteGlyph(codepoint: u32, alloc: std.mem.Allocator) ?Character {
 
     defer result.?.deinit();
 
-    // Create OpenGL texture from sprite data
+    const r = result.?;
+
+    // Extract only the trimmed region for the texture (like Ghostty's writeAtlas)
+    // We need to copy row by row since the trimmed region is smaller than the surface
+    var trimmed_data = alloc.alloc(u8, r.width * r.height) catch return null;
+    defer alloc.free(trimmed_data);
+
+    const src_stride = r.surface_width;
+    for (0..r.height) |y| {
+        const src_y = y + r.clip_top;
+        const src_start = src_y * src_stride + r.clip_left;
+        const dst_start = y * r.width;
+        @memcpy(trimmed_data[dst_start..][0..r.width], r.data[src_start..][0..r.width]);
+    }
+
+    // Create OpenGL texture from trimmed sprite data
     var texture: c.GLuint = 0;
     gl.GenTextures.?(1, &texture);
     gl.BindTexture.?(c.GL_TEXTURE_2D, texture);
@@ -385,37 +400,50 @@ fn loadSpriteGlyph(codepoint: u32, alloc: std.mem.Allocator) ?Character {
         c.GL_TEXTURE_2D,
         0,
         c.GL_RED,
-        @intCast(result.?.width),
-        @intCast(result.?.height),
+        @intCast(r.width),
+        @intCast(r.height),
         0,
         c.GL_RED,
         c.GL_UNSIGNED_BYTE,
-        result.?.data.ptr,
+        trimmed_data.ptr,
     );
     gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
     gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
     gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
     gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
 
-    // Account for padding and position sprites correctly
-    // Sprites should fill the cell, not be offset by baseline like text glyphs
+    // Calculate glyph offsets like Ghostty does:
+    // Ghostty: offset_x = clip_left - padding_x  
+    // Ghostty: offset_y = region.height + clip_bottom - padding_y
+    //
+    // Ghostty's offset_y is the distance from cell BOTTOM to glyph TOP.
     // 
-    // renderChar uses: y0 = y + cell_baseline - (size_y - bearing_y)
-    // For sprites we want the CELL CONTENT to start at y (bottom of cell)
-    // 
-    // For non-padded sprites: y0 = y, so bearing_y = size_y - cell_baseline
-    // For padded sprites: y0 = y - padding_y (content starts at y, but texture extends below)
-    //   so bearing_y = size_y - cell_baseline - padding_y
-    const r = result.?;
-    const sprite_height: i32 = @intCast(r.height);
+    // Our renderChar formula: y0 = y + cell_baseline - (size_y - bearing_y)
+    //                         glyph_top = y0 + size_y = y + cell_baseline + bearing_y
+    //
+    // We want glyph_top = y + offset_y (cell bottom + distance to glyph top)
+    // So: y + cell_baseline + bearing_y = y + offset_y
+    // Thus: bearing_y = offset_y - cell_baseline
+    const offset_x: i32 = @as(i32, @intCast(r.clip_left)) - @as(i32, @intCast(r.padding_x));
+    var offset_y: i32 = @as(i32, @intCast(r.height + r.clip_bottom)) - @as(i32, @intCast(r.padding_y));
     const baseline_i: i32 = @intFromFloat(cell_baseline);
-    const padding_y_i: i32 = @intCast(r.padding_y);
+
+    // For braille (no trim, no padding), offset_y = cell_height, meaning glyph top = cell top.
+    // But braille should sit ON the baseline like text, not fill from cell top.
+    // Experimentally: subtracting full baseline (6) is too low, 0 is too high.
+    // Try half the baseline as a compromise.
+    if (codepoint >= 0x2800 and codepoint <= 0x28FF) {
+        offset_y -= @divFloor(baseline_i, 2);
+    }
+
+    const bearing_y = offset_y - baseline_i;
+
     return Character{
         .texture_id = texture,
         .size_x = @intCast(r.width),
         .size_y = @intCast(r.height),
-        .bearing_x = -@as(i32, @intCast(r.padding_x)),
-        .bearing_y = sprite_height - baseline_i - padding_y_i,
+        .bearing_x = offset_x,
+        .bearing_y = bearing_y,
         .advance = @as(i64, @intCast(r.cell_width)) << 6, // Cell width in 26.6 fixed point
         .valid = true,
     };
