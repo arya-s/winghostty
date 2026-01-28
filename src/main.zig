@@ -139,6 +139,20 @@ var cursor_height: f32 = 16; // Height of cursor (ascender portion)
 var box_thickness: u32 = 1; // Thickness for box drawing characters
 var window_focused: bool = true; // Track window focus state
 
+// Cursor configuration (like Ghostty)
+const CursorStyle = enum {
+    block,
+    bar,
+    underline,
+    block_hollow,
+};
+
+var g_cursor_style: CursorStyle = .block; // Default cursor style
+var g_cursor_blink: bool = true; // Whether cursor should blink (default: true like Ghostty)
+var g_cursor_blink_visible: bool = true; // Current blink state (toggled by timer)
+var g_last_blink_time: i64 = 0; // Timestamp of last blink toggle
+const CURSOR_BLINK_INTERVAL_MS: i64 = 600; // Blink interval in ms (same as Ghostty)
+
 // Font fallback system
 var g_ft_lib: ?freetype.Library = null;
 var g_font_discovery: ?*directwrite.FontDiscovery = null;
@@ -724,6 +738,19 @@ fn renderTerminal(terminal: *ghostty_vt.Terminal, window_height: f32, offset_x: 
     const cursor_y = screen.cursor.y;
     const viewport_at_bottom = screen.pages.viewport == .active;
 
+    // Get terminal-controlled cursor style (set by DECSCUSR escape sequence)
+    // This is what programs like vim use to change cursor shape
+    const terminal_cursor_style: TerminalCursorStyle = switch (screen.cursor.cursor_style) {
+        .bar => .bar,
+        .block => .block,
+        .underline => .underline,
+        .block_hollow => .block_hollow,
+    };
+
+    // Get terminal-controlled cursor blink mode (also set by DECSCUSR)
+    // Steady styles (2, 4, 6) set this to false, blinking styles (1, 3, 5) set it to true
+    const terminal_cursor_blink = terminal.modes.get(.cursor_blinking);
+
     for (0..term_rows) |row_idx| {
         // Row 0 is at the top, so we start from (window_height - offset) and go down
         const y = window_height - offset_y - ((@as(f32, @floatFromInt(row_idx)) + 1) * cell_height);
@@ -796,23 +823,11 @@ fn renderTerminal(terminal: *ghostty_vt.Terminal, window_height: f32, offset_x: 
             // Check if cell is selected
             const is_selected = isCellSelected(col_idx, row_idx);
 
-            // Draw cursor background (fills entire cell like Ghostty)
+            // Draw cursor (with style and blink support like Ghostty)
             if (is_cursor) {
-                if (window_focused) {
-                    // Solid block cursor when focused
-                    renderQuad(x, y, cell_width, cell_height, .{ 0.7, 0.7, 0.7 });
+                const cursor_result = renderCursor(x, y, cell_width, cell_height, terminal_cursor_style, terminal_cursor_blink);
+                if (cursor_result.invert_fg) {
                     fg_color = .{ 0.0, 0.0, 0.0 }; // Black text on cursor
-                } else {
-                    // Hollow cursor when unfocused (like Ghostty)
-                    const thickness: f32 = @max(2.0, @round(cell_width / 8.0) + 1.0);
-                    // Top edge
-                    renderQuad(x, y + cell_height - thickness, cell_width, thickness, .{ 0.7, 0.7, 0.7 });
-                    // Bottom edge
-                    renderQuad(x, y, cell_width, thickness, .{ 0.7, 0.7, 0.7 });
-                    // Left edge
-                    renderQuad(x, y, thickness, cell_height, .{ 0.7, 0.7, 0.7 });
-                    // Right edge
-                    renderQuad(x + cell_width - thickness, y, thickness, cell_height, .{ 0.7, 0.7, 0.7 });
                 }
             } else if (is_selected) {
                 renderQuad(x, y, cell_width, cell_height, .{ 0.3, 0.4, 0.6 }); // Selection blue
@@ -865,9 +880,110 @@ fn renderQuad(x: f32, y: f32, w: f32, h: f32, color: [3]f32) void {
     gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6);
 }
 
+/// Terminal cursor style (matches ghostty's terminal/cursor.zig)
+/// Set by DECSCUSR escape sequence from programs like vim
+const TerminalCursorStyle = enum {
+    bar,
+    block,
+    underline,
+    block_hollow,
+};
+
+/// Render the cursor with style and blink support (like Ghostty)
+/// Returns whether foreground should be inverted (for block cursor)
+/// terminal_style is the style requested by the terminal (via DECSCUSR escape sequence)
+/// terminal_blink is the blink mode from the terminal (set by DECSCUSR steady/blinking variants)
+fn renderCursor(x: f32, y: f32, w: f32, h: f32, terminal_style: TerminalCursorStyle, terminal_blink: bool) struct { invert_fg: bool } {
+    const cursor_color = [3]f32{ 0.7, 0.7, 0.7 };
+    // Cursor thickness defaults to 1 pixel like Ghostty (metrics.cursor_thickness = 1)
+    const cursor_thickness: f32 = 1.0;
+
+    // Determine effective cursor style (like Ghostty's cursor.zig logic)
+    // Priority: unfocused -> blink off -> terminal-controlled style -> configured style
+    const effective_style: CursorStyle = blk: {
+        // If not focused, always show hollow block
+        if (!window_focused) break :blk .block_hollow;
+
+        // Check if cursor should blink:
+        // - terminal_blink: controlled by DECSCUSR (steady vs blinking variants)
+        // - g_cursor_blink: user's --cursor-style-blink setting
+        // Cursor blinks if BOTH are true (terminal wants blink AND user hasn't disabled it)
+        const should_blink = terminal_blink and g_cursor_blink;
+        if (should_blink and !g_cursor_blink_visible) {
+            return .{ .invert_fg = false }; // Don't render cursor (blink off phase)
+        }
+
+        // Use terminal-controlled style (from DECSCUSR escape sequence)
+        // This allows programs like vim to change cursor shape
+        break :blk switch (terminal_style) {
+            .block => .block,
+            .bar => .bar,
+            .underline => .underline,
+            .block_hollow => .block_hollow,
+        };
+    };
+
+    switch (effective_style) {
+        .block => {
+            // Solid filled block
+            renderQuad(x, y, w, h, cursor_color);
+            return .{ .invert_fg = true };
+        },
+        .block_hollow => {
+            // Hollow rectangle - fill then hollow out the inside (like Ghostty)
+            // Draw outer rect
+            renderQuad(x, y, w, h, cursor_color);
+            // Hollow out inside with background color
+            const bg_color = [3]f32{ 0.05, 0.05, 0.08 }; // Match terminal background
+            renderQuad(
+                x + cursor_thickness,
+                y + cursor_thickness,
+                w - cursor_thickness * 2,
+                h - cursor_thickness * 2,
+                bg_color,
+            );
+            return .{ .invert_fg = false };
+        },
+        .bar => {
+            // Vertical bar on left side of cell
+            // Ghostty places bar cursor half thickness over left edge for centering
+            renderQuad(x, y, cursor_thickness, h, cursor_color);
+            return .{ .invert_fg = false };
+        },
+        .underline => {
+            // Horizontal line at bottom of cell
+            renderQuad(x, y, w, cursor_thickness, cursor_color);
+            return .{ .invert_fg = false };
+        },
+    }
+}
+
+/// Update cursor blink state based on time (call once per frame)
+fn updateCursorBlink() void {
+    if (!g_cursor_blink) {
+        g_cursor_blink_visible = true;
+        return;
+    }
+
+    const now = std.time.milliTimestamp();
+    if (now - g_last_blink_time >= CURSOR_BLINK_INTERVAL_MS) {
+        g_cursor_blink_visible = !g_cursor_blink_visible;
+        g_last_blink_time = now;
+    }
+}
+
+/// Reset cursor blink to visible state (call on keypress like Ghostty)
+fn resetCursorBlink() void {
+    g_cursor_blink_visible = true;
+    g_last_blink_time = std.time.milliTimestamp();
+}
+
 // GLFW character callback - handles regular text input
 fn charCallback(_: ?*c.GLFWwindow, codepoint: c_uint) callconv(.c) void {
     if (g_pty) |pty| {
+        // Reset cursor blink on keystroke (like Ghostty)
+        resetCursorBlink();
+
         // Scroll viewport to bottom when typing
         if (g_terminal) |term| {
             term.scrollViewport(.bottom) catch {};
@@ -1122,6 +1238,8 @@ fn keyCallback(_: ?*c.GLFWwindow, key: c_int, _: c_int, action: c_int, mods: c_i
             key == c.GLFW_KEY_LEFT_ALT or key == c.GLFW_KEY_RIGHT_ALT or
             key == c.GLFW_KEY_LEFT_SUPER or key == c.GLFW_KEY_RIGHT_SUPER;
         if (!is_scroll_key and !is_modifier) {
+            // Reset cursor blink on keystroke (like Ghostty)
+            resetCursorBlink();
             if (g_terminal) |term| {
                 term.scrollViewport(.bottom) catch {};
             }
@@ -1256,6 +1374,46 @@ pub fn main() !void {
                 return;
             }
         }
+        if (std.mem.eql(u8, arg, "--cursor-style")) {
+            i += 1;
+            if (i < args.len) {
+                const cursor_style = args[i];
+                if (std.mem.eql(u8, cursor_style, "block")) {
+                    g_cursor_style = .block;
+                } else if (std.mem.eql(u8, cursor_style, "bar")) {
+                    g_cursor_style = .bar;
+                } else if (std.mem.eql(u8, cursor_style, "underline")) {
+                    g_cursor_style = .underline;
+                } else if (std.mem.eql(u8, cursor_style, "block_hollow")) {
+                    g_cursor_style = .block_hollow;
+                } else {
+                    std.debug.print("Unknown cursor style: {s}\n", .{cursor_style});
+                    std.debug.print("Valid styles: block, bar, underline, block_hollow\n", .{});
+                    return;
+                }
+            } else {
+                std.debug.print("Error: --cursor-style requires a style argument\n", .{});
+                return;
+            }
+        }
+        if (std.mem.eql(u8, arg, "--cursor-style-blink")) {
+            i += 1;
+            if (i < args.len) {
+                const blink_val = args[i];
+                if (std.mem.eql(u8, blink_val, "true")) {
+                    g_cursor_blink = true;
+                } else if (std.mem.eql(u8, blink_val, "false")) {
+                    g_cursor_blink = false;
+                } else {
+                    std.debug.print("Invalid value for --cursor-style-blink: {s}\n", .{blink_val});
+                    std.debug.print("Valid values: true, false\n", .{});
+                    return;
+                }
+            } else {
+                std.debug.print("Error: --cursor-style-blink requires a value (true/false)\n", .{});
+                return;
+            }
+        }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             std.debug.print(
                 \\Phantty - A terminal emulator
@@ -1267,6 +1425,9 @@ pub fn main() !void {
                 \\  --font-style <style>    Font weight/style (default: "semi-bold")
                 \\                          Options: thin, extra-light, light, regular, medium,
                 \\                                   semi-bold, bold, extra-bold, black
+                \\  --cursor-style <style>  Cursor shape (default: "block")
+                \\                          Options: block, bar, underline, block_hollow
+                \\  --cursor-style-blink <bool>  Enable cursor blinking (default: true)
                 \\  --list-fonts            List all available system fonts
                 \\  --test-font-discovery   Test font discovery for common fonts
                 \\  --help, -h              Show this help message
@@ -1274,7 +1435,7 @@ pub fn main() !void {
                 \\Examples:
                 \\  phantty --font "Cascadia Code"
                 \\  phantty --font "JetBrains Mono" --font-style bold
-                \\  phantty -f Consolas --font-style regular
+                \\  phantty --cursor-style bar --cursor-style-blink false
                 \\  phantty --list-fonts
                 \\
             , .{});
@@ -1289,6 +1450,17 @@ pub fn main() !void {
     });
     defer terminal.deinit(allocator);
     std.debug.print("Terminal initialized: {}x{}\n", .{ term_cols, term_rows });
+
+    // Set initial cursor style from user config (like Ghostty does in Termio.zig)
+    terminal.screens.active.cursor.cursor_style = switch (g_cursor_style) {
+        .bar => .bar,
+        .block => .block,
+        .underline => .underline,
+        .block_hollow => .block_hollow,
+    };
+
+    // Set initial cursor blink mode (Ghostty defaults to true in Termio.zig:219)
+    terminal.modes.set(.cursor_blinking, g_cursor_blink);
 
     // Spawn PTY with wsl.exe
     const wsl_cmd = std.unicode.utf8ToUtf16LeStringLiteral("wsl.exe");
@@ -1355,6 +1527,7 @@ pub fn main() !void {
     defer g_ft_lib = null;
 
     std.debug.print("Requested font: {s} (weight: {})\n", .{ requested_font, @intFromEnum(requested_weight) });
+    std.debug.print("Cursor style: {s}, blink: {}\n", .{ @tagName(g_cursor_style), g_cursor_blink });
 
     // Initialize DirectWrite for font discovery (keep alive for fallback lookups)
     var dw_discovery: ?directwrite.FontDiscovery = directwrite.FontDiscovery.init() catch |err| blk: {
@@ -1471,6 +1644,9 @@ pub fn main() !void {
 
         gl.ClearColor.?(0.05, 0.05, 0.08, 1.0);
         gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
+
+        // Update cursor blink state
+        updateCursorBlink();
 
         // Render with padding from edges
         renderTerminal(&terminal, @floatFromInt(fb_height), padding, padding);
