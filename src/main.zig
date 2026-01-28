@@ -10,6 +10,11 @@ const c = @cImport({
     @cInclude("GLFW/glfw3.h");
 });
 
+/// Convert FreeType 26.6 fixed-point to f64 (like Ghostty)
+fn f26dot6ToF64(v: anytype) f64 {
+    return @as(f64, @floatFromInt(v)) / 64.0;
+}
+
 // ============================================================================
 // Font Discovery Test Functions (use --list-fonts or --test-font-discovery)
 // ============================================================================
@@ -425,28 +430,122 @@ fn preloadCharacters(face: freetype.Face) void {
 
     std.debug.print("Starting glyph preload, g_allocator set: {}\n", .{g_allocator != null});
 
-    // Calculate cell dimensions FIRST from font metrics
+    // Calculate cell dimensions FIRST from font metrics (like Ghostty)
     // This must happen before loading sprites so they use correct dimensions
     if (loadGlyph('M')) |m_char| {
         cell_width = @floatFromInt(@as(i64, @intCast(m_char.advance)) >> 6);
-        
-        // Get proper line height from FreeType metrics (ascender - descender + line gap)
-        // FreeType stores these in 26.6 fixed point format in the size metrics
+
+        // Get metrics like Ghostty does - from font tables with fallback to FreeType
         const size_metrics = face.handle.*.size.*.metrics;
-        const ascender: f32 = @floatFromInt(size_metrics.ascender >> 6);
-        const descender: f32 = @floatFromInt(size_metrics.descender >> 6); // negative value
-        const ft_height: f32 = @floatFromInt(size_metrics.height >> 6);
-        
-        // Use the font's recommended line height
-        cell_height = ft_height;
-        
-        // Calculate baseline position (from bottom of cell) and cursor height
-        // Baseline is at -descender from bottom, cursor spans from baseline to ascender
-        cell_baseline = -descender;
-        cursor_height = ascender; // Cursor height matches ascender
-        
-        std.debug.print("Cell dimensions: {}x{} (ascender={}, descender={}, baseline={})\n", .{ 
-            cell_width, cell_height, ascender, descender, cell_baseline 
+        const px_per_em: f64 = @floatFromInt(size_metrics.y_ppem);
+
+        // Get units_per_em from head table or FreeType
+        const units_per_em: f64 = blk: {
+            if (face.getSfntTable(.head)) |head| {
+                break :blk @floatFromInt(head.Units_Per_EM);
+            }
+            if (face.handle.*.face_flags & freetype.c.FT_FACE_FLAG_SCALABLE != 0) {
+                break :blk @floatFromInt(face.handle.*.units_per_EM);
+            }
+            break :blk @floatFromInt(size_metrics.y_ppem);
+        };
+        const px_per_unit = px_per_em / units_per_em;
+
+        // Get vertical metrics from font tables (like Ghostty)
+        const ascent: f64, const descent: f64, const line_gap: f64 = vertical_metrics: {
+            const hhea_ = face.getSfntTable(.hhea);
+            const os2_ = face.getSfntTable(.os2);
+
+            // If no hhea table, fall back to FreeType metrics
+            const hhea = hhea_ orelse {
+                const ft_ascender = f26dot6ToF64(size_metrics.ascender);
+                const ft_descender = f26dot6ToF64(size_metrics.descender);
+                const ft_height = f26dot6ToF64(size_metrics.height);
+                break :vertical_metrics .{
+                    ft_ascender,
+                    ft_descender,
+                    ft_height + ft_descender - ft_ascender,
+                };
+            };
+
+            const hhea_ascent: f64 = @floatFromInt(hhea.Ascender);
+            const hhea_descent: f64 = @floatFromInt(hhea.Descender);
+            const hhea_line_gap: f64 = @floatFromInt(hhea.Line_Gap);
+
+            // If no OS/2 table, use hhea metrics
+            const os2 = os2_ orelse break :vertical_metrics .{
+                hhea_ascent * px_per_unit,
+                hhea_descent * px_per_unit,
+                hhea_line_gap * px_per_unit,
+            };
+
+            // Check for invalid OS/2 table
+            if (os2.version == 0xFFFF) break :vertical_metrics .{
+                hhea_ascent * px_per_unit,
+                hhea_descent * px_per_unit,
+                hhea_line_gap * px_per_unit,
+            };
+
+            const os2_ascent: f64 = @floatFromInt(os2.sTypoAscender);
+            const os2_descent: f64 = @floatFromInt(os2.sTypoDescender);
+            const os2_line_gap: f64 = @floatFromInt(os2.sTypoLineGap);
+
+            // If USE_TYPO_METRICS bit is set (bit 7), use OS/2 typo metrics
+            if (os2.fsSelection & (1 << 7) != 0) {
+                break :vertical_metrics .{
+                    os2_ascent * px_per_unit,
+                    os2_descent * px_per_unit,
+                    os2_line_gap * px_per_unit,
+                };
+            }
+
+            // Otherwise prefer hhea if available
+            if (hhea.Ascender != 0 or hhea.Descender != 0) {
+                break :vertical_metrics .{
+                    hhea_ascent * px_per_unit,
+                    hhea_descent * px_per_unit,
+                    hhea_line_gap * px_per_unit,
+                };
+            }
+
+            // Fall back to OS/2 sTypo metrics
+            if (os2_ascent != 0 or os2_descent != 0) {
+                break :vertical_metrics .{
+                    os2_ascent * px_per_unit,
+                    os2_descent * px_per_unit,
+                    os2_line_gap * px_per_unit,
+                };
+            }
+
+            // Last resort: OS/2 usWin metrics
+            const win_ascent: f64 = @floatFromInt(os2.usWinAscent);
+            const win_descent: f64 = @floatFromInt(os2.usWinDescent);
+            break :vertical_metrics .{
+                win_ascent * px_per_unit,
+                -win_descent * px_per_unit, // usWinDescent is positive, flip sign
+                0.0,
+            };
+        };
+
+        // Calculate cell dimensions like Ghostty
+        const face_height = ascent - descent + line_gap;
+        cell_height = @floatCast(@round(face_height));
+
+        // Split line gap in half for top/bottom padding (like Ghostty)
+        const half_line_gap = line_gap / 2.0;
+
+        // Calculate baseline from bottom of cell (like Ghostty)
+        // face_baseline = half_line_gap - descent (descent is negative, so this adds)
+        const face_baseline = half_line_gap - descent;
+        // Center the baseline by accounting for rounding difference
+        const baseline_centered = face_baseline - (cell_height - face_height) / 2.0;
+        cell_baseline = @floatCast(@round(baseline_centered));
+
+        // Cursor height is the ascender
+        cursor_height = @floatCast(@round(ascent));
+
+        std.debug.print("Cell dimensions: {d:.0}x{d:.0} (ascent={d:.1}, descent={d:.1}, line_gap={d:.1}, baseline={d:.0})\n", .{
+            cell_width, cell_height, ascent, descent, line_gap, cell_baseline,
         });
     } else {
         std.debug.print("ERROR: Could not load 'M' glyph!\n", .{});
