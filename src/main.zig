@@ -606,24 +606,24 @@ fn preloadCharacters(face: freetype.Face) void {
 }
 
 fn indexToRgb(color_idx: u8) [3]f32 {
-    // Basic 16 colors (standard terminal colors)
+    // Basic 16 colors matching Ghostty's default palette
     const basic_colors = [16][3]f32{
-        .{ 0.0, 0.0, 0.0 },       // 0: black
-        .{ 0.8, 0.0, 0.0 },       // 1: red
-        .{ 0.0, 0.8, 0.0 },       // 2: green
-        .{ 0.8, 0.8, 0.0 },       // 3: yellow
-        .{ 0.0, 0.0, 0.8 },       // 4: blue
-        .{ 0.8, 0.0, 0.8 },       // 5: magenta
-        .{ 0.0, 0.8, 0.8 },       // 6: cyan
-        .{ 0.75, 0.75, 0.75 },    // 7: white
-        .{ 0.5, 0.5, 0.5 },       // 8: bright black (gray)
-        .{ 1.0, 0.3, 0.3 },       // 9: bright red
-        .{ 0.3, 1.0, 0.3 },       // 10: bright green
-        .{ 1.0, 1.0, 0.3 },       // 11: bright yellow
-        .{ 0.3, 0.3, 1.0 },       // 12: bright blue
-        .{ 1.0, 0.3, 1.0 },       // 13: bright magenta
-        .{ 0.3, 1.0, 1.0 },       // 14: bright cyan
-        .{ 1.0, 1.0, 1.0 },       // 15: bright white
+        .{ @as(f32, 0x1D) / 255.0, @as(f32, 0x1F) / 255.0, @as(f32, 0x21) / 255.0 }, // 0: black
+        .{ @as(f32, 0xCC) / 255.0, @as(f32, 0x66) / 255.0, @as(f32, 0x66) / 255.0 }, // 1: red
+        .{ @as(f32, 0xB5) / 255.0, @as(f32, 0xBD) / 255.0, @as(f32, 0x68) / 255.0 }, // 2: green
+        .{ @as(f32, 0xF0) / 255.0, @as(f32, 0xC6) / 255.0, @as(f32, 0x74) / 255.0 }, // 3: yellow
+        .{ @as(f32, 0x81) / 255.0, @as(f32, 0xA2) / 255.0, @as(f32, 0xBE) / 255.0 }, // 4: blue
+        .{ @as(f32, 0xB2) / 255.0, @as(f32, 0x94) / 255.0, @as(f32, 0xBB) / 255.0 }, // 5: magenta
+        .{ @as(f32, 0x8A) / 255.0, @as(f32, 0xBE) / 255.0, @as(f32, 0xB7) / 255.0 }, // 6: cyan
+        .{ @as(f32, 0xC5) / 255.0, @as(f32, 0xC8) / 255.0, @as(f32, 0xC6) / 255.0 }, // 7: white
+        .{ @as(f32, 0x66) / 255.0, @as(f32, 0x66) / 255.0, @as(f32, 0x66) / 255.0 }, // 8: bright black (gray)
+        .{ @as(f32, 0xD5) / 255.0, @as(f32, 0x4E) / 255.0, @as(f32, 0x53) / 255.0 }, // 9: bright red
+        .{ @as(f32, 0xB9) / 255.0, @as(f32, 0xCA) / 255.0, @as(f32, 0x4A) / 255.0 }, // 10: bright green
+        .{ @as(f32, 0xE7) / 255.0, @as(f32, 0xC5) / 255.0, @as(f32, 0x47) / 255.0 }, // 11: bright yellow
+        .{ @as(f32, 0x7A) / 255.0, @as(f32, 0xA6) / 255.0, @as(f32, 0xDA) / 255.0 }, // 12: bright blue
+        .{ @as(f32, 0xC3) / 255.0, @as(f32, 0x97) / 255.0, @as(f32, 0xD8) / 255.0 }, // 13: bright magenta
+        .{ @as(f32, 0x70) / 255.0, @as(f32, 0xC0) / 255.0, @as(f32, 0xB1) / 255.0 }, // 14: bright cyan
+        .{ @as(f32, 0xEA) / 255.0, @as(f32, 0xEA) / 255.0, @as(f32, 0xEA) / 255.0 }, // 15: bright white
     };
 
     if (color_idx < 16) {
