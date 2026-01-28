@@ -1,9 +1,10 @@
 # Phantty
 
-A Windows terminal emulator written in Zig, inspired by [Ghostty](https://github.com/ghostty-org/ghostty).
+A Windows terminal emulator written in Zig, powered by [libghostty-vt](https://github.com/ghostty-org/ghostty) for terminal emulation.
 
 ## Features
 
+- **Ghostty's terminal emulation** - Uses libghostty-vt for VT parsing and terminal state
 - **DirectWrite font discovery** - Find system fonts by name
 - **FreeType rendering** - High-quality glyph rasterization
 - **Per-glyph font fallback** - Automatic fallback for missing characters
