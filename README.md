@@ -56,7 +56,7 @@ Options:
 
 Phantty uses a Ghostty-compatible config file format (`key = value` pairs). The config file is loaded from `%APPDATA%\phantty\config`.
 
-Run `phantty.exe --show-config-path` to print the resolved path.
+Press `Ctrl+,` to open the config file in your default editor, or run `phantty.exe --show-config-path` to print the resolved path.
 
 CLI flags override config file values (last wins).
 
