@@ -200,11 +200,11 @@ theme: ?[]const u8 = null,
 /// Path to a Ghostty-compatible custom GLSL shader for post-processing.
 @"custom-shader": ?[]const u8 = null,
 
-/// Initial terminal height in cells (min: 4).
-@"window-height": u16 = 28,
+/// Initial terminal height in cells (min: 4, 0 = auto).
+@"window-height": u16 = 0,
 
-/// Initial terminal width in cells (min: 10).
-@"window-width": u16 = 110,
+/// Initial terminal width in cells (min: 10, 0 = auto).
+@"window-width": u16 = 0,
 
 /// Scrollback buffer limit in bytes.
 @"scrollback-limit": u32 = 10_000_000,

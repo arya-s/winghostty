@@ -45,8 +45,8 @@ Options:
                                 Options: block, bar, underline, block_hollow
   --cursor-style-blink <bool>  Enable cursor blinking (default: true)
   --theme <path>               Load a Ghostty theme file
-  --window-height <rows>       Initial window height in cells (default: 28, min: 4)
-  --window-width <cols>        Initial window width in cells (default: 110, min: 10)
+  --window-height <rows>       Initial window height in cells (default: 0=auto, min: 4)
+  --window-width <cols>        Initial window width in cells (default: 0=auto, min: 10)
   --list-fonts                 List available system fonts
   --test-font-discovery        Test DirectWrite font discovery
   --help                       Show help
@@ -87,8 +87,8 @@ config-file = extra.conf
 | `cursor-style-blink` | `true` | Enable cursor blinking |
 | `theme` | *(Poimandres)* | Theme name (from `themes/` directory) or file path |
 | `custom-shader` | *(none)* | Path to a GLSL post-processing shader |
-| `window-height` | `28` | Initial height in cells (min: 4) |
-| `window-width` | `110` | Initial width in cells (min: 10) |
+| `window-height` | `0` (auto) | Initial height in cells (min: 4, 0 = auto 80×24) |
+| `window-width` | `0` (auto) | Initial width in cells (min: 10, 0 = auto 80×24) |
 | `scrollback-limit` | `10000000` | Scrollback buffer limit in bytes |
 | `config-file` | *(none)* | Include another config file (prefix with `?` to make optional) |
 

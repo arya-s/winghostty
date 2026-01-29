@@ -122,8 +122,8 @@ const embedded = @import("font/embedded.zig");
 // Terminal dimensions (initial, will be updated on resize)
 // Defaults match Ghostty's default of 0 (auto-size), but we set
 // reasonable defaults since we don't auto-detect screen size.
-var term_cols: u16 = 110;
-var term_rows: u16 = 28;
+var term_cols: u16 = 80;
+var term_rows: u16 = 24;
 const DEFAULT_FONT_SIZE: u32 = 14;
 
 // OpenGL context from glad
@@ -1669,8 +1669,9 @@ pub fn main() !void {
     g_theme = cfg.resolved_theme;
     g_cursor_style = cfg.@"cursor-style";
     g_cursor_blink = cfg.@"cursor-style-blink";
-    term_cols = cfg.@"window-width";
-    term_rows = cfg.@"window-height";
+    // Apply window size from config (0 = auto, use defaults)
+    if (cfg.@"window-width" > 0) term_cols = cfg.@"window-width";
+    if (cfg.@"window-height" > 0) term_rows = cfg.@"window-height";
 
     const requested_font = cfg.@"font-family";
     const requested_weight = cfg.@"font-style".toDwriteWeight();
