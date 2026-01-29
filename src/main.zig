@@ -238,8 +238,10 @@ var g_click_y: f64 = 0; // Y position of initial click
 const embedded = @import("font/embedded.zig");
 
 // Terminal dimensions (initial, will be updated on resize)
-var term_cols: u16 = 80;
-var term_rows: u16 = 24;
+// Defaults match Ghostty's default of 0 (auto-size), but we set
+// reasonable defaults since we don't auto-detect screen size.
+var term_cols: u16 = 110;
+var term_rows: u16 = 28;
 const FONT_SIZE: u32 = 14;
 
 // OpenGL context from glad
@@ -1560,6 +1562,32 @@ pub fn main() !void {
                 return;
             }
         }
+        if (std.mem.eql(u8, arg, "--window-height")) {
+            i += 1;
+            if (i < args.len) {
+                const val = std.fmt.parseInt(u16, args[i], 10) catch {
+                    std.debug.print("Invalid value for --window-height: {s}\n", .{args[i]});
+                    return;
+                };
+                term_rows = @max(4, val);
+            } else {
+                std.debug.print("Error: --window-height requires a value\n", .{});
+                return;
+            }
+        }
+        if (std.mem.eql(u8, arg, "--window-width")) {
+            i += 1;
+            if (i < args.len) {
+                const val = std.fmt.parseInt(u16, args[i], 10) catch {
+                    std.debug.print("Invalid value for --window-width: {s}\n", .{args[i]});
+                    return;
+                };
+                term_cols = @max(10, val);
+            } else {
+                std.debug.print("Error: --window-width requires a value\n", .{});
+                return;
+            }
+        }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             std.debug.print(
                 \\Phantty - A terminal emulator
@@ -1575,6 +1603,8 @@ pub fn main() !void {
                 \\                          Options: block, bar, underline, block_hollow
                 \\  --cursor-style-blink <bool>  Enable cursor blinking (default: true)
                 \\  --theme <path>          Load a Ghostty theme file
+                \\  --window-height <rows>  Initial window height in cells (default: 28, min: 4)
+                \\  --window-width <cols>   Initial window width in cells (default: 110, min: 10)
                 \\  --list-fonts            List all available system fonts
                 \\  --test-font-discovery   Test font discovery for common fonts
                 \\  --help, -h              Show this help message
@@ -1584,6 +1614,7 @@ pub fn main() !void {
                 \\  phantty --font "JetBrains Mono" --font-style bold
                 \\  phantty --cursor-style bar --cursor-style-blink false
                 \\  phantty --theme ~/poimandres.theme
+                \\  phantty --window-height 40 --window-width 120
                 \\  phantty --list-fonts
                 \\
             , .{});
