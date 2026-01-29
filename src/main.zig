@@ -186,6 +186,8 @@ var g_cursor_blink_visible: bool = true; // Current blink state (toggled by time
 var g_last_blink_time: i64 = 0; // Timestamp of last blink toggle
 const CURSOR_BLINK_INTERVAL_MS: i64 = 600; // Blink interval in ms (same as Ghostty)
 
+const ConfigWatcher = @import("config_watcher.zig");
+
 // Font fallback system
 var g_ft_lib: ?freetype.Library = null;
 var g_font_discovery: ?*directwrite.FontDiscovery = null;
@@ -1227,6 +1229,26 @@ fn updateCursorBlink() void {
     }
 }
 
+/// Check if the config file has changed (via ReadDirectoryChangesW) and reload if so.
+fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void {
+    if (!watcher.hasChanged()) return;
+
+    std.debug.print("Config file changed, reloading...\n", .{});
+
+    const cfg = Config.load(allocator) catch |err| {
+        std.debug.print("Failed to reload config: {}\n", .{err});
+        return;
+    };
+    defer cfg.deinit(allocator);
+
+    // Hot-reload: theme, cursor style, cursor blink
+    g_theme = cfg.resolved_theme;
+    g_cursor_style = cfg.@"cursor-style";
+    g_cursor_blink = cfg.@"cursor-style-blink";
+
+    std.debug.print("Config reloaded successfully\n", .{});
+}
+
 /// Reset cursor blink to visible state (call on keypress like Ghostty)
 fn resetCursorBlink() void {
     g_cursor_blink_visible = true;
@@ -1887,12 +1909,22 @@ pub fn main() !void {
 
     std.debug.print("Ready! Cell size: {d:.1}x{d:.1}\n", .{ cell_width, cell_height });
 
+    // Set up config file watcher (ReadDirectoryChangesW)
+    var config_watcher = ConfigWatcher.init(allocator);
+    if (config_watcher == null) {
+        std.debug.print("Config watcher not available (config directory may not exist)\n", .{});
+    }
+    defer if (config_watcher) |*w| w.deinit();
+
     // Buffer for reading PTY output
     var pty_buffer: [4096]u8 = undefined;
     var stream = terminal.vtStream();
 
     // Main loop
     while (c.glfwWindowShouldClose(window) == 0) {
+        // Check for config file changes
+        if (config_watcher) |*w| checkConfigReload(allocator, w);
+
         // Process pending resize (coalesced, like Ghostty)
         // We wait for RESIZE_COALESCE_MS after last resize event before applying
         if (g_pending_resize) {
