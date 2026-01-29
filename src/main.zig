@@ -10,6 +10,135 @@ const c = @cImport({
     @cInclude("GLFW/glfw3.h");
 });
 
+// ============================================================================
+// Theme System
+// ============================================================================
+
+/// RGB color as floats (0.0-1.0)
+const Color = [3]f32;
+
+/// Theme definition - matches Ghostty's theme file format
+const Theme = struct {
+    // Basic 16-color palette (ANSI colors 0-15)
+    palette: [16]Color,
+    
+    // Semantic colors
+    background: Color,
+    foreground: Color,
+    cursor_color: Color,
+    cursor_text: ?Color, // Text color when under cursor (optional)
+    selection_background: Color,
+    selection_foreground: ?Color, // Optional, if null use inverted fg
+    
+    /// Default Poimandres theme (https://github.com/LucidMach/poimandres-ghostty)
+    pub fn default() Theme {
+        return .{
+            .palette = .{
+                hexToColor(0x1b1e28), // 0: black
+                hexToColor(0xd0679d), // 1: red
+                hexToColor(0x5de4c7), // 2: green
+                hexToColor(0xfffac2), // 3: yellow
+                hexToColor(0x89ddff), // 4: blue
+                hexToColor(0xd2a6ff), // 5: magenta
+                hexToColor(0xadd7ff), // 6: cyan
+                hexToColor(0xffffff), // 7: white
+                hexToColor(0x6c6f93), // 8: bright black
+                hexToColor(0xd0679d), // 9: bright red
+                hexToColor(0x5de4c7), // 10: bright green
+                hexToColor(0xfffac2), // 11: bright yellow
+                hexToColor(0x89ddff), // 12: bright blue
+                hexToColor(0xd2a6ff), // 13: bright magenta
+                hexToColor(0xadd7ff), // 14: bright cyan
+                hexToColor(0xffffff), // 15: bright white
+            },
+            .background = hexToColor(0x1b1e28),
+            .foreground = hexToColor(0xa6accd),
+            .cursor_color = hexToColor(0xe4f0fb),
+            .cursor_text = null,
+            .selection_background = hexToColor(0x2a2e3f),
+            .selection_foreground = hexToColor(0xf8f8f2),
+        };
+    }
+    
+    /// Load a theme from a Ghostty theme file
+    pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Theme {
+        const file = try std.fs.cwd().openFile(path, .{});
+        defer file.close();
+        
+        const content = try file.readToEndAlloc(allocator, 1024 * 1024); // 1MB max
+        defer allocator.free(content);
+        
+        return parseTheme(content);
+    }
+    
+    /// Parse theme content in Ghostty format
+    fn parseTheme(content: []const u8) !Theme {
+        var theme = Theme.default();
+        
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |line| {
+            // Skip empty lines and comments
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0 or trimmed[0] == '#') continue;
+            
+            // Parse "key = value" format
+            if (std.mem.indexOf(u8, trimmed, "=")) |eq_pos| {
+                const key = std.mem.trim(u8, trimmed[0..eq_pos], " \t");
+                const value = std.mem.trim(u8, trimmed[eq_pos + 1 ..], " \t");
+                
+                if (std.mem.eql(u8, key, "palette")) {
+                    // Format: "palette = N=#RRGGBB" or "palette = N=RRGGBB"
+                    if (std.mem.indexOf(u8, value, "=")) |idx_eq| {
+                        const idx_str = value[0..idx_eq];
+                        const color_str = value[idx_eq + 1 ..];
+                        const idx = std.fmt.parseInt(u8, idx_str, 10) catch continue;
+                        if (idx < 16) {
+                            if (parseColor(color_str)) |color| {
+                                theme.palette[idx] = color;
+                            }
+                        }
+                    }
+                } else if (std.mem.eql(u8, key, "background")) {
+                    if (parseColor(value)) |color| theme.background = color;
+                } else if (std.mem.eql(u8, key, "foreground")) {
+                    if (parseColor(value)) |color| theme.foreground = color;
+                } else if (std.mem.eql(u8, key, "cursor-color")) {
+                    if (parseColor(value)) |color| theme.cursor_color = color;
+                } else if (std.mem.eql(u8, key, "cursor-text")) {
+                    if (parseColor(value)) |color| theme.cursor_text = color;
+                } else if (std.mem.eql(u8, key, "selection-background")) {
+                    if (parseColor(value)) |color| theme.selection_background = color;
+                } else if (std.mem.eql(u8, key, "selection-foreground")) {
+                    if (parseColor(value)) |color| theme.selection_foreground = color;
+                }
+                // Ignore unknown keys (theme files can have other config options)
+            }
+        }
+        
+        return theme;
+    }
+};
+
+/// Convert hex color (0xRRGGBB) to Color
+fn hexToColor(hex: u24) Color {
+    const r = @as(f32, @floatFromInt((hex >> 16) & 0xFF)) / 255.0;
+    const g = @as(f32, @floatFromInt((hex >> 8) & 0xFF)) / 255.0;
+    const b = @as(f32, @floatFromInt(hex & 0xFF)) / 255.0;
+    return .{ r, g, b };
+}
+
+/// Parse color string (with or without # prefix)
+fn parseColor(s: []const u8) ?Color {
+    const hex_str = if (s.len > 0 and s[0] == '#') s[1..] else s;
+    if (hex_str.len != 6) return null;
+    
+    const hex = std.fmt.parseInt(u24, hex_str, 16) catch return null;
+    return hexToColor(hex);
+}
+
+// Global theme (set at startup)
+var g_theme: Theme = Theme.default();
+
 /// Convert FreeType 26.6 fixed-point to f64 (like Ghostty)
 fn f26dot6ToF64(v: anytype) f64 {
     return @as(f64, @floatFromInt(v)) / 64.0;
@@ -662,28 +791,9 @@ fn preloadCharacters(face: freetype.Face) void {
 }
 
 fn indexToRgb(color_idx: u8) [3]f32 {
-    // Basic 16 colors matching Ghostty's default palette
-    const basic_colors = [16][3]f32{
-        .{ @as(f32, 0x1D) / 255.0, @as(f32, 0x1F) / 255.0, @as(f32, 0x21) / 255.0 }, // 0: black
-        .{ @as(f32, 0xCC) / 255.0, @as(f32, 0x66) / 255.0, @as(f32, 0x66) / 255.0 }, // 1: red
-        .{ @as(f32, 0xB5) / 255.0, @as(f32, 0xBD) / 255.0, @as(f32, 0x68) / 255.0 }, // 2: green
-        .{ @as(f32, 0xF0) / 255.0, @as(f32, 0xC6) / 255.0, @as(f32, 0x74) / 255.0 }, // 3: yellow
-        .{ @as(f32, 0x81) / 255.0, @as(f32, 0xA2) / 255.0, @as(f32, 0xBE) / 255.0 }, // 4: blue
-        .{ @as(f32, 0xB2) / 255.0, @as(f32, 0x94) / 255.0, @as(f32, 0xBB) / 255.0 }, // 5: magenta
-        .{ @as(f32, 0x8A) / 255.0, @as(f32, 0xBE) / 255.0, @as(f32, 0xB7) / 255.0 }, // 6: cyan
-        .{ @as(f32, 0xC5) / 255.0, @as(f32, 0xC8) / 255.0, @as(f32, 0xC6) / 255.0 }, // 7: white
-        .{ @as(f32, 0x66) / 255.0, @as(f32, 0x66) / 255.0, @as(f32, 0x66) / 255.0 }, // 8: bright black (gray)
-        .{ @as(f32, 0xD5) / 255.0, @as(f32, 0x4E) / 255.0, @as(f32, 0x53) / 255.0 }, // 9: bright red
-        .{ @as(f32, 0xB9) / 255.0, @as(f32, 0xCA) / 255.0, @as(f32, 0x4A) / 255.0 }, // 10: bright green
-        .{ @as(f32, 0xE7) / 255.0, @as(f32, 0xC5) / 255.0, @as(f32, 0x47) / 255.0 }, // 11: bright yellow
-        .{ @as(f32, 0x7A) / 255.0, @as(f32, 0xA6) / 255.0, @as(f32, 0xDA) / 255.0 }, // 12: bright blue
-        .{ @as(f32, 0xC3) / 255.0, @as(f32, 0x97) / 255.0, @as(f32, 0xD8) / 255.0 }, // 13: bright magenta
-        .{ @as(f32, 0x70) / 255.0, @as(f32, 0xC0) / 255.0, @as(f32, 0xB1) / 255.0 }, // 14: bright cyan
-        .{ @as(f32, 0xEA) / 255.0, @as(f32, 0xEA) / 255.0, @as(f32, 0xEA) / 255.0 }, // 15: bright white
-    };
-
+    // Use theme palette for colors 0-15
     if (color_idx < 16) {
-        return basic_colors[color_idx];
+        return g_theme.palette[color_idx];
     } else if (color_idx < 232) {
         // 216 color cube (6x6x6): indices 16-231
         const idx = color_idx - 16;
@@ -783,7 +893,7 @@ fn renderTerminal(terminal: *ghostty_vt.Terminal, window_height: f32, offset_x: 
 
 
             // Get foreground color from cell style
-            var fg_color: [3]f32 = .{ 0.9, 0.9, 0.9 }; // Default light gray
+            var fg_color: [3]f32 = g_theme.foreground; // Default from theme
             var bg_color: ?[3]f32 = null;
 
             if (cell_data) |cd| {
@@ -842,11 +952,12 @@ fn renderTerminal(terminal: *ghostty_vt.Terminal, window_height: f32, offset_x: 
             if (is_cursor) {
                 const cursor_result = renderCursor(x, y, cell_width, cell_height, terminal_cursor_style, terminal_cursor_blink);
                 if (cursor_result.invert_fg) {
-                    fg_color = .{ 0.0, 0.0, 0.0 }; // Black text on cursor
+                    // Use cursor_text if defined, otherwise use background color (inverted)
+                    fg_color = g_theme.cursor_text orelse g_theme.background;
                 }
             } else if (is_selected) {
-                renderQuad(x, y, cell_width, cell_height, .{ 0.3, 0.4, 0.6 }); // Selection blue
-                fg_color = .{ 1.0, 1.0, 1.0 }; // White text on selection
+                renderQuad(x, y, cell_width, cell_height, g_theme.selection_background);
+                fg_color = g_theme.selection_foreground orelse g_theme.foreground;
             } else if (bg_color) |bg| {
                 renderQuad(x, y, cell_width, cell_height, bg);
             }
@@ -909,7 +1020,7 @@ const TerminalCursorStyle = enum {
 /// terminal_style is the style requested by the terminal (via DECSCUSR escape sequence)
 /// terminal_blink is the blink mode from the terminal (set by DECSCUSR steady/blinking variants)
 fn renderCursor(x: f32, y: f32, w: f32, h: f32, terminal_style: TerminalCursorStyle, terminal_blink: bool) struct { invert_fg: bool } {
-    const cursor_color = [3]f32{ 0.7, 0.7, 0.7 };
+    const cursor_color = g_theme.cursor_color;
     // Cursor thickness defaults to 1 pixel like Ghostty (metrics.cursor_thickness = 1)
     const cursor_thickness: f32 = 1.0;
 
@@ -948,14 +1059,13 @@ fn renderCursor(x: f32, y: f32, w: f32, h: f32, terminal_style: TerminalCursorSt
             // Hollow rectangle - fill then hollow out the inside (like Ghostty)
             // Draw outer rect
             renderQuad(x, y, w, h, cursor_color);
-            // Hollow out inside with background color
-            const bg_color = [3]f32{ 0.05, 0.05, 0.08 }; // Match terminal background
+            // Hollow out inside with background color from theme
             renderQuad(
                 x + cursor_thickness,
                 y + cursor_thickness,
                 w - cursor_thickness * 2,
                 h - cursor_thickness * 2,
-                bg_color,
+                g_theme.background,
             );
             return .{ .invert_fg = false };
         },
@@ -1210,7 +1320,7 @@ fn framebufferSizeCallback(window: ?*c.GLFWwindow, width: c_int, height: c_int) 
     gl.Viewport.?(0, 0, width, height);
     setProjection(@floatFromInt(width), @floatFromInt(height));
 
-    gl.ClearColor.?(0.05, 0.05, 0.08, 1.0);
+    gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
     gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
 
     // Render terminal if available and not in the middle of a resize operation
@@ -1436,6 +1546,20 @@ pub fn main() !void {
                 return;
             }
         }
+        if (std.mem.eql(u8, arg, "--theme")) {
+            i += 1;
+            if (i < args.len) {
+                const theme_path = args[i];
+                g_theme = Theme.loadFromFile(allocator, theme_path) catch |err| {
+                    std.debug.print("Failed to load theme '{s}': {}\n", .{ theme_path, err });
+                    return;
+                };
+                std.debug.print("Loaded theme from: {s}\n", .{theme_path});
+            } else {
+                std.debug.print("Error: --theme requires a file path argument\n", .{});
+                return;
+            }
+        }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             std.debug.print(
                 \\Phantty - A terminal emulator
@@ -1450,6 +1574,7 @@ pub fn main() !void {
                 \\  --cursor-style <style>  Cursor shape (default: "block")
                 \\                          Options: block, bar, underline, block_hollow
                 \\  --cursor-style-blink <bool>  Enable cursor blinking (default: true)
+                \\  --theme <path>          Load a Ghostty theme file
                 \\  --list-fonts            List all available system fonts
                 \\  --test-font-discovery   Test font discovery for common fonts
                 \\  --help, -h              Show this help message
@@ -1458,6 +1583,7 @@ pub fn main() !void {
                 \\  phantty --font "Cascadia Code"
                 \\  phantty --font "JetBrains Mono" --font-style bold
                 \\  phantty --cursor-style bar --cursor-style-blink false
+                \\  phantty --theme ~/poimandres.theme
                 \\  phantty --list-fonts
                 \\
             , .{});
@@ -1697,7 +1823,7 @@ pub fn main() !void {
         gl.Viewport.?(0, 0, fb_width, fb_height);
         setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
 
-        gl.ClearColor.?(0.05, 0.05, 0.08, 1.0);
+        gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
         gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
 
         // Update cursor blink state
