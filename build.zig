@@ -67,6 +67,10 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
+    // Use Windows GUI subsystem to avoid spawning a background console window.
+    // This is the equivalent of /SUBSYSTEM:WINDOWS in MSVC.
+    exe.subsystem = .Windows;
+
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
