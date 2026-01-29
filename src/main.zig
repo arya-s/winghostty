@@ -4,139 +4,21 @@ const freetype = @import("freetype");
 const Pty = @import("pty.zig").Pty;
 const sprite = @import("font/sprite.zig");
 const directwrite = @import("directwrite.zig");
+const Config = @import("config.zig");
 
 const c = @cImport({
     @cInclude("glad/gl.h");
     @cInclude("GLFW/glfw3.h");
 });
 
-// ============================================================================
-// Theme System
-// ============================================================================
+// Type aliases from config module
+const Color = Config.Color;
+const Theme = Config.Theme;
+const CursorStyle = Config.CursorStyle;
+const hexToColor = Config.hexToColor;
+const parseColor = Config.parseColor;
 
-/// RGB color as floats (0.0-1.0)
-const Color = [3]f32;
-
-/// Theme definition - matches Ghostty's theme file format
-const Theme = struct {
-    // Basic 16-color palette (ANSI colors 0-15)
-    palette: [16]Color,
-    
-    // Semantic colors
-    background: Color,
-    foreground: Color,
-    cursor_color: Color,
-    cursor_text: ?Color, // Text color when under cursor (optional)
-    selection_background: Color,
-    selection_foreground: ?Color, // Optional, if null use inverted fg
-    
-    /// Default Poimandres theme (https://github.com/LucidMach/poimandres-ghostty)
-    pub fn default() Theme {
-        return .{
-            .palette = .{
-                hexToColor(0x1b1e28), // 0: black
-                hexToColor(0xd0679d), // 1: red
-                hexToColor(0x5de4c7), // 2: green
-                hexToColor(0xfffac2), // 3: yellow
-                hexToColor(0x89ddff), // 4: blue
-                hexToColor(0xd2a6ff), // 5: magenta
-                hexToColor(0xadd7ff), // 6: cyan
-                hexToColor(0xffffff), // 7: white
-                hexToColor(0x6c6f93), // 8: bright black
-                hexToColor(0xd0679d), // 9: bright red
-                hexToColor(0x5de4c7), // 10: bright green
-                hexToColor(0xfffac2), // 11: bright yellow
-                hexToColor(0x89ddff), // 12: bright blue
-                hexToColor(0xd2a6ff), // 13: bright magenta
-                hexToColor(0xadd7ff), // 14: bright cyan
-                hexToColor(0xffffff), // 15: bright white
-            },
-            .background = hexToColor(0x1b1e28),
-            .foreground = hexToColor(0xa6accd),
-            .cursor_color = hexToColor(0xe4f0fb),
-            .cursor_text = null,
-            .selection_background = hexToColor(0x2a2e3f),
-            .selection_foreground = hexToColor(0xf8f8f2),
-        };
-    }
-    
-    /// Load a theme from a Ghostty theme file
-    pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Theme {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
-        
-        const content = try file.readToEndAlloc(allocator, 1024 * 1024); // 1MB max
-        defer allocator.free(content);
-        
-        return parseTheme(content);
-    }
-    
-    /// Parse theme content in Ghostty format
-    fn parseTheme(content: []const u8) !Theme {
-        var theme = Theme.default();
-        
-        var lines = std.mem.splitScalar(u8, content, '\n');
-        while (lines.next()) |line| {
-            // Skip empty lines and comments
-            const trimmed = std.mem.trim(u8, line, " \t\r");
-            if (trimmed.len == 0 or trimmed[0] == '#') continue;
-            
-            // Parse "key = value" format
-            if (std.mem.indexOf(u8, trimmed, "=")) |eq_pos| {
-                const key = std.mem.trim(u8, trimmed[0..eq_pos], " \t");
-                const value = std.mem.trim(u8, trimmed[eq_pos + 1 ..], " \t");
-                
-                if (std.mem.eql(u8, key, "palette")) {
-                    // Format: "palette = N=#RRGGBB" or "palette = N=RRGGBB"
-                    if (std.mem.indexOf(u8, value, "=")) |idx_eq| {
-                        const idx_str = value[0..idx_eq];
-                        const color_str = value[idx_eq + 1 ..];
-                        const idx = std.fmt.parseInt(u8, idx_str, 10) catch continue;
-                        if (idx < 16) {
-                            if (parseColor(color_str)) |color| {
-                                theme.palette[idx] = color;
-                            }
-                        }
-                    }
-                } else if (std.mem.eql(u8, key, "background")) {
-                    if (parseColor(value)) |color| theme.background = color;
-                } else if (std.mem.eql(u8, key, "foreground")) {
-                    if (parseColor(value)) |color| theme.foreground = color;
-                } else if (std.mem.eql(u8, key, "cursor-color")) {
-                    if (parseColor(value)) |color| theme.cursor_color = color;
-                } else if (std.mem.eql(u8, key, "cursor-text")) {
-                    if (parseColor(value)) |color| theme.cursor_text = color;
-                } else if (std.mem.eql(u8, key, "selection-background")) {
-                    if (parseColor(value)) |color| theme.selection_background = color;
-                } else if (std.mem.eql(u8, key, "selection-foreground")) {
-                    if (parseColor(value)) |color| theme.selection_foreground = color;
-                }
-                // Ignore unknown keys (theme files can have other config options)
-            }
-        }
-        
-        return theme;
-    }
-};
-
-/// Convert hex color (0xRRGGBB) to Color
-fn hexToColor(hex: u24) Color {
-    const r = @as(f32, @floatFromInt((hex >> 16) & 0xFF)) / 255.0;
-    const g = @as(f32, @floatFromInt((hex >> 8) & 0xFF)) / 255.0;
-    const b = @as(f32, @floatFromInt(hex & 0xFF)) / 255.0;
-    return .{ r, g, b };
-}
-
-/// Parse color string (with or without # prefix)
-fn parseColor(s: []const u8) ?Color {
-    const hex_str = if (s.len > 0 and s[0] == '#') s[1..] else s;
-    if (hex_str.len != 6) return null;
-    
-    const hex = std.fmt.parseInt(u24, hex_str, 16) catch return null;
-    return hexToColor(hex);
-}
-
-// Global theme (set at startup)
+// Global theme (set at startup via config)
 var g_theme: Theme = Theme.default();
 
 /// Convert FreeType 26.6 fixed-point to f64 (like Ghostty)
@@ -242,7 +124,7 @@ const embedded = @import("font/embedded.zig");
 // reasonable defaults since we don't auto-detect screen size.
 var term_cols: u16 = 110;
 var term_rows: u16 = 28;
-const FONT_SIZE: u32 = 14;
+const DEFAULT_FONT_SIZE: u32 = 14;
 
 // OpenGL context from glad
 var gl: c.GladGLContext = undefined;
@@ -298,14 +180,6 @@ var g_last_resize_time: i64 = 0;
 var g_resize_in_progress: bool = false; // Prevent rendering during resize
 const RESIZE_COALESCE_MS: i64 = 25; // Same as Ghostty
 
-// Cursor configuration (like Ghostty)
-const CursorStyle = enum {
-    block,
-    bar,
-    underline,
-    block_hollow,
-};
-
 var g_cursor_style: CursorStyle = .block; // Default cursor style
 var g_cursor_blink: bool = true; // Whether cursor should blink (default: true like Ghostty)
 var g_cursor_blink_visible: bool = true; // Current blink state (toggled by timer)
@@ -316,7 +190,7 @@ const CURSOR_BLINK_INTERVAL_MS: i64 = 600; // Blink interval in ms (same as Ghos
 var g_ft_lib: ?freetype.Library = null;
 var g_font_discovery: ?*directwrite.FontDiscovery = null;
 var g_fallback_faces: std.AutoHashMapUnmanaged(u32, freetype.Face) = .empty; // codepoint -> fallback face
-var g_font_size: u32 = FONT_SIZE;
+var g_font_size: u32 = DEFAULT_FONT_SIZE;
 
 const vertex_shader_source: [*c]const u8 =
     \\#version 330 core
@@ -1666,6 +1540,17 @@ fn keyCallback(_: ?*c.GLFWwindow, key: c_int, _: c_int, action: c_int, mods: c_i
         return;
     }
 
+    // Ctrl+, = Open config file in editor (like Ghostty)
+    if (ctrl and key == c.GLFW_KEY_COMMA) {
+        std.debug.print("[keybind] Ctrl+, pressed\n", .{});
+        if (g_allocator) |alloc| {
+            Config.openConfigInEditor(alloc);
+        } else {
+            std.debug.print("[keybind] ERROR: g_allocator is null\n", .{});
+        }
+        return;
+    }
+
     // Alt+Enter = Toggle fullscreen
     const alt = (mods & c.GLFW_MOD_ALT) != 0;
     if (alt and key == c.GLFW_KEY_ENTER) {
@@ -1758,202 +1643,56 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Parse command line arguments
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    // Handle special commands before loading full config
+    if (Config.hasCommand(allocator, "help") or Config.hasCommand(allocator, "h")) {
+        Config.printHelp();
+        return;
+    }
+    if (Config.hasCommand(allocator, "list-fonts")) {
+        try listSystemFonts(allocator);
+        return;
+    }
+    if (Config.hasCommand(allocator, "test-font-discovery")) {
+        try testFontDiscovery(allocator);
+        return;
+    }
+    if (Config.hasCommand(allocator, "show-config-path")) {
+        Config.printConfigPath(allocator);
+        return;
+    }
 
-    var requested_font: []const u8 = "JetBrains Mono"; // default
-    var requested_weight: directwrite.DWRITE_FONT_WEIGHT = .SEMI_BOLD; // default to SemiBold
-    var shader_path: ?[]const u8 = null;
+    // Load configuration: defaults → config file → CLI flags
+    const cfg = try Config.load(allocator);
+    defer cfg.deinit(allocator);
 
-    var i: usize = 1; // skip program name
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--list-fonts")) {
-            try listSystemFonts(allocator);
-            return;
-        }
-        if (std.mem.eql(u8, arg, "--test-font-discovery")) {
-            try testFontDiscovery(allocator);
-            return;
-        }
-        if (std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "-f")) {
-            i += 1;
-            if (i < args.len) {
-                requested_font = args[i];
-            } else {
-                std.debug.print("Error: --font requires a font name argument\n", .{});
-                std.debug.print("Usage: phantty --font \"Cascadia Code\"\n", .{});
-                return;
-            }
-        }
-        if (std.mem.eql(u8, arg, "--font-style")) {
-            i += 1;
-            if (i < args.len) {
-                const style = args[i];
-                if (std.mem.eql(u8, style, "thin")) {
-                    requested_weight = .THIN;
-                } else if (std.mem.eql(u8, style, "extra-light") or std.mem.eql(u8, style, "extralight")) {
-                    requested_weight = .EXTRA_LIGHT;
-                } else if (std.mem.eql(u8, style, "light")) {
-                    requested_weight = .LIGHT;
-                } else if (std.mem.eql(u8, style, "regular") or std.mem.eql(u8, style, "normal")) {
-                    requested_weight = .NORMAL;
-                } else if (std.mem.eql(u8, style, "medium")) {
-                    requested_weight = .MEDIUM;
-                } else if (std.mem.eql(u8, style, "semi-bold") or std.mem.eql(u8, style, "semibold")) {
-                    requested_weight = .SEMI_BOLD;
-                } else if (std.mem.eql(u8, style, "bold")) {
-                    requested_weight = .BOLD;
-                } else if (std.mem.eql(u8, style, "extra-bold") or std.mem.eql(u8, style, "extrabold")) {
-                    requested_weight = .EXTRA_BOLD;
-                } else if (std.mem.eql(u8, style, "black") or std.mem.eql(u8, style, "heavy")) {
-                    requested_weight = .BLACK;
-                } else {
-                    std.debug.print("Unknown font style: {s}\n", .{style});
-                    std.debug.print("Valid styles: thin, extra-light, light, regular, medium, semi-bold, bold, extra-bold, black\n", .{});
-                    return;
-                }
-            } else {
-                std.debug.print("Error: --font-style requires a style argument\n", .{});
-                return;
-            }
-        }
-        if (std.mem.eql(u8, arg, "--cursor-style")) {
-            i += 1;
-            if (i < args.len) {
-                const cursor_style = args[i];
-                if (std.mem.eql(u8, cursor_style, "block")) {
-                    g_cursor_style = .block;
-                } else if (std.mem.eql(u8, cursor_style, "bar")) {
-                    g_cursor_style = .bar;
-                } else if (std.mem.eql(u8, cursor_style, "underline")) {
-                    g_cursor_style = .underline;
-                } else if (std.mem.eql(u8, cursor_style, "block_hollow")) {
-                    g_cursor_style = .block_hollow;
-                } else {
-                    std.debug.print("Unknown cursor style: {s}\n", .{cursor_style});
-                    std.debug.print("Valid styles: block, bar, underline, block_hollow\n", .{});
-                    return;
-                }
-            } else {
-                std.debug.print("Error: --cursor-style requires a style argument\n", .{});
-                return;
-            }
-        }
-        if (std.mem.eql(u8, arg, "--cursor-style-blink")) {
-            i += 1;
-            if (i < args.len) {
-                const blink_val = args[i];
-                if (std.mem.eql(u8, blink_val, "true")) {
-                    g_cursor_blink = true;
-                } else if (std.mem.eql(u8, blink_val, "false")) {
-                    g_cursor_blink = false;
-                } else {
-                    std.debug.print("Invalid value for --cursor-style-blink: {s}\n", .{blink_val});
-                    std.debug.print("Valid values: true, false\n", .{});
-                    return;
-                }
-            } else {
-                std.debug.print("Error: --cursor-style-blink requires a value (true/false)\n", .{});
-                return;
-            }
-        }
-        if (std.mem.eql(u8, arg, "--theme")) {
-            i += 1;
-            if (i < args.len) {
-                const theme_path = args[i];
-                g_theme = Theme.loadFromFile(allocator, theme_path) catch |err| {
-                    std.debug.print("Failed to load theme '{s}': {}\n", .{ theme_path, err });
-                    return;
-                };
-                std.debug.print("Loaded theme from: {s}\n", .{theme_path});
-            } else {
-                std.debug.print("Error: --theme requires a file path argument\n", .{});
-                return;
-            }
-        }
-        if (std.mem.eql(u8, arg, "--shader")) {
-            i += 1;
-            if (i < args.len) {
-                shader_path = args[i];
-            } else {
-                std.debug.print("Error: --shader requires a file path argument\n", .{});
-                return;
-            }
-        }
-        if (std.mem.eql(u8, arg, "--window-height")) {
-            i += 1;
-            if (i < args.len) {
-                const val = std.fmt.parseInt(u16, args[i], 10) catch {
-                    std.debug.print("Invalid value for --window-height: {s}\n", .{args[i]});
-                    return;
-                };
-                term_rows = @max(4, val);
-            } else {
-                std.debug.print("Error: --window-height requires a value\n", .{});
-                return;
-            }
-        }
-        if (std.mem.eql(u8, arg, "--window-width")) {
-            i += 1;
-            if (i < args.len) {
-                const val = std.fmt.parseInt(u16, args[i], 10) catch {
-                    std.debug.print("Invalid value for --window-width: {s}\n", .{args[i]});
-                    return;
-                };
-                term_cols = @max(10, val);
-            } else {
-                std.debug.print("Error: --window-width requires a value\n", .{});
-                return;
-            }
-        }
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            std.debug.print(
-                \\Phantty - A terminal emulator
-                \\
-                \\Usage: phantty [options]
-                \\
-                \\Options:
-                \\  --font, -f <name>       Use specified font (default: "JetBrains Mono")
-                \\  --font-style <style>    Font weight/style (default: "semi-bold")
-                \\                          Options: thin, extra-light, light, regular, medium,
-                \\                                   semi-bold, bold, extra-bold, black
-                \\  --cursor-style <style>  Cursor shape (default: "block")
-                \\                          Options: block, bar, underline, block_hollow
-                \\  --cursor-style-blink <bool>  Enable cursor blinking (default: true)
-                \\  --theme <path>          Load a Ghostty theme file
-                \\  --shader <path>         Load a Ghostty-compatible custom shader (GLSL)
-                \\  --window-height <rows>  Initial window height in cells (default: 28, min: 4)
-                \\  --window-width <cols>   Initial window width in cells (default: 110, min: 10)
-                \\  --list-fonts            List all available system fonts
-                \\  --test-font-discovery   Test font discovery for common fonts
-                \\  --help, -h              Show this help message
-                \\
-                \\Examples:
-                \\  phantty --font "Cascadia Code"
-                \\  phantty --font "JetBrains Mono" --font-style bold
-                \\  phantty --cursor-style bar --cursor-style-blink false
-                \\  phantty --theme ~/poimandres.theme
-                \\  phantty --window-height 40 --window-width 120
-                \\  phantty --list-fonts
-                \\
-            , .{});
-            return;
-        }
+    // Apply config to globals
+    g_theme = cfg.resolved_theme;
+    g_cursor_style = cfg.@"cursor-style";
+    g_cursor_blink = cfg.@"cursor-style-blink";
+    term_cols = cfg.@"window-width";
+    term_rows = cfg.@"window-height";
+
+    const requested_font = cfg.@"font-family";
+    const requested_weight = cfg.@"font-style".toDwriteWeight();
+    const font_size = cfg.@"font-size";
+    const shader_path = cfg.@"custom-shader";
+
+    if (cfg.config_path) |path| {
+        std.debug.print("Config loaded from: {s}\n", .{path});
+    } else {
+        std.debug.print("No config file found, using defaults\n", .{});
     }
 
     // Initialize ghostty-vt terminal
-    // max_scrollback is in bytes - use 10MB like Ghostty's default scrollback-limit
     var terminal: ghostty_vt.Terminal = try .init(allocator, .{
         .cols = term_cols,
         .rows = term_rows,
-        .max_scrollback = 10_000_000, // 10MB
+        .max_scrollback = cfg.@"scrollback-limit",
     });
     defer terminal.deinit(allocator);
     std.debug.print("Terminal initialized: {}x{}\n", .{ term_cols, term_rows });
 
-    // Set initial cursor style from user config (like Ghostty does in Termio.zig)
+    // Set initial cursor style from config (like Ghostty does in Termio.zig)
     terminal.screens.active.cursor.cursor_style = switch (g_cursor_style) {
         .bar => .bar,
         .block => .block,
@@ -2075,7 +1814,7 @@ pub fn main() !void {
                 std.debug.print("Failed to load system font: {}, using embedded fallback\n", .{err});
             }
         }
-        
+
         // Fall back to embedded JetBrains Mono
         std.debug.print("Using embedded JetBrains Mono as fallback\n", .{});
         break :blk ft_lib.initMemoryFace(embedded.regular, 0) catch |err| {
@@ -2085,13 +1824,13 @@ pub fn main() !void {
     };
     defer face.deinit();
 
-    face.setCharSize(0, FONT_SIZE * 64, 96, 96) catch |err| {
+    face.setCharSize(0, @as(i32, @intCast(font_size)) * 64, 96, 96) catch |err| {
         std.debug.print("Failed to set font size: {}\n", .{err});
         return err;
     };
 
     // Store font size globally for fallback fonts
-    g_font_size = FONT_SIZE;
+    g_font_size = font_size;
 
     if (!initShaders()) {
         std.debug.print("Failed to initialize shaders\n", .{});

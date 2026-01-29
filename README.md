@@ -52,6 +52,46 @@ Options:
   --help                       Show help
 ```
 
+## Configuration
+
+Phantty uses a Ghostty-compatible config file format (`key = value` pairs). The config file is loaded from `%APPDATA%\phantty\config`.
+
+Run `phantty.exe --show-config-path` to print the resolved path.
+
+CLI flags override config file values (last wins).
+
+### Example config
+
+```
+font-family = Cascadia Code
+font-style = regular
+font-size = 14
+cursor-style = bar
+cursor-style-blink = true
+theme = Poimandres
+window-height = 32
+window-width = 120
+scrollback-limit = 10000000
+custom-shader = path/to/shader.glsl
+config-file = extra.conf
+```
+
+### Available keys
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `font-family` | `JetBrains Mono` | Font family name |
+| `font-style` | `semi-bold` | Font weight: `thin`, `extra-light`, `light`, `regular`, `medium`, `semi-bold`, `bold`, `extra-bold`, `black` |
+| `font-size` | `14` | Font size in points |
+| `cursor-style` | `block` | Cursor shape: `block`, `bar`, `underline`, `block_hollow` |
+| `cursor-style-blink` | `true` | Enable cursor blinking |
+| `theme` | *(Poimandres)* | Theme name (from `themes/` directory) or file path |
+| `custom-shader` | *(none)* | Path to a GLSL post-processing shader |
+| `window-height` | `28` | Initial height in cells (min: 4) |
+| `window-width` | `110` | Initial width in cells (min: 10) |
+| `scrollback-limit` | `10000000` | Scrollback buffer limit in bytes |
+| `config-file` | *(none)* | Include another config file (prefix with `?` to make optional) |
+
 ## License
 
 MIT

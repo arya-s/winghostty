@@ -117,6 +117,27 @@ phantty.exe
 - [ ] Multiple font support (bold, italic)
 - [ ] Ligatures
 
+## Configuration
+
+Follows Ghostty's `key = value` format. Config file locations:
+- **Windows:** `%APPDATA%\phantty\config`
+- **Linux/WSL:** `$XDG_CONFIG_HOME/phantty/config` or `~/.config/phantty/config`
+
+Supported keys (all also available as `--key value` CLI flags):
+- `font-family` — Font name (default: "JetBrains Mono")
+- `font-style` — Font weight (default: semi-bold)
+- `font-size` — Font size in points (default: 14)
+- `cursor-style` — Cursor shape: block, bar, underline, block_hollow (default: block)
+- `cursor-style-blink` — Cursor blinking: true/false (default: true)
+- `theme` — Theme name or file path
+- `custom-shader` — GLSL post-processing shader path
+- `window-height` — Initial height in cells (default: 28)
+- `window-width` — Initial width in cells (default: 110)
+- `scrollback-limit` — Scrollback buffer in bytes (default: 10000000)
+- `config-file` — Load additional config file (prefix `?` for optional)
+
+Theme resolution order: file path → `%APPDATA%\phantty\themes\<name>` → XDG themes dir.
+
 ## Dependencies
 
 Zig packages (via build.zig.zon):
@@ -138,6 +159,7 @@ phantty/
   build.zig.zon
   src/
     main.zig              # Entry point, GLFW setup, rendering
+    config.zig            # Configuration system (file + CLI parsing)
     directwrite.zig       # DirectWrite font discovery
     pty.zig               # ConPTY wrapper
     font/
@@ -150,6 +172,7 @@ phantty/
     fonts/
       JetBrainsMono-Regular.ttf  # Embedded via @embedFile
       JetBrainsMono-Bold.ttf     # Available for future use
+  themes/                 # Built-in themes
   test-sprites.sh         # Test script for sprite rendering
 ```
 
