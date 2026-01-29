@@ -139,6 +139,15 @@ var cursor_height: f32 = 16; // Height of cursor (ascender portion)
 var box_thickness: u32 = 1; // Thickness for box drawing characters
 var window_focused: bool = true; // Track window focus state
 
+// Pending resize state (resize is deferred to main loop to avoid PageList integrity issues)
+// Ghostty coalesces resize events with a 25ms timer to batch rapid resizes
+var g_pending_resize: bool = false;
+var g_pending_cols: u16 = 0;
+var g_pending_rows: u16 = 0;
+var g_last_resize_time: i64 = 0;
+var g_resize_in_progress: bool = false; // Prevent rendering during resize
+const RESIZE_COALESCE_MS: i64 = 25; // Same as Ghostty
+
 // Cursor configuration (like Ghostty)
 const CursorStyle = enum {
     block,
@@ -751,11 +760,15 @@ fn renderTerminal(terminal: *ghostty_vt.Terminal, window_height: f32, offset_x: 
     // Steady styles (2, 4, 6) set this to false, blinking styles (1, 3, 5) set it to true
     const terminal_cursor_blink = terminal.modes.get(.cursor_blinking);
 
-    for (0..term_rows) |row_idx| {
+    // Use terminal's actual dimensions for rendering (not global vars which may be out of sync)
+    const render_rows = terminal.rows;
+    const render_cols = terminal.cols;
+
+    for (0..render_rows) |row_idx| {
         // Row 0 is at the top, so we start from (window_height - offset) and go down
         const y = window_height - offset_y - ((@as(f32, @floatFromInt(row_idx)) + 1) * cell_height);
 
-        for (0..term_cols) |col_idx| {
+        for (0..render_cols) |col_idx| {
             const x = offset_x + @as(f32, @floatFromInt(col_idx)) * cell_width;
 
             // Check if this is the cursor position (only when viewport is at bottom)
@@ -766,6 +779,8 @@ fn renderTerminal(terminal: *ghostty_vt.Terminal, window_height: f32, offset_x: 
                 .x = @intCast(col_idx),
                 .y = @intCast(row_idx),
             } });
+            
+
 
             // Get foreground color from cell style
             var fg_color: [3]f32 = .{ 0.9, 0.9, 0.9 }; // Default light gray
@@ -1172,34 +1187,41 @@ fn windowFocusCallback(_: ?*c.GLFWwindow, focused: c_int) callconv(.c) void {
     window_focused = focused != 0;
 }
 
-fn framebufferSizeCallback(_: ?*c.GLFWwindow, width: c_int, height: c_int) callconv(.c) void {
+fn framebufferSizeCallback(window: ?*c.GLFWwindow, width: c_int, height: c_int) callconv(.c) void {
     const padding: f32 = 10;
     const content_width = @as(f32, @floatFromInt(width)) - padding * 2;
     const content_height = @as(f32, @floatFromInt(height)) - padding * 2;
-    
+
     const new_cols: u16 = @intFromFloat(@max(1, content_width / cell_width));
     const new_rows: u16 = @intFromFloat(@max(1, content_height / cell_height));
-    
+
     if (new_cols != term_cols or new_rows != term_rows) {
-        term_cols = new_cols;
-        term_rows = new_rows;
-        
-        std.debug.print("Resize: {}x{}\n", .{ term_cols, term_rows });
-        
-        // Resize PTY
-        if (g_pty) |pty| {
-            pty.resize(term_cols, term_rows);
-        }
-        
-        // Resize terminal
+        // Mark resize as pending - actual resize happens in main loop
+        // to avoid PageList integrity issues during callback
+        // Coalesce rapid resize events (like Ghostty does with 25ms timer)
+        g_pending_resize = true;
+        g_pending_cols = new_cols;
+        g_pending_rows = new_rows;
+        g_last_resize_time = std.time.milliTimestamp();
+    }
+
+    // Immediately render a frame during resize to avoid black areas
+    // We render with current terminal state (before resize) to show something
+    gl.Viewport.?(0, 0, width, height);
+    setProjection(@floatFromInt(width), @floatFromInt(height));
+
+    gl.ClearColor.?(0.05, 0.05, 0.08, 1.0);
+    gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
+
+    // Render terminal if available and not in the middle of a resize operation
+    if (!g_resize_in_progress) {
         if (g_terminal) |terminal| {
-            if (g_allocator) |allocator| {
-                terminal.resize(allocator, term_cols, term_rows) catch |err| {
-                    std.debug.print("Terminal resize error: {}\n", .{err});
-                };
-            }
+            updateCursorBlink();
+            renderTerminal(terminal, @floatFromInt(height), padding, padding);
         }
     }
+
+    c.glfwSwapBuffers(window);
 }
 
 // GLFW scroll callback - handles mouse wheel scrollback
@@ -1444,9 +1466,11 @@ pub fn main() !void {
     }
 
     // Initialize ghostty-vt terminal
+    // max_scrollback is in bytes - use 10MB like Ghostty's default scrollback-limit
     var terminal: ghostty_vt.Terminal = try .init(allocator, .{
         .cols = term_cols,
         .rows = term_rows,
+        .max_scrollback = 10_000_000, // 10MB
     });
     defer terminal.deinit(allocator);
     std.debug.print("Terminal initialized: {}x{}\n", .{ term_cols, term_rows });
@@ -1626,6 +1650,37 @@ pub fn main() !void {
 
     // Main loop
     while (c.glfwWindowShouldClose(window) == 0) {
+        // Process pending resize (coalesced, like Ghostty)
+        // We wait for RESIZE_COALESCE_MS after last resize event before applying
+        if (g_pending_resize) {
+            const now = std.time.milliTimestamp();
+            if (now - g_last_resize_time >= RESIZE_COALESCE_MS) {
+                g_pending_resize = false;
+
+                if (g_pending_cols != term_cols or g_pending_rows != term_rows) {
+                    // Mark resize in progress to prevent rendering with inconsistent state
+                    g_resize_in_progress = true;
+                    defer g_resize_in_progress = false;
+
+                    term_cols = g_pending_cols;
+                    term_rows = g_pending_rows;
+
+                    // Resize terminal
+                    terminal.resize(allocator, term_cols, term_rows) catch |err| {
+                        std.debug.print("Terminal resize error: {}\n", .{err});
+                    };
+
+                    // Resize PTY
+                    // TODO: ConPTY sends a full screen redraw on resize which overwrites
+                    // our scrollback content when growing. See GitHub issue #2.
+                    pty.resize(term_cols, term_rows);
+
+                    // Scroll to bottom after resize to ensure we see the active area
+                    terminal.scrollViewport(.{ .bottom = {} }) catch {};
+                }
+            }
+        }
+
         // Read from PTY (non-blocking check first)
         while (pty.dataAvailable() > 0) {
             const bytes_read = pty.read(&pty_buffer) catch break;
