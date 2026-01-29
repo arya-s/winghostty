@@ -1,4 +1,4 @@
-.PHONY: debug release clean
+.PHONY: debug release clean update-ghostty
 
 debug:
 	zig build
@@ -8,3 +8,6 @@ release:
 
 clean:
 	rm -rf zig-out .zig-cache
+
+update-ghostty:
+	zig fetch --save=ghostty https://github.com/ghostty-org/ghostty/archive/main.tar.gz
