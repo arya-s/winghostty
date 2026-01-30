@@ -2019,6 +2019,9 @@ pub fn main() !void {
 
     std.debug.print("Ready! Cell size: {d:.1}x{d:.1}\n", .{ cell_width, cell_height });
 
+    // Ensure config directory + file exist so the watcher can observe from startup
+    Config.ensureConfigExists(allocator);
+
     // Set up config file watcher (ReadDirectoryChangesW)
     var config_watcher = ConfigWatcher.init(allocator);
     if (config_watcher == null) {

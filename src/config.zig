@@ -619,6 +619,31 @@ pub fn printHelp() void {
 }
 
 // ============================================================================
+// Ensure config exists on startup
+// ============================================================================
+
+/// Ensure the config directory and file exist. Called at startup so the
+/// file watcher can observe the directory from the very beginning.
+/// If the config file doesn't exist yet, it is created with the default
+/// template (same one used by Ctrl+,).
+pub fn ensureConfigExists(allocator: std.mem.Allocator) void {
+    const path = configFilePath(allocator) catch return;
+    defer allocator.free(path);
+
+    // Create parent directory recursively
+    if (std.fs.path.dirname(path)) |dir| {
+        std.fs.cwd().makePath(dir) catch return;
+    }
+
+    // Create config file with default template if it doesn't exist
+    if (std.fs.cwd().createFile(path, .{ .exclusive = true })) |file| {
+        file.writeAll(default_config_template) catch {};
+        file.close();
+        log.info("created default config file: {s}", .{path});
+    } else |_| {}
+}
+
+// ============================================================================
 // Open / Edit Config (Ctrl+, keybinding)
 // ============================================================================
 
