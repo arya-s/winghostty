@@ -85,7 +85,7 @@ config-file = extra.conf
 | `font-size` | `12` | Font size in points |
 | `cursor-style` | `block` | Cursor shape: `block`, `bar`, `underline`, `block_hollow` |
 | `cursor-style-blink` | `true` | Enable cursor blinking |
-| `theme` | *(Poimandres)* | Theme name (from `themes/` directory) or file path |
+| `theme` | *(none)* | Theme name or absolute path (453 Ghostty themes built-in) |
 | `custom-shader` | *(none)* | Path to a GLSL post-processing shader |
 | `window-height` | `0` (auto) | Initial height in cells (min: 4, 0 = auto 80×24) |
 | `window-width` | `0` (auto) | Initial width in cells (min: 10, 0 = auto 80×24) |

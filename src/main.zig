@@ -1776,6 +1776,10 @@ pub fn main() !void {
         try listSystemFonts(allocator);
         return;
     }
+    if (Config.hasCommand(allocator, "list-themes")) {
+        Config.listThemes();
+        return;
+    }
     if (Config.hasCommand(allocator, "test-font-discovery")) {
         try testFontDiscovery(allocator);
         return;

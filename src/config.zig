@@ -19,6 +19,7 @@ const Config = @This();
 
 const std = @import("std");
 const directwrite = @import("directwrite.zig");
+const themes = @import("themes.zig");
 
 const log = std.log.scoped(.config);
 
@@ -38,32 +39,33 @@ pub const Theme = struct {
     selection_background: Color,
     selection_foreground: ?Color,
 
+    /// Default colors matching Ghostty's built-in defaults.
     pub fn default() Theme {
         return .{
             .palette = .{
-                hexToColor(0x1b1e28), // 0: black
-                hexToColor(0xd0679d), // 1: red
-                hexToColor(0x5de4c7), // 2: green
-                hexToColor(0xfffac2), // 3: yellow
-                hexToColor(0x89ddff), // 4: blue
-                hexToColor(0xd2a6ff), // 5: magenta
-                hexToColor(0xadd7ff), // 6: cyan
-                hexToColor(0xffffff), // 7: white
-                hexToColor(0x6c6f93), // 8: bright black
-                hexToColor(0xd0679d), // 9: bright red
-                hexToColor(0x5de4c7), // 10: bright green
-                hexToColor(0xfffac2), // 11: bright yellow
-                hexToColor(0x89ddff), // 12: bright blue
-                hexToColor(0xd2a6ff), // 13: bright magenta
-                hexToColor(0xadd7ff), // 14: bright cyan
-                hexToColor(0xffffff), // 15: bright white
+                hexToColor(0x1d1f21), // 0: black
+                hexToColor(0xcc6666), // 1: red
+                hexToColor(0xb5bd68), // 2: green
+                hexToColor(0xf0c674), // 3: yellow
+                hexToColor(0x81a2be), // 4: blue
+                hexToColor(0xb294bb), // 5: magenta
+                hexToColor(0x8abeb7), // 6: cyan
+                hexToColor(0xc5c8c6), // 7: white
+                hexToColor(0x666666), // 8: bright black
+                hexToColor(0xd54e53), // 9: bright red
+                hexToColor(0xb9ca4a), // 10: bright green
+                hexToColor(0xe7c547), // 11: bright yellow
+                hexToColor(0x7aa6da), // 12: bright blue
+                hexToColor(0xc397d8), // 13: bright magenta
+                hexToColor(0x70c0b1), // 14: bright cyan
+                hexToColor(0xeaeaea), // 15: bright white
             },
-            .background = hexToColor(0x1b1e28),
-            .foreground = hexToColor(0xa6accd),
-            .cursor_color = hexToColor(0xe4f0fb),
+            .background = hexToColor(0x282c34),
+            .foreground = hexToColor(0xffffff),
+            .cursor_color = hexToColor(0xffffff),
             .cursor_text = null,
-            .selection_background = hexToColor(0x2a2e3f),
-            .selection_foreground = hexToColor(0xf8f8f2),
+            .selection_background = hexToColor(0xffffff),
+            .selection_foreground = hexToColor(0x282c34),
         };
     }
 
@@ -473,6 +475,7 @@ fn loadCliArgs(self: *Config, allocator: std.mem.Allocator) !void {
 
         // Special commands (not config keys, handled by main)
         if (std.mem.eql(u8, flag, "list-fonts") or
+            std.mem.eql(u8, flag, "list-themes") or
             std.mem.eql(u8, flag, "test-font-discovery") or
             std.mem.eql(u8, flag, "help") or
             std.mem.eql(u8, flag, "h") or
@@ -515,53 +518,40 @@ pub fn hasCommand(allocator: std.mem.Allocator, command: []const u8) bool {
 // Theme Resolution
 // ============================================================================
 
-/// Resolve a theme by name or path. Looks in:
-///   1. Built-in themes directory (relative to exe)
-///   2. %APPDATA%\phantty\themes\<name>
-///   3. Absolute or relative file path
+/// Resolve a theme by name or path. Search order (like Ghostty):
+///   1. Absolute path → load directly
+///   2. User themes:  %APPDATA%\phantty\themes\<name>
+///   3. Embedded themes compiled into the binary
 fn resolveTheme(self: *Config, allocator: std.mem.Allocator, theme_name: []const u8) void {
-    // Try as a file path first (absolute or relative)
-    if (Theme.loadFromFile(allocator, theme_name)) |theme| {
-        self.resolved_theme = theme;
-        log.info("loaded theme from path: {s}", .{theme_name});
+    // 1. Absolute path — load directly
+    if (std.fs.path.isAbsolute(theme_name)) {
+        if (Theme.loadFromFile(allocator, theme_name)) |theme| {
+            self.resolved_theme = theme;
+            log.info("loaded theme from absolute path: {s}", .{theme_name});
+            return;
+        } else |_| {}
+        log.warn("theme file not found: {s}", .{theme_name});
         return;
-    } else |_| {}
+    }
 
-    // Try %APPDATA%\phantty\themes\<name>
+    // 2. User themes: %APPDATA%\phantty\themes\<name>
     if (std.process.getEnvVarOwned(allocator, "APPDATA")) |appdata| {
         defer allocator.free(appdata);
         const path = std.fs.path.join(allocator, &.{ appdata, "phantty", "themes", theme_name }) catch return;
         defer allocator.free(path);
         if (Theme.loadFromFile(allocator, path)) |theme| {
             self.resolved_theme = theme;
-            log.info("loaded theme from appdata: {s}", .{path});
+            log.info("loaded theme '{s}' from user dir: {s}", .{ theme_name, path });
             return;
         } else |_| {}
     } else |_| {}
 
-    // Try XDG fallback
-    if (std.process.getEnvVarOwned(allocator, "XDG_CONFIG_HOME")) |xdg| {
-        defer allocator.free(xdg);
-        const path = std.fs.path.join(allocator, &.{ xdg, "phantty", "themes", theme_name }) catch return;
-        defer allocator.free(path);
-        if (Theme.loadFromFile(allocator, path)) |theme| {
-            self.resolved_theme = theme;
-            log.info("loaded theme from xdg: {s}", .{path});
-            return;
-        } else |_| {}
-    } else |_| {}
-
-    // Try HOME fallback
-    if (std.process.getEnvVarOwned(allocator, "HOME")) |home| {
-        defer allocator.free(home);
-        const path = std.fs.path.join(allocator, &.{ home, ".config", "phantty", "themes", theme_name }) catch return;
-        defer allocator.free(path);
-        if (Theme.loadFromFile(allocator, path)) |theme| {
-            self.resolved_theme = theme;
-            log.info("loaded theme from home: {s}", .{path});
-            return;
-        } else |_| {}
-    } else |_| {}
+    // 3. Embedded themes compiled into the binary
+    if (themes.get(theme_name)) |data| {
+        self.resolved_theme = Theme.parseThemeContent(data);
+        log.info("loaded embedded theme: {s}", .{theme_name});
+        return;
+    }
 
     log.warn("theme not found: {s}", .{theme_name});
 }
@@ -570,6 +560,15 @@ fn resolveTheme(self: *Config, allocator: std.mem.Allocator, theme_name: []const
 // Help
 // ============================================================================
 
+pub fn listThemes() void {
+    std.debug.print("Available built-in themes ({} total):\n\n", .{themes.entries.len});
+    for (&themes.entries) |*entry| {
+        std.debug.print("  {s}\n", .{entry.name});
+    }
+    std.debug.print("\nUser themes in %APPDATA%\\phantty\\themes\\ take priority.\n", .{});
+    std.debug.print("Set with: theme = <name>\n", .{});
+}
+
 pub fn printHelp() void {
     std.debug.print(
         \\Phantty - A terminal emulator
@@ -577,38 +576,36 @@ pub fn printHelp() void {
         \\Usage: phantty [options]
         \\
         \\Options:
-        \\  --font-family <name>         Font family (default: "JetBrains Mono")
+        \\  --font-family <name>         Font family (default: embedded fallback)
         \\  -f <name>                    Alias for --font-family
-        \\  --font-style <style>         Font weight (default: "semi-bold")
+        \\  --font-style <style>         Font weight (default: regular)
         \\                               Values: thin, extra-light, light, regular, medium,
         \\                                       semi-bold, bold, extra-bold, black
-        \\  --font-size <pt>             Font size in points (default: 14)
+        \\  --font-size <pt>             Font size in points (default: 12)
         \\  --cursor-style <style>       Cursor shape (default: "block")
         \\                               Values: block, bar, underline, block_hollow
         \\  --cursor-style-blink <bool>  Enable cursor blinking (default: true)
         \\  --theme <name|path>          Theme name or file path
         \\  --custom-shader <path>       Ghostty-compatible GLSL post-processing shader
-        \\  --window-height <rows>       Initial height in cells (default: 28, min: 4)
-        \\  --window-width <cols>        Initial width in cells (default: 110, min: 10)
+        \\  --window-height <rows>       Initial height in cells (default: 0=auto, min: 4)
+        \\  --window-width <cols>        Initial width in cells (default: 0=auto, min: 10)
         \\  --scrollback-limit <bytes>   Scrollback buffer size (default: 10000000)
         \\  --config-file <path>         Load additional config file (prefix ? for optional)
         \\
         \\  --show-config-path           Print the config file path and exit
         \\  --list-fonts                 List all available system fonts
+        \\  --list-themes                List all available themes
         \\  --test-font-discovery        Test font discovery for common fonts
         \\  --help, -h                   Show this help message
         \\
-        \\Config file location:
-        \\  Windows: %APPDATA%\phantty\config
-        \\  Linux:   $XDG_CONFIG_HOME/phantty/config
-        \\           (or ~/.config/phantty/config)
+        \\Config file: %APPDATA%\phantty\config
+        \\User themes: %APPDATA%\phantty\themes\
         \\
         \\Config file uses Ghostty's key = value format. Example:
         \\
-        \\  # ~/.config/phantty/config
         \\  font-family = Cascadia Code
         \\  font-size = 16
-        \\  theme = catppuccin-frappe
+        \\  theme = Catppuccin Mocha
         \\  cursor-style = bar
         \\
         \\Examples:
