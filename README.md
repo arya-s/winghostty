@@ -2,6 +2,9 @@
 
 A Windows terminal emulator written in Zig, powered by [libghostty-vt](https://github.com/ghostty-org/ghostty) for terminal emulation.
 
+> [!NOTE]
+> Phantty is **Windows-only**. On macOS and Linux, use [Ghostty](https://ghostty.org/) instead.
+
 ## Features
 
 - **Ghostty's terminal emulation** - Uses libghostty-vt for VT parsing and terminal state
