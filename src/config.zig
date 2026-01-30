@@ -224,6 +224,9 @@ resolved_theme: Theme = Theme.default(),
 /// Path to the loaded config file (for diagnostics), or null.
 config_path: ?[]const u8 = null,
 
+/// Strings allocated during config loading that must be freed.
+_owned_strings: std.ArrayListUnmanaged([]const u8) = .empty,
+
 // ============================================================================
 // Cleanup
 // ============================================================================
@@ -233,6 +236,12 @@ pub fn deinit(self: *const Config, allocator: std.mem.Allocator) void {
     if (self.config_path) |path| {
         allocator.free(path);
     }
+    for (self._owned_strings.items) |s| {
+        allocator.free(s);
+    }
+    // We need a mutable copy to deinit the list itself
+    var list = self._owned_strings;
+    list.deinit(allocator);
 }
 
 // ============================================================================
@@ -299,6 +308,20 @@ pub fn printConfigPath(allocator: std.mem.Allocator) void {
 }
 
 // ============================================================================
+// String Ownership
+// ============================================================================
+
+/// Duplicate a string and track it for cleanup in deinit.
+fn dupeString(self: *Config, allocator: std.mem.Allocator, value: []const u8) ?[]const u8 {
+    const duped = allocator.dupe(u8, value) catch return null;
+    self._owned_strings.append(allocator, duped) catch {
+        allocator.free(duped);
+        return null;
+    };
+    return duped;
+}
+
+// ============================================================================
 // File Parsing
 // ============================================================================
 
@@ -337,7 +360,7 @@ fn parseContent(self: *Config, allocator: std.mem.Allocator, content: []const u8
 /// Apply a single key = value pair to the config.
 fn applyKeyValue(self: *Config, allocator: std.mem.Allocator, key: []const u8, value: []const u8, base_dir: []const u8) void {
     if (std.mem.eql(u8, key, "font-family")) {
-        self.@"font-family" = value;
+        self.@"font-family" = self.dupeString(allocator, value) orelse return;
     } else if (std.mem.eql(u8, key, "font-style")) {
         if (FontWeight.parse(value)) |w| {
             self.@"font-style" = w;
@@ -370,9 +393,9 @@ fn applyKeyValue(self: *Config, allocator: std.mem.Allocator, key: []const u8, v
             log.warn("invalid cursor-style-blink: {s}", .{value});
         }
     } else if (std.mem.eql(u8, key, "theme")) {
-        self.theme = value;
+        self.theme = self.dupeString(allocator, value) orelse return;
     } else if (std.mem.eql(u8, key, "custom-shader")) {
-        self.@"custom-shader" = value;
+        self.@"custom-shader" = self.dupeString(allocator, value) orelse return;
     } else if (std.mem.eql(u8, key, "window-height")) {
         const v = std.fmt.parseInt(u16, value, 10) catch {
             log.warn("invalid window-height: {s}", .{value});

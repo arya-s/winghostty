@@ -1229,6 +1229,72 @@ fn updateCursorBlink() void {
     }
 }
 
+/// Clear all GL textures from the glyph cache and reset it.
+fn clearGlyphCache(allocator: std.mem.Allocator) void {
+    var it = glyph_cache.iterator();
+    while (it.next()) |entry| {
+        gl.DeleteTextures.?(1, &entry.value_ptr.texture_id);
+    }
+    glyph_cache.deinit(allocator);
+    glyph_cache = .empty;
+}
+
+/// Clear fallback font faces.
+fn clearFallbackFaces(allocator: std.mem.Allocator) void {
+    var it = g_fallback_faces.iterator();
+    while (it.next()) |entry| {
+        entry.value_ptr.deinit();
+    }
+    g_fallback_faces.deinit(allocator);
+    g_fallback_faces = .empty;
+}
+
+/// Try to load a font face from config, returning the face or null on failure.
+fn loadFontFromConfig(
+    allocator: std.mem.Allocator,
+    font_family: []const u8,
+    weight: directwrite.DWRITE_FONT_WEIGHT,
+    font_size: u32,
+    ft_lib: freetype.Library,
+) ?freetype.Face {
+    // Try system font via DirectWrite
+    if (font_family.len > 0) {
+        if (g_font_discovery) |dw| {
+            if (dw.findFontFilePath(allocator, font_family, weight, .NORMAL) catch null) |result| {
+                var r = result;
+                defer r.deinit();
+                if (ft_lib.initFace(r.path, @intCast(r.face_index))) |face| {
+                    face.setCharSize(0, @as(i32, @intCast(font_size)) * 64, 96, 96) catch {
+                        face.deinit();
+                        return null;
+                    };
+                    std.debug.print("Reload: loaded system font '{s}'\n", .{font_family});
+                    return face;
+                } else |_| {}
+            }
+        }
+        std.debug.print("Reload: font '{s}' not found, using embedded fallback\n", .{font_family});
+    }
+
+    // Fall back to embedded font
+    const face = ft_lib.initMemoryFace(embedded.regular, 0) catch return null;
+    face.setCharSize(0, @as(i32, @intCast(font_size)) * 64, 96, 96) catch {
+        face.deinit();
+        return null;
+    };
+    return face;
+}
+
+/// Resize the window to fit the current terminal grid and cell dimensions.
+fn resizeWindowToGrid(window: *c.GLFWwindow) void {
+    const padding: f32 = 10;
+    const content_w: f32 = cell_width * @as(f32, @floatFromInt(term_cols));
+    const content_h: f32 = cell_height * @as(f32, @floatFromInt(term_rows));
+    const win_w: c_int = @intFromFloat(content_w + padding * 2);
+    const win_h: c_int = @intFromFloat(content_h + padding * 2);
+    c.glfwSetWindowSize(window, win_w, win_h);
+}
+
 /// Check if the config file has changed (via ReadDirectoryChangesW) and reload if so.
 fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void {
     if (!watcher.hasChanged()) return;
@@ -1241,10 +1307,46 @@ fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void
     };
     defer cfg.deinit(allocator);
 
-    // Hot-reload: theme, cursor style, cursor blink
+    const window = g_window orelse return;
+    const ft_lib = g_ft_lib orelse return;
+
+    // --- Theme, cursor ---
     g_theme = cfg.resolved_theme;
     g_cursor_style = cfg.@"cursor-style";
     g_cursor_blink = cfg.@"cursor-style-blink";
+
+    // --- Font ---
+    const new_font_size = cfg.@"font-size";
+    const new_weight = cfg.@"font-style".toDwriteWeight();
+    const new_family = cfg.@"font-family";
+
+    // Reload font: clear caches, load new face, recalculate metrics
+    if (loadFontFromConfig(allocator, new_family, new_weight, new_font_size, ft_lib)) |new_face| {
+        // Clean up old font state
+        if (glyph_face) |old| old.deinit();
+        clearGlyphCache(allocator);
+        clearFallbackFaces(allocator);
+
+        g_font_size = new_font_size;
+        preloadCharacters(new_face);
+        // glyph_face is set inside preloadCharacters
+
+        // --- Window size ---
+        // If window size is configured, apply it; then resize window to match new cell dims
+        if (cfg.@"window-width" > 0) term_cols = cfg.@"window-width";
+        if (cfg.@"window-height" > 0) term_rows = cfg.@"window-height";
+        resizeWindowToGrid(window);
+
+        // Resize terminal and PTY to match
+        if (g_terminal) |term| {
+            term.resize(allocator, term_cols, term_rows) catch {};
+        }
+        if (g_pty) |pty| {
+            pty.resize(term_cols, term_rows);
+        }
+    } else {
+        std.debug.print("Reload: failed to load font, keeping current font\n", .{});
+    }
 
     std.debug.print("Config reloaded successfully\n", .{});
 }
@@ -1804,14 +1906,7 @@ pub fn main() !void {
     g_font_discovery = if (dw_discovery) |*dw| dw else null;
     defer g_font_discovery = null;
 
-    // Clean up fallback faces on exit
-    defer {
-        var it = g_fallback_faces.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.deinit();
-        }
-        g_fallback_faces.deinit(allocator);
-    }
+    // Fallback faces are cleaned up in the main defer block (with glyph_face)
 
     // Try to find the requested font via DirectWrite
     var font_result: ?directwrite.FontDiscovery.FontResult = null;
@@ -1849,7 +1944,8 @@ pub fn main() !void {
             return err;
         };
     };
-    defer face.deinit();
+    // Don't defer face.deinit() here — glyph_face owns it and may be
+    // replaced by hot-reload. Cleanup is in the defer block below.
 
     face.setCharSize(0, @as(i32, @intCast(font_size)) * 64, 96, 96) catch |err| {
         std.debug.print("Failed to set font size: {}\n", .{err});
@@ -1866,12 +1962,12 @@ pub fn main() !void {
     initBuffers();
     preloadCharacters(face);
     defer {
+        // Clean up the current font face (may have been replaced by hot-reload)
+        if (glyph_face) |f| f.deinit();
+        glyph_face = null;
         // Clean up glyph cache textures
-        var it = glyph_cache.iterator();
-        while (it.next()) |entry| {
-            gl.DeleteTextures.?(1, &entry.value_ptr.texture_id);
-        }
-        glyph_cache.deinit(allocator);
+        clearGlyphCache(allocator);
+        clearFallbackFaces(allocator);
     }
     initSolidTexture();
 
