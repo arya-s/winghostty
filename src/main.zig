@@ -1315,6 +1315,16 @@ fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void
     g_cursor_style = cfg.@"cursor-style";
     g_cursor_blink = cfg.@"cursor-style-blink";
 
+    // Sync cursor style to terminal (rendering reads from terminal state)
+    if (g_terminal) |term| {
+        term.screens.active.cursor.cursor_style = switch (g_cursor_style) {
+            .bar => .bar,
+            .block => .block,
+            .underline => .underline,
+            .block_hollow => .block_hollow,
+        };
+    }
+
     // --- Font ---
     const new_font_size = cfg.@"font-size";
     const new_weight = cfg.@"font-style".toDwriteWeight();

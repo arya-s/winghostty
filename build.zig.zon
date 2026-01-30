@@ -1,7 +1,7 @@
 .{
     .name = .phantty,
     .version = "0.1.0",
-    .fingerprint = 0x3b92d6b5a730cbd9,
+    .fingerprint = 0x940001c6ff1b8d7c,
     .minimum_zig_version = "0.15.2",
 
     .paths = .{
