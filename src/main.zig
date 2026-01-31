@@ -322,10 +322,8 @@ fn addPlaceholderTab() void {
 }
 
 fn closeTab(idx: usize) void {
-    if (g_tab_count <= 1) return; // don't close last tab
+    if (g_tab_count <= 1) return; // last tab closed via g_should_close instead
     if (idx >= g_tab_count) return;
-    // Don't allow closing the terminal tab (index 0) for now
-    if (g_tabs[idx].kind == .terminal) return;
 
     // Shift tabs down
     var i = idx;
@@ -333,10 +331,18 @@ fn closeTab(idx: usize) void {
         g_tabs[i] = g_tabs[i + 1];
     }
     g_tab_count -= 1;
-    if (g_active_tab >= g_tab_count) {
-        g_active_tab = g_tab_count - 1;
+
+    // Adjust active tab index
+    if (g_active_tab == idx) {
+        // Closed the active tab — switch to the one that took its place,
+        // or the last tab if we closed the rightmost
+        if (g_active_tab >= g_tab_count) {
+            g_active_tab = g_tab_count - 1;
+        }
+    } else if (g_active_tab > idx) {
+        // Closed a tab before the active one — shift index left
+        g_active_tab -= 1;
     }
-    std.debug.print("Tab closed, count: {}, active: {}\n", .{ g_tab_count, g_active_tab });
 }
 
 fn switchTab(idx: usize) void {
@@ -376,6 +382,8 @@ const Character = struct {
 // Glyph cache using a hashmap for Unicode support
 var glyph_cache: std.AutoHashMapUnmanaged(u32, Character) = .empty;
 var glyph_face: ?freetype.Face = null;
+var icon_face: ?freetype.Face = null; // Segoe MDL2 Assets for caption button icons
+var icon_cache: std.AutoHashMapUnmanaged(u32, Character) = .empty;
 var vao: c.GLuint = 0;
 var vbo: c.GLuint = 0;
 var shader_program: c.GLuint = 0;
@@ -1064,7 +1072,6 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
     };
     const text_active = [3]f32{ 0.9, 0.9, 0.9 };
     const text_inactive = [3]f32{ 0.55, 0.55, 0.55 };
-    const plus_color = [3]f32{ 0.5, 0.5, 0.5 };
 
     // Layout constants
     const caption_btn_w: f32 = 46;
@@ -1249,13 +1256,40 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
             renderQuad(cursor_x, tb_top, bdr, titlebar_h, border_color);
         }
 
-        // + icon
-        const plus_cx = cursor_x + plus_btn_w / 2;
-        const plus_cy = tb_top + titlebar_h / 2;
-        const arm: f32 = 5;
-        const t: f32 = 1.0;
-        renderQuad(plus_cx - arm, plus_cy - t / 2, arm * 2, t, plus_color);
-        renderQuad(plus_cx - t / 2, plus_cy - arm, t, arm * 2, plus_color);
+        // + icon — same font/color as caption buttons, scaled up 15% to match stroke weight
+        const plus_icon_color = [3]f32{ 0.75, 0.75, 0.75 };
+        const plus_scale: f32 = 1.15;
+        if (icon_face != null) {
+            if (loadIconGlyph(0xE948)) |ch| {
+                const gw = @as(f32, @floatFromInt(ch.size_x)) * plus_scale;
+                const gh = @as(f32, @floatFromInt(ch.size_y)) * plus_scale;
+                const gx = cursor_x + (plus_btn_w - gw) / 2;
+                const gy = tb_top + (titlebar_h + gh) / 2 - @as(f32, @floatFromInt(ch.bearing_y)) * plus_scale;
+
+                const vertices = [6][4]f32{
+                    .{ gx, gy + gh, 0.0, 0.0 },
+                    .{ gx, gy, 0.0, 1.0 },
+                    .{ gx + gw, gy, 1.0, 1.0 },
+                    .{ gx, gy + gh, 0.0, 0.0 },
+                    .{ gx + gw, gy, 1.0, 1.0 },
+                    .{ gx + gw, gy + gh, 1.0, 0.0 },
+                };
+
+                gl.Uniform3f.?(gl.GetUniformLocation.?(shader_program, "textColor"), plus_icon_color[0], plus_icon_color[1], plus_icon_color[2]);
+                gl.BindTexture.?(c.GL_TEXTURE_2D, ch.texture_id);
+                gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
+                gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
+                gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
+                gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6);
+            }
+        } else {
+            const plus_cx = cursor_x + plus_btn_w / 2;
+            const plus_cy = tb_top + titlebar_h / 2;
+            const arm: f32 = 5;
+            const t: f32 = 1.0;
+            renderQuad(plus_cx - arm, plus_cy - t / 2, arm * 2, t, plus_icon_color);
+            renderQuad(plus_cx - t / 2, plus_cy - arm, t, arm * 2, plus_icon_color);
+        }
         cursor_x += plus_btn_w;
     }
 
@@ -1281,65 +1315,150 @@ const CaptionButtonType = enum { minimize, maximize, close };
 ///   - Hover (min/max): subtle light fill bg, white icon
 ///   - Hover (close): red #C42B1C bg, white icon
 fn renderCaptionButton(x: f32, y: f32, w: f32, h: f32, btn_type: CaptionButtonType, hovered: bool) void {
-    // Draw hover background
+    // Draw hover background with inset padding (matches Explorer)
     if (hovered) {
+        const pad: f32 = 2;
         const hover_bg = switch (btn_type) {
             .close => [3]f32{ 0.77, 0.17, 0.11 }, // #C42B1C
             else => [3]f32{
-                @min(1.0, g_theme.background[0] + 0.15),
-                @min(1.0, g_theme.background[1] + 0.15),
-                @min(1.0, g_theme.background[2] + 0.15),
+                @min(1.0, g_theme.background[0] + 0.05),
+                @min(1.0, g_theme.background[1] + 0.05),
+                @min(1.0, g_theme.background[2] + 0.05),
             },
         };
-        renderQuad(x, y, w, h, hover_bg);
+        renderQuad(x + pad, y + pad, w - pad * 2, h - pad * 2, hover_bg);
     }
 
     // Icon color: white when hovered, light gray otherwise
     const icon_color: [3]f32 = if (hovered) .{ 1.0, 1.0, 1.0 } else .{ 0.75, 0.75, 0.75 };
 
-    const cx = x + w / 2; // button center x
-    const cy = y + h / 2; // button center y
+    // Check if window is maximized (for restore icon)
+    const is_maximized = if (build_options.use_win32)
+        (if (g_window) |win| win32_backend.IsZoomed(win.hwnd) != 0 else false)
+    else
+        false;
 
-    // Icon dimensions: 10×10 logical pixels, 1px stroke
-    const icon_size: f32 = 10;
-    const half: f32 = icon_size / 2;
-    const t: f32 = 1.0; // stroke thickness
+    // Segoe MDL2 Assets glyph codepoints (same as Windows Terminal)
+    const icon_codepoint: u32 = switch (btn_type) {
+        .close => 0xE8BB,
+        .maximize => if (is_maximized) @as(u32, 0xE923) else @as(u32, 0xE922),
+        .minimize => 0xE921,
+    };
+
+    // Try rendering from Segoe MDL2 Assets icon font
+    if (icon_face != null) {
+        if (loadIconGlyph(icon_codepoint)) |ch| {
+            const gw = @as(f32, @floatFromInt(ch.size_x));
+            const gh = @as(f32, @floatFromInt(ch.size_y));
+            // Center the glyph bitmap in the button (ignore baseline positioning)
+            const gx = x + (w - gw) / 2;
+            const gy = y + (h - gh) / 2;
+
+            const vertices = [6][4]f32{
+                .{ gx, gy + gh, 0.0, 0.0 },
+                .{ gx, gy, 0.0, 1.0 },
+                .{ gx + gw, gy, 1.0, 1.0 },
+                .{ gx, gy + gh, 0.0, 0.0 },
+                .{ gx + gw, gy, 1.0, 1.0 },
+                .{ gx + gw, gy + gh, 1.0, 0.0 },
+            };
+
+            gl.Uniform3f.?(gl.GetUniformLocation.?(shader_program, "textColor"), icon_color[0], icon_color[1], icon_color[2]);
+            gl.BindTexture.?(c.GL_TEXTURE_2D, ch.texture_id);
+            gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
+            gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
+            gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
+            gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6);
+            return;
+        }
+    }
+
+    // Fallback: quad-based icons
+    const cx = x + w / 2;
+    const cy = y + h / 2;
 
     switch (btn_type) {
         .close => {
-            // × icon: two diagonal lines from corner to corner of 10×10 box.
-            // Drawn as overlapping quads along the diagonal for a smooth line.
-            const steps: usize = 20;
-            const step_size = icon_size / @as(f32, @floatFromInt(steps - 1));
+            const size: f32 = 5;
+            const steps: usize = 32;
+            const t: f32 = 1.5;
             for (0..steps) |i| {
-                const fi = @as(f32, @floatFromInt(i));
-                const px = cx - half + fi * step_size;
-                // Top-left → bottom-right diagonal
-                const py1 = cy + half - fi * step_size;
-                renderQuad(px - t * 0.5, py1 - t * 0.5, t, t, icon_color);
-                // Top-right → bottom-left diagonal
-                const py2 = cy - half + fi * step_size;
-                renderQuad(px - t * 0.5, py2 - t * 0.5, t, t, icon_color);
+                const frac = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(steps - 1));
+                const px = cx - size + frac * size * 2;
+                const py1 = cy + size - frac * size * 2;
+                renderQuad(px - t / 2, py1 - t / 2, t, t, icon_color);
+                const py2 = cy - size + frac * size * 2;
+                renderQuad(px - t / 2, py2 - t / 2, t, t, icon_color);
             }
         },
         .maximize => {
-            // □ icon: 10×10 square outline, 1px stroke
-            const left = cx - half;
-            const bottom = cy - half;
-            renderQuad(left, bottom + icon_size - t, icon_size, t, icon_color); // top
-            renderQuad(left, bottom, icon_size, t, icon_color); // bottom
-            renderQuad(left, bottom, t, icon_size, icon_color); // left
-            renderQuad(left + icon_size - t, bottom, t, icon_size, icon_color); // right
+            const size: f32 = 5;
+            const t: f32 = 1;
+            renderQuad(cx - size, cy + size - t, size * 2, t, icon_color); // top
+            renderQuad(cx - size, cy - size, size * 2, t, icon_color); // bottom
+            renderQuad(cx - size, cy - size, t, size * 2, icon_color); // left
+            renderQuad(cx + size - t, cy - size, t, size * 2, icon_color); // right
         },
         .minimize => {
-            // ─ icon: single horizontal line, 10px wide, centered
-            renderQuad(cx - half, cy - t / 2, icon_size, t, icon_color);
+            const size: f32 = 5;
+            const t: f32 = 1;
+            renderQuad(cx - size, cy - t / 2, size * 2, t, icon_color);
         },
     }
 }
 
 fn getGlyphInfo(codepoint: u32) ?Character {
     return glyph_cache.get(codepoint);
+}
+
+/// Load a glyph from the Segoe MDL2 Assets icon font.
+fn loadIconGlyph(codepoint: u32) ?Character {
+    if (icon_cache.get(codepoint)) |ch| return ch;
+
+    const face = icon_face orelse return null;
+    const alloc = g_allocator orelse return null;
+
+    const glyph_index = face.getCharIndex(codepoint) orelse return null;
+    if (glyph_index == 0) return null;
+
+    // Use mono hinting for crisp icon rendering (snaps to pixel grid)
+    face.loadGlyph(@intCast(glyph_index), .{ .target = .normal }) catch return null;
+    face.renderGlyph(.normal) catch return null;
+
+    const glyph = face.handle.*.glyph;
+    const bitmap = glyph.*.bitmap;
+
+    var texture: c.GLuint = 0;
+    gl.GenTextures.?(1, &texture);
+    gl.BindTexture.?(c.GL_TEXTURE_2D, texture);
+
+    if (bitmap.width > 0 and bitmap.rows > 0) {
+        gl.TexImage2D.?(
+            c.GL_TEXTURE_2D, 0, c.GL_RED,
+            @intCast(bitmap.width), @intCast(bitmap.rows),
+            0, c.GL_RED, c.GL_UNSIGNED_BYTE, bitmap.buffer,
+        );
+    } else {
+        const empty: [1]u8 = .{0};
+        gl.TexImage2D.?(c.GL_TEXTURE_2D, 0, c.GL_RED, 1, 1, 0, c.GL_RED, c.GL_UNSIGNED_BYTE, &empty);
+    }
+
+    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
+    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
+    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_NEAREST);
+    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_NEAREST);
+
+    const ch = Character{
+        .texture_id = texture,
+        .size_x = @intCast(bitmap.width),
+        .size_y = @intCast(bitmap.rows),
+        .bearing_x = @intCast(glyph.*.bitmap_left),
+        .bearing_y = @intCast(glyph.*.bitmap_top),
+        .advance = @intCast(glyph.*.advance.x),
+    };
+
+    icon_cache.put(alloc, codepoint, ch) catch return null;
+    return ch;
 }
 
 /// Render placeholder content for tabs that don't have a terminal yet.
@@ -2555,6 +2674,23 @@ const win32_input = if (build_options.use_win32) struct {
     var plus_btn_pressed: bool = false;
 
     fn handleMouseButton(ev: win32_backend.MouseButtonEvent) void {
+        // Middle-click on tab to close it
+        if (ev.button == .middle and ev.action == .release) {
+            const xpos: f64 = @floatFromInt(ev.x);
+            const ypos: f64 = @floatFromInt(ev.y);
+            const titlebar_h: f64 = if (g_window) |w| @floatFromInt(w.titlebar_height) else 40;
+            if (ypos < titlebar_h) {
+                if (hitTestTab(xpos)) |tab_idx| {
+                    if (g_tab_count <= 1) {
+                        g_should_close = true;
+                    } else {
+                        closeTab(tab_idx);
+                    }
+                }
+            }
+            return;
+        }
+
         if (ev.button == .left) {
             const xpos: f64 = @floatFromInt(ev.x);
             const ypos: f64 = @floatFromInt(ev.y);
@@ -2624,6 +2760,35 @@ const win32_input = if (build_options.use_win32) struct {
         if (show_plus and xpos >= cursor and xpos < cursor + plus_btn_w) {
             plus_btn_pressed = true;
         }
+    }
+
+    fn hitTestTab(xpos: f64) ?usize {
+        const win = g_window orelse return null;
+        const window_width: f64 = blk: {
+            var rect: win32_backend.RECT = undefined;
+            _ = win32_backend.GetClientRect(win.hwnd, &rect);
+            break :blk @floatFromInt(rect.right);
+        };
+
+        const caption_area_w: f64 = 46 * 3;
+        const gap_w: f64 = 42;
+        const plus_btn_w: f64 = 40;
+        const show_plus = g_tab_count > 1;
+        const num_tabs = g_tab_count;
+
+        const plus_total: f64 = if (show_plus) plus_btn_w else 0;
+        const right_reserved: f64 = caption_area_w + gap_w + plus_total;
+        const tab_area_w: f64 = window_width - right_reserved;
+        const tab_w: f64 = if (num_tabs > 0) tab_area_w / @as(f64, @floatFromInt(num_tabs)) else tab_area_w;
+
+        var cursor: f64 = 0;
+        for (0..num_tabs) |tab_idx| {
+            if (xpos >= cursor and xpos < cursor + tab_w) {
+                return tab_idx;
+            }
+            cursor += tab_w;
+        }
+        return null;
     }
 
     fn hitTestPlusButton(xpos: f64) bool {
@@ -3076,13 +3241,41 @@ pub fn main() !void {
     }
     initBuffers();
     preloadCharacters(face);
+
+    // Load Segoe MDL2 Assets for caption button icons (Windows system font)
+    // Size is DPI-dependent: 10px at 96 DPI, scales proportionally
+    if (ft_lib.initFace("C:\\Windows\\Fonts\\segmdl2.ttf", 0)) |iface| {
+        const dpi: u32 = if (build_options.use_win32)
+            (if (g_window) |w| win32_backend.GetDpiForWindow(w.hwnd) else 96)
+        else
+            96;
+        // 10px at 96 DPI = 10pt at 72 DPI. Scale for actual DPI.
+        const icon_size_26_6: i32 = @intCast(10 * 64 * dpi / 96);
+        iface.setCharSize(0, icon_size_26_6, 72, 72) catch {};
+        icon_face = iface;
+        std.debug.print("Loaded Segoe MDL2 Assets for caption icons (dpi={})\n", .{dpi});
+    } else |_| {
+        std.debug.print("Segoe MDL2 Assets not found, using quad-based caption icons\n", .{});
+    }
+
     defer {
+        // Clean up icon font
+        if (icon_face) |f| {
+            f.deinit();
+            icon_face = null;
+        }
         // Clean up the current font face (may have been replaced by hot-reload)
         if (glyph_face) |f| f.deinit();
         glyph_face = null;
         // Clean up glyph cache textures
         clearGlyphCache(allocator);
         clearFallbackFaces(allocator);
+        // Clean up icon cache
+        var icon_it = icon_cache.iterator();
+        while (icon_it.next()) |entry| {
+            gl.DeleteTextures.?(1, &entry.value_ptr.texture_id);
+        }
+        icon_cache.deinit(allocator);
     }
     initSolidTexture();
 

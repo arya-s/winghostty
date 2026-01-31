@@ -142,6 +142,7 @@ pub const WS_EX_APPWINDOW: DWORD = 0x00040000;
 pub const CS_HREDRAW: UINT = 0x0002;
 pub const CS_VREDRAW: UINT = 0x0001;
 pub const CS_OWNDC: UINT = 0x0020;
+pub const CS_DBLCLKS: UINT = 0x0008;
 
 // ShowWindow commands
 pub const SW_MINIMIZE: INT = 6;
@@ -172,6 +173,11 @@ pub const WM_CHAR: UINT = 0x0102;
 pub const WM_MOUSEMOVE: UINT = 0x0200;
 pub const WM_LBUTTONDOWN: UINT = 0x0201;
 pub const WM_LBUTTONUP: UINT = 0x0202;
+pub const WM_LBUTTONDBLCLK: UINT = 0x0203;
+pub const WM_MBUTTONDOWN: UINT = 0x0207;
+pub const WM_MBUTTONUP: UINT = 0x0208;
+pub const WM_NCMBUTTONDOWN: UINT = 0x00A8;
+pub const WM_NCMBUTTONUP: UINT = 0x00A9;
 pub const WM_RBUTTONDOWN: UINT = 0x0204;
 pub const WM_RBUTTONUP: UINT = 0x0205;
 pub const WM_MOUSEWHEEL: UINT = 0x020A;
@@ -272,6 +278,8 @@ extern "user32" fn PostQuitMessage(nExitCode: INT) callconv(.winapi) void;
 extern "user32" fn GetDC(hWnd: ?HWND) callconv(.winapi) ?HDC;
 extern "user32" fn ReleaseDC(hWnd: ?HWND, hDC: HDC) callconv(.winapi) INT;
 pub extern "user32" fn GetClientRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
+pub extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.winapi) UINT;
+extern "user32" fn SendMessageW(hWnd: HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT;
 extern "user32" fn InvalidateRect(hWnd: HWND, lpRect: ?*const RECT, bErase: BOOL) callconv(.winapi) BOOL;
 extern "user32" fn BeginPaint(hWnd: HWND, lpPaint: *PAINTSTRUCT) callconv(.winapi) ?HDC;
 extern "user32" fn EndPaint(hWnd: HWND, lpPaint: *const PAINTSTRUCT) callconv(.winapi) BOOL;
@@ -486,7 +494,7 @@ pub const Window = struct {
         _ = RegisterClassExW(&dummy_wc);
 
         const real_wc = WNDCLASSEXW{
-            .style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC,
+            .style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC | CS_DBLCLKS,
             .lpfnWndProc = wndProc,
             .hInstance = hInstance,
             .hCursor = LoadCursorW(null, IDC_ARROW),
@@ -816,6 +824,7 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
     // - WM_NCMOUSEMOVE, WM_NCMOUSELEAVE: our hover tracking
     if (msg != WM_NCCALCSIZE and msg != WM_NCHITTEST and
         msg != WM_NCLBUTTONDOWN and msg != WM_NCLBUTTONUP and
+        msg != WM_NCMBUTTONDOWN and msg != WM_NCMBUTTONUP and
         msg != WM_NCMOUSEMOVE and msg != WM_NCMOUSELEAVE)
     {
         var dwm_result: LRESULT = 0;
@@ -929,8 +938,9 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
                 }
 
                 if (w.tab_count <= 1) {
-                    // Single tab: entire titlebar is draggable
-                    return HTCAPTION;
+                    // Single tab: return HTCLIENT so all mouse events come through
+                    // (we handle drag-to-move via WM_LBUTTONDOWN → WM_NCLBUTTONDOWN)
+                    return HTCLIENT;
                 }
 
                 // Multiple tabs: tab area and + button are clickable for switching.
@@ -985,6 +995,20 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             if (w.pressed_button != .none) return 0;
             // For HTCAPTION etc., let DefWindowProc handle dragging
             return DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+        WM_NCMBUTTONDOWN => {
+            // Eat it to prevent default behavior
+            return 0;
+        },
+        WM_NCMBUTTONUP => {
+            // Convert screen coords to client coords and push as middle-click release
+            var pt = POINT{
+                .x = @as(i16, @bitCast(@as(u16, @intCast(lParam & 0xFFFF)))),
+                .y = @as(i16, @bitCast(@as(u16, @intCast((lParam >> 16) & 0xFFFF)))),
+            };
+            _ = ScreenToClient(hwnd, &pt);
+            w.mouse_button_events.push(.{ .button = .middle, .action = .release, .x = pt.x, .y = pt.y });
+            return 0;
         },
         WM_NCLBUTTONUP => {
             const pressed = w.pressed_button;
@@ -1055,10 +1079,49 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
         WM_LBUTTONDOWN => {
             const x: i32 = @as(i16, @bitCast(@as(u16, @intCast(lParam & 0xFFFF))));
             const y: i32 = @as(i16, @bitCast(@as(u16, @intCast((lParam >> 16) & 0xFFFF))));
+
+            // Single tab: left-click in titlebar initiates window drag
+            if (w.tab_count <= 1 and y < w.titlebar_height) {
+                _ = ReleaseCapture();
+                _ = SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, lParam);
+                return 0;
+            }
+
             w.mouse_button_events.push(.{ .button = .left, .action = .press, .x = x, .y = y });
             // Capture mouse so we get move events outside the window during drag
             _ = SetCapture(hwnd);
             return 0;
+        },
+        WM_LBUTTONDBLCLK => {
+            const x: i32 = @as(i16, @bitCast(@as(u16, @intCast(lParam & 0xFFFF))));
+            const y: i32 = @as(i16, @bitCast(@as(u16, @intCast((lParam >> 16) & 0xFFFF))));
+            // Double-click in titlebar: maximize/restore
+            // Only if in the draggable area (not on tabs or + button)
+            if (y < w.titlebar_height) {
+                var client_rect: RECT = undefined;
+                _ = GetClientRect(hwnd, &client_rect);
+                const window_width = client_rect.right - client_rect.left;
+                const caption_x = window_width - getCaptionButtonWidth();
+
+                if (w.tab_count <= 1) {
+                    // Single tab: entire titlebar is draggable, allow maximize
+                    if (IsZoomed(hwnd) != 0) {
+                        _ = ShowWindow(hwnd, SW_RESTORE);
+                    } else {
+                        _ = ShowWindow(hwnd, SW_MAXIMIZE);
+                    }
+                    return 0;
+                } else {
+                    // Multi-tab: only maximize in the gap between + button and caption buttons
+                    // The gap area is roughly from the end of tabs+plus to caption buttons
+                    // If clicked on caption button area or beyond, ignore
+                    if (x >= caption_x) return 0;
+                    // Let it pass through as a regular click for tab/+ button handling
+                    w.mouse_button_events.push(.{ .button = .left, .action = .press, .x = x, .y = y });
+                    return 0;
+                }
+            }
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
         },
         WM_LBUTTONUP => {
             const x: i32 = @as(i16, @bitCast(@as(u16, @intCast(lParam & 0xFFFF))));
@@ -1077,6 +1140,18 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             const x: i32 = @as(i16, @bitCast(@as(u16, @intCast(lParam & 0xFFFF))));
             const y: i32 = @as(i16, @bitCast(@as(u16, @intCast((lParam >> 16) & 0xFFFF))));
             w.mouse_button_events.push(.{ .button = .right, .action = .release, .x = x, .y = y });
+            return 0;
+        },
+        WM_MBUTTONDOWN => {
+            const x: i32 = @as(i16, @bitCast(@as(u16, @intCast(lParam & 0xFFFF))));
+            const y: i32 = @as(i16, @bitCast(@as(u16, @intCast((lParam >> 16) & 0xFFFF))));
+            w.mouse_button_events.push(.{ .button = .middle, .action = .press, .x = x, .y = y });
+            return 0;
+        },
+        WM_MBUTTONUP => {
+            const x: i32 = @as(i16, @bitCast(@as(u16, @intCast(lParam & 0xFFFF))));
+            const y: i32 = @as(i16, @bitCast(@as(u16, @intCast((lParam >> 16) & 0xFFFF))));
+            w.mouse_button_events.push(.{ .button = .middle, .action = .release, .x = x, .y = y });
             return 0;
         },
         WM_MOUSEMOVE => {
