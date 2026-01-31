@@ -115,6 +115,7 @@ var g_selection: Selection = .{
     .end_row = 0,
     .active = false,
 };
+var g_should_close: bool = false; // Set by Ctrl+W with 1 tab
 var g_selecting: bool = false; // True while mouse button is held
 var g_click_x: f64 = 0; // X position of initial click (for threshold calculation)
 var g_click_y: f64 = 0; // Y position of initial click
@@ -212,29 +213,62 @@ fn scanForOscTitle(data: []const u8) void {
 }
 
 /// OSC 7 gives us a reliable CWD. OSC 0/1/2 give us whatever the shell sets.
-/// We track both separately — OSC 7 always wins for display.
+/// Within the same PTY read batch, OSC 7 wins over 0/1/2 (OMZ sends truncated
+/// OSC 0 after the full OSC 7). Between batches, any new title is accepted.
 var g_osc7_title: [256]u8 = undefined;
 var g_osc7_title_len: usize = 0;
+var g_got_osc7_this_batch: bool = false;
+
+/// Map known shell executable paths/titles to friendly display names.
+/// Windows Terminal does the same — "Windows PowerShell", "Command Prompt", etc.
+fn shellFriendlyName(title: []const u8) []const u8 {
+    // Case-insensitive check helpers
+    const lower_buf = blk: {
+        var buf: [512]u8 = undefined;
+        const len = @min(title.len, buf.len);
+        for (0..len) |i| {
+            buf[i] = if (title[i] >= 'A' and title[i] <= 'Z') title[i] + 32 else title[i];
+        }
+        break :blk buf[0..len];
+    };
+
+    // PowerShell (Windows PowerShell or pwsh)
+    if (std.mem.indexOf(u8, lower_buf, "powershell.exe") != null) return "Windows PowerShell";
+    if (std.mem.indexOf(u8, lower_buf, "pwsh.exe") != null) return "PowerShell";
+    if (std.mem.indexOf(u8, lower_buf, "powershell") != null and
+        std.mem.indexOf(u8, lower_buf, ".exe") == null) return "Windows PowerShell";
+    if (std.mem.indexOf(u8, lower_buf, "pwsh") != null and
+        std.mem.indexOf(u8, lower_buf, ".exe") == null) return "PowerShell";
+
+    // Command Prompt
+    if (std.mem.indexOf(u8, lower_buf, "cmd.exe") != null) return "Command Prompt";
+    if (std.mem.eql(u8, lower_buf, "cmd")) return "Command Prompt";
+
+    // Return original title if no match
+    return title;
+}
+
+fn resetOscBatch() void {
+    g_got_osc7_this_batch = false;
+}
 
 fn updateWindowTitle(title: []const u8, osc_num: u8) void {
     if (title.len == 0) return;
 
     if (osc_num == '7') {
         // OSC 7: file://host/path — extract the path, replace /home/<user> with ~
+        g_got_osc7_this_batch = true;
         const prefix = "file://";
         if (std.mem.startsWith(u8, title, prefix)) {
             const after_prefix = title[prefix.len..];
             if (std.mem.indexOfScalar(u8, after_prefix, '/')) |slash| {
                 const path = after_prefix[slash..];
 
-                // Detect home directory: /home/<user> pattern
-                // Find the home prefix by looking for /home/XXX
                 const home_prefix = "/home/";
                 if (std.mem.startsWith(u8, path, home_prefix)) {
-                    // Find end of username
                     const after_home = path[home_prefix.len..];
                     const user_end = std.mem.indexOfScalar(u8, after_home, '/') orelse after_home.len;
-                    const home_len = home_prefix.len + user_end; // "/home/user"
+                    const home_len = home_prefix.len + user_end;
 
                     const rest = path[home_len..];
                     g_osc7_title[0] = '~';
@@ -249,13 +283,20 @@ fn updateWindowTitle(title: []const u8, osc_num: u8) void {
             }
         }
     } else {
-        // OSC 0/1/2 — store as fallback
-        const len = @min(title.len, g_window_title.len);
-        @memcpy(g_window_title[0..len], title[0..len]);
+        // OSC 0/1/2 — skip if we already got OSC 7 in this same batch
+        if (g_got_osc7_this_batch) return;
+
+        // Map known shell paths/titles to friendly names
+        const friendly = shellFriendlyName(title);
+
+        // Accept and clear OSC 7 cache (new shell may not send OSC 7)
+        g_osc7_title_len = 0;
+        const len = @min(friendly.len, g_window_title.len);
+        @memcpy(g_window_title[0..len], friendly[0..len]);
         g_window_title_len = len;
     }
 
-    // Pick best title: OSC 7 path if available, else OSC 0/1/2
+    // Pick best title: OSC 7 if available, else OSC 0/1/2
     const best_title: []const u8 = if (g_osc7_title_len > 0)
         g_osc7_title[0..g_osc7_title_len]
     else
@@ -1052,8 +1093,23 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
         // Inactive tabs: slightly lighter bg with 1px darker inset border
         // Active tab: no border, same as terminal bg (merges with content)
         if (!is_active) {
-            // Fill with inactive bg
-            renderQuad(cursor_x, tb_top, tab_w, titlebar_h, inactive_tab_bg);
+            // Check hover
+            const tab_hovered = blk: {
+                if (!build_options.use_win32) break :blk false;
+                const win = g_window orelse break :blk false;
+                if (win.mouse_y < 0 or win.mouse_y >= @as(i32, @intFromFloat(titlebar_h))) break :blk false;
+                const fx: f32 = @floatFromInt(win.mouse_x);
+                break :blk fx >= cursor_x and fx < cursor_x + tab_w;
+            };
+
+            // Fill — slightly lighter on hover
+            const tab_bg = if (tab_hovered) [3]f32{
+                @min(1.0, inactive_tab_bg[0] + 0.04),
+                @min(1.0, inactive_tab_bg[1] + 0.04),
+                @min(1.0, inactive_tab_bg[2] + 0.04),
+            } else inactive_tab_bg;
+            renderQuad(cursor_x, tb_top, tab_w, titlebar_h, tab_bg);
+
             // 1px inset border — left border only (skip on first tab), top, bottom
             renderQuad(cursor_x, tb_top + titlebar_h - bdr, tab_w, bdr, border_color); // top
             renderQuad(cursor_x, tb_top, tab_w, bdr, border_color); // bottom
@@ -1169,13 +1225,29 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
         cursor_x += tab_w;
     }
 
-    // --- + (new tab) button — shown as a small inset tab, only with 2+ tabs ---
+    // --- + (new tab) button — transparent bg, inactive_tab_bg on hover ---
     if (show_plus) {
-        // Same style as inactive tabs: lighter bg + left border only, top, bottom
-        renderQuad(cursor_x, tb_top, plus_btn_w, titlebar_h, inactive_tab_bg);
-        renderQuad(cursor_x, tb_top + titlebar_h - bdr, plus_btn_w, bdr, border_color); // top
-        renderQuad(cursor_x, tb_top, plus_btn_w, bdr, border_color); // bottom
-        renderQuad(cursor_x, tb_top, bdr, titlebar_h, border_color); // left
+        // Check if mouse is hovering the + button
+        const plus_hovered = blk: {
+            if (!build_options.use_win32) break :blk false;
+            const win = g_window orelse break :blk false;
+            const mouse_x = win.mouse_x;
+            const mouse_y = win.mouse_y;
+            if (mouse_y < 0 or mouse_y >= @as(i32, @intFromFloat(titlebar_h))) break :blk false;
+            const fx: f32 = @floatFromInt(mouse_x);
+            break :blk fx >= cursor_x and fx < cursor_x + plus_btn_w;
+        };
+
+        if (plus_hovered) {
+            renderQuad(cursor_x, tb_top, plus_btn_w, titlebar_h, inactive_tab_bg);
+            renderQuad(cursor_x, tb_top + titlebar_h - bdr, plus_btn_w, bdr, border_color); // top
+            renderQuad(cursor_x, tb_top, plus_btn_w, bdr, border_color); // bottom
+        }
+
+        // Left border — skip when last tab is active (no visual break needed)
+        if (g_active_tab != num_tabs - 1) {
+            renderQuad(cursor_x, tb_top, bdr, titlebar_h, border_color);
+        }
 
         // + icon
         const plus_cx = cursor_x + plus_btn_w / 2;
@@ -2206,7 +2278,11 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
         if (ctrl and shift and key == c.GLFW_KEY_V) { pasteFromClipboard(); return; }
         if (ctrl and shift and key == c.GLFW_KEY_T) { addPlaceholderTab(); return; }
         if (ctrl and key == c.GLFW_KEY_W) {
-            if (g_tab_count > 1) closeTab(g_active_tab);
+            if (g_tab_count <= 1) {
+                g_should_close = true;
+            } else {
+                closeTab(g_active_tab);
+            }
             return;
         }
         if (ctrl and key == c.GLFW_KEY_TAB) {
@@ -2379,9 +2455,11 @@ const win32_input = if (build_options.use_win32) struct {
             addPlaceholderTab();
             return;
         }
-        // Ctrl+W = close tab (only placeholder tabs for now)
+        // Ctrl+W = close tab, or close app if only 1 tab
         if (ev.ctrl and ev.vk == 0x57) { // 'W'
-            if (g_tab_count > 1) {
+            if (g_tab_count <= 1) {
+                g_should_close = true;
+            } else {
                 closeTab(g_active_tab);
             }
             return;
@@ -2474,23 +2552,22 @@ const win32_input = if (build_options.use_win32) struct {
         if (seq) |s| _ = pty.write(s) catch {};
     }
 
+    var plus_btn_pressed: bool = false;
+
     fn handleMouseButton(ev: win32_backend.MouseButtonEvent) void {
         if (ev.button == .left) {
             const xpos: f64 = @floatFromInt(ev.x);
             const ypos: f64 = @floatFromInt(ev.y);
+            const titlebar_h: f64 = if (g_window) |w| @floatFromInt(w.titlebar_height) else 40;
 
-            // Check if click is in the titlebar (tab bar area)
             if (ev.action == .press) {
-                const titlebar_h: f64 = if (g_window) |w| @floatFromInt(w.titlebar_height) else 40;
+                // Check if click is in the titlebar (tab bar area)
                 if (ypos < titlebar_h) {
-                    handleTabBarClick(xpos);
+                    handleTabBarPress(xpos);
                     return;
                 }
-            }
 
-            const cell_pos = mouseToCell(xpos, ypos);
-
-            if (ev.action == .press) {
+                const cell_pos = mouseToCell(xpos, ypos);
                 g_selection.start_col = cell_pos.col;
                 g_selection.start_row = cell_pos.row;
                 g_selection.end_col = cell_pos.col;
@@ -2500,12 +2577,21 @@ const win32_input = if (build_options.use_win32) struct {
                 g_click_x = xpos;
                 g_click_y = ypos;
             } else {
+                // Mouse up
+                if (plus_btn_pressed) {
+                    plus_btn_pressed = false;
+                    // Only fire if still in the + button area
+                    if (ypos < titlebar_h and hitTestPlusButton(xpos)) {
+                        addPlaceholderTab();
+                    }
+                    return;
+                }
                 g_selecting = false;
             }
         }
     }
 
-    fn handleTabBarClick(xpos: f64) void {
+    fn handleTabBarPress(xpos: f64) void {
         const win = g_window orelse return;
         const window_width: f64 = blk: {
             var rect: win32_backend.RECT = undefined;
@@ -2534,10 +2620,31 @@ const win32_input = if (build_options.use_win32) struct {
             cursor += tab_w;
         }
 
-        // Check if + button was clicked
+        // Check if + button was pressed
         if (show_plus and xpos >= cursor and xpos < cursor + plus_btn_w) {
-            addPlaceholderTab();
+            plus_btn_pressed = true;
         }
+    }
+
+    fn hitTestPlusButton(xpos: f64) bool {
+        const win = g_window orelse return false;
+        const window_width: f64 = blk: {
+            var rect: win32_backend.RECT = undefined;
+            _ = win32_backend.GetClientRect(win.hwnd, &rect);
+            break :blk @floatFromInt(rect.right);
+        };
+
+        const caption_area_w: f64 = 46 * 3;
+        const gap_w: f64 = 42;
+        const plus_btn_w: f64 = 40;
+        if (g_tab_count <= 1) return false;
+
+        const right_reserved: f64 = caption_area_w + gap_w + plus_btn_w;
+        const tab_area_w: f64 = window_width - right_reserved;
+        const tab_w: f64 = tab_area_w / @as(f64, @floatFromInt(g_tab_count));
+        const plus_x = tab_w * @as(f64, @floatFromInt(g_tab_count));
+
+        return xpos >= plus_x and xpos < plus_x + plus_btn_w;
     }
 
     fn handleMouseMove(ev: win32_backend.MouseMoveEvent) void {
@@ -3073,6 +3180,7 @@ pub fn main() !void {
         }
 
         // Read from PTY (non-blocking check first)
+        resetOscBatch();
         while (pty.dataAvailable() > 0) {
             const bytes_read = pty.read(&pty_buffer) catch break;
             if (bytes_read == 0) break;
@@ -3087,7 +3195,7 @@ pub fn main() !void {
             const win = g_window orelse break;
 
             // Poll Win32 messages (fills event queues + checks WM_QUIT)
-            running = win.pollEvents();
+            running = win.pollEvents() and !g_should_close;
 
             // Sync tab count to win32 for hit-testing
             win.tab_count = g_tab_count;
@@ -3144,7 +3252,7 @@ pub fn main() !void {
 
             c.glfwSwapBuffers(glfw_window);
             c.glfwPollEvents();
-            running = c.glfwWindowShouldClose(glfw_window) == 0;
+            running = c.glfwWindowShouldClose(glfw_window) == 0 and !g_should_close;
         }
     }
 

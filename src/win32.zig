@@ -144,7 +144,10 @@ pub const CS_VREDRAW: UINT = 0x0001;
 pub const CS_OWNDC: UINT = 0x0020;
 
 // ShowWindow commands
+pub const SW_MINIMIZE: INT = 6;
 pub const SW_SHOW: INT = 5;
+pub const SW_RESTORE: INT = 9;
+pub const SW_MAXIMIZE: INT = 3;
 
 // CW_USEDEFAULT
 pub const CW_USEDEFAULT: INT = @bitCast(@as(u32, 0x80000000));
@@ -179,6 +182,7 @@ pub const WM_NCCALCSIZE: UINT = 0x0083;
 pub const WM_NCHITTEST: UINT = 0x0084;
 pub const WM_ERASEBKGND: UINT = 0x0014;
 pub const WM_NCLBUTTONDOWN: UINT = 0x00A1;
+pub const WM_NCLBUTTONUP: UINT = 0x00A2;
 pub const WM_NCMOUSEMOVE: UINT = 0x00A0;
 pub const WM_NCMOUSELEAVE: UINT = 0x02A2;
 pub const WM_MOUSELEAVE: UINT = 0x02A3;
@@ -443,8 +447,13 @@ pub const Window = struct {
     /// Which caption button is currently hovered (if any).
     /// Updated each frame from mouse position.
     hovered_button: CaptionButton = .none,
+    /// Which caption button is currently pressed (mouse down, waiting for up)
+    pressed_button: CaptionButton = .none,
     /// Tab count (synced from main.zig each frame, used for hit-testing)
     tab_count: usize = 1,
+    /// Current mouse position in client coordinates (for hover tracking)
+    mouse_x: i32 = 0,
+    mouse_y: i32 = 0,
 
     // Input event queues (written by WndProc, read by main loop)
     key_events: RingBuffer(KeyEvent, 64) = .{},
@@ -800,7 +809,15 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
     // Let DWM handle some non-client messages first (for window shadow, etc.)
     // BUT skip WM_NCCALCSIZE and WM_NCHITTEST — we handle those ourselves
     // for the custom title bar.
-    if (msg != WM_NCCALCSIZE and msg != WM_NCHITTEST) {
+    // Let DWM handle some non-client messages (window shadow, etc.)
+    // Skip messages we handle ourselves to prevent legacy button rendering:
+    // - WM_NCCALCSIZE, WM_NCHITTEST: custom title bar
+    // - WM_NCLBUTTONDOWN (0x00A1): prevents Win95-style button on click+hold
+    // - WM_NCMOUSEMOVE, WM_NCMOUSELEAVE: our hover tracking
+    if (msg != WM_NCCALCSIZE and msg != WM_NCHITTEST and
+        msg != WM_NCLBUTTONDOWN and msg != WM_NCLBUTTONUP and
+        msg != WM_NCMOUSEMOVE and msg != WM_NCMOUSELEAVE)
+    {
         var dwm_result: LRESULT = 0;
         if (DwmDefWindowProc(hwnd, msg, wParam, lParam, &dwm_result) != 0) {
             return dwm_result;
@@ -943,6 +960,10 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
                 else => .none,
             };
 
+            // Mouse left client area — set position to -1 so + button hover clears
+            w.mouse_x = -1;
+            w.mouse_y = -1;
+
             // Request WM_NCMOUSELEAVE so we know when the mouse leaves
             var tme = TRACKMOUSEEVENT{
                 .dwFlags = TME_LEAVE | TME_NONCLIENT,
@@ -951,6 +972,47 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             _ = TrackMouseEvent(&tme);
 
             return 0;
+        },
+        WM_NCLBUTTONDOWN => {
+            // Record which caption button was pressed (action on mouse-up)
+            const hit = @as(LRESULT, @bitCast(wParam));
+            w.pressed_button = switch (hit) {
+                HTCLOSE => .close,
+                HTMAXBUTTON => .maximize,
+                HTMINBUTTON => .minimize,
+                else => .none,
+            };
+            if (w.pressed_button != .none) return 0;
+            // For HTCAPTION etc., let DefWindowProc handle dragging
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+        WM_NCLBUTTONUP => {
+            const pressed = w.pressed_button;
+            w.pressed_button = .none;
+
+            // Only activate if mouse is still on the same button
+            if (pressed == w.hovered_button) {
+                switch (pressed) {
+                    .close => {
+                        _ = DestroyWindow(hwnd);
+                        return 0;
+                    },
+                    .maximize => {
+                        if (IsZoomed(hwnd) != 0) {
+                            _ = ShowWindow(hwnd, SW_RESTORE);
+                        } else {
+                            _ = ShowWindow(hwnd, SW_MAXIMIZE);
+                        }
+                        return 0;
+                    },
+                    .minimize => {
+                        _ = ShowWindow(hwnd, SW_MINIMIZE);
+                        return 0;
+                    },
+                    .none => {},
+                }
+            }
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
         },
         WM_NCMOUSELEAVE => {
             w.hovered_button = .none;
@@ -1020,6 +1082,8 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
         WM_MOUSEMOVE => {
             const x: i32 = @as(i16, @bitCast(@as(u16, @intCast(lParam & 0xFFFF))));
             const y: i32 = @as(i16, @bitCast(@as(u16, @intCast((lParam >> 16) & 0xFFFF))));
+            w.mouse_x = x;
+            w.mouse_y = y;
             w.mouse_move_events.push(.{ .x = x, .y = y });
             return 0;
         },
