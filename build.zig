@@ -11,12 +11,37 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{});
 
+    // Backend selection: "glfw", "win32", or "all" (default: "all")
+    const backend = b.option([]const u8, "backend", "Windowing backend: 'glfw', 'win32', or 'all' (default)") orelse "all";
+
+    const build_glfw = std.mem.eql(u8, backend, "glfw") or std.mem.eql(u8, backend, "all");
+    const build_win32 = std.mem.eql(u8, backend, "win32") or std.mem.eql(u8, backend, "all");
+
+    if (build_glfw) {
+        buildBackend(b, target, optimize, false);
+    }
+    if (build_win32) {
+        buildBackend(b, target, optimize, true);
+    }
+}
+
+fn buildBackend(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    use_win32: bool,
+) void {
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+
+    // Build options passed to source code
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "use_win32", use_win32);
+    exe_mod.addOptions("build_options", build_options);
 
     // Add ghostty-vt dependency with SIMD disabled for cross-compilation
     if (b.lazyDependency("ghostty", .{
@@ -27,12 +52,21 @@ pub fn build(b: *std.Build) void {
         exe_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
     }
 
-    // Add GLFW dependency
-    if (b.lazyDependency("glfw", .{
-        .target = target,
-        .optimize = optimize,
-    })) |dep| {
-        exe_mod.linkLibrary(dep.artifact("glfw3"));
+    // Add GLFW dependency (only for glfw backend)
+    if (!use_win32) {
+        if (b.lazyDependency("glfw", .{
+            .target = target,
+            .optimize = optimize,
+        })) |dep| {
+            exe_mod.linkLibrary(dep.artifact("glfw3"));
+        }
+    }
+
+    // Win32 backend: link native Windows libraries
+    if (use_win32) {
+        exe_mod.linkSystemLibrary("user32", .{});
+        exe_mod.linkSystemLibrary("gdi32", .{});
+        exe_mod.linkSystemLibrary("dwmapi", .{});
     }
 
     // Add FreeType dependency
@@ -62,8 +96,10 @@ pub fn build(b: *std.Build) void {
     // Link OpenGL on Windows
     exe_mod.linkSystemLibrary("opengl32", .{});
 
+    const name = if (use_win32) "phantty-win32" else "phantty-glfw";
+
     const exe = b.addExecutable(.{
-        .name = "phantty",
+        .name = name,
         .root_module = exe_mod,
     });
 
@@ -72,10 +108,4 @@ pub fn build(b: *std.Build) void {
     exe.subsystem = if (optimize == .Debug) .Console else .Windows;
 
     b.installArtifact(exe);
-
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-
-    const run_step = b.step("run", "Run the application");
-    run_step.dependOn(&run_cmd.step);
 }

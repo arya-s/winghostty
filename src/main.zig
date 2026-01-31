@@ -1,14 +1,18 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const ghostty_vt = @import("ghostty-vt");
 const freetype = @import("freetype");
 const Pty = @import("pty.zig").Pty;
 const sprite = @import("font/sprite.zig");
 const directwrite = @import("directwrite.zig");
 const Config = @import("config.zig");
+const win32_backend = if (build_options.use_win32) @import("win32.zig") else struct {};
 
 const c = @cImport({
     @cInclude("glad/gl.h");
-    @cInclude("GLFW/glfw3.h");
+    if (!build_options.use_win32) {
+        @cInclude("GLFW/glfw3.h");
+    }
 });
 
 // Type aliases from config module
@@ -90,10 +94,10 @@ fn testFontDiscovery(allocator: std.mem.Allocator) !void {
     }
 }
 
-// Global pointers for GLFW callbacks
+// Global pointers for callbacks
 var g_pty: ?*Pty = null;
 var g_terminal: ?*ghostty_vt.Terminal = null;
-var g_window: ?*c.GLFWwindow = null;
+var g_window: if (build_options.use_win32) ?*win32_backend.Window else ?*c.GLFWwindow = null;
 var g_allocator: ?std.mem.Allocator = null;
 
 // Selection state
@@ -114,6 +118,195 @@ var g_selection: Selection = .{
 var g_selecting: bool = false; // True while mouse button is held
 var g_click_x: f64 = 0; // X position of initial click (for threshold calculation)
 var g_click_y: f64 = 0; // Y position of initial click
+
+// ============================================================================
+// Tab model
+// ============================================================================
+
+const Tab = struct {
+    kind: enum { terminal, placeholder },
+    title: []const u8,
+};
+
+const MAX_TABS = 16;
+var g_tabs: [MAX_TABS]Tab = undefined;
+var g_tab_count: usize = 0;
+var g_active_tab: usize = 0;
+
+// Window/tab title from OSC 0/2 sequences
+var g_window_title: [256]u8 = undefined;
+var g_window_title_len: usize = 0;
+
+// OSC parser state machine — handles sequences split across PTY reads
+const OscParseState = enum { ground, esc, osc_num, osc_semi, osc_title };
+var g_osc_state: OscParseState = .ground;
+var g_osc_is_title: bool = false; // true if the OSC number is 0, 1, or 2
+var g_osc_num: u8 = 0; // which OSC number we're parsing
+var g_osc_buf: [512]u8 = undefined;
+var g_osc_buf_len: usize = 0;
+
+/// Scan PTY output for OSC 0 / OSC 2 title sequences.
+/// Handles sequences split across multiple reads via state machine.
+fn scanForOscTitle(data: []const u8) void {
+    for (data) |byte| {
+        switch (g_osc_state) {
+            .ground => {
+                if (byte == 0x1b) {
+                    g_osc_state = .esc;
+                }
+            },
+            .esc => {
+                if (byte == ']') {
+                    g_osc_state = .osc_num;
+                    g_osc_is_title = false;
+                } else {
+                    g_osc_state = .ground;
+                }
+            },
+            .osc_num => {
+                if (byte == '0' or byte == '1' or byte == '2' or byte == '7') {
+                    g_osc_is_title = true;
+                    g_osc_num = byte;
+                    g_osc_state = .osc_semi;
+                } else if (byte >= '0' and byte <= '9') {
+                    // Multi-digit OSC number — could be 7x, etc.
+                    // Store first digit and move to osc_semi to check for ';'
+                    g_osc_is_title = false;
+                    g_osc_num = byte;
+                    g_osc_state = .osc_semi;
+                } else {
+                    g_osc_state = .ground;
+                }
+            },
+            .osc_semi => {
+                if (byte == ';') {
+                    if (g_osc_is_title) {
+                        g_osc_buf_len = 0;
+                        g_osc_state = .osc_title;
+                    } else {
+                        g_osc_state = .ground;
+                    }
+                } else if (byte >= '0' and byte <= '9') {
+                    // Multi-digit OSC number, stay in osc_semi
+                } else {
+                    g_osc_state = .ground;
+                }
+            },
+            .osc_title => {
+                if (byte == 0x07) {
+                    // BEL terminates
+                    updateWindowTitle(g_osc_buf[0..g_osc_buf_len], g_osc_num);
+                    g_osc_state = .ground;
+                } else if (byte == 0x1b) {
+                    // Could be ST (ESC \) — treat ESC as terminator
+                    updateWindowTitle(g_osc_buf[0..g_osc_buf_len], g_osc_num);
+                    g_osc_state = .esc; // re-enter esc state in case it's ESC ]
+                } else if (g_osc_buf_len < g_osc_buf.len) {
+                    g_osc_buf[g_osc_buf_len] = byte;
+                    g_osc_buf_len += 1;
+                }
+                // If buffer full, just keep consuming until terminator
+            },
+        }
+    }
+}
+
+/// OSC 7 gives us a reliable CWD. OSC 0/1/2 give us whatever the shell sets.
+/// We track both separately — OSC 7 always wins for display.
+var g_osc7_title: [256]u8 = undefined;
+var g_osc7_title_len: usize = 0;
+
+fn updateWindowTitle(title: []const u8, osc_num: u8) void {
+    if (title.len == 0) return;
+
+    if (osc_num == '7') {
+        // OSC 7: file://host/path — extract the path, replace /home/<user> with ~
+        const prefix = "file://";
+        if (std.mem.startsWith(u8, title, prefix)) {
+            const after_prefix = title[prefix.len..];
+            if (std.mem.indexOfScalar(u8, after_prefix, '/')) |slash| {
+                const path = after_prefix[slash..];
+
+                // Detect home directory: /home/<user> pattern
+                // Find the home prefix by looking for /home/XXX
+                const home_prefix = "/home/";
+                if (std.mem.startsWith(u8, path, home_prefix)) {
+                    // Find end of username
+                    const after_home = path[home_prefix.len..];
+                    const user_end = std.mem.indexOfScalar(u8, after_home, '/') orelse after_home.len;
+                    const home_len = home_prefix.len + user_end; // "/home/user"
+
+                    const rest = path[home_len..];
+                    g_osc7_title[0] = '~';
+                    const rest_len = @min(rest.len, g_osc7_title.len - 1);
+                    @memcpy(g_osc7_title[1 .. 1 + rest_len], rest[0..rest_len]);
+                    g_osc7_title_len = 1 + rest_len;
+                } else {
+                    const len = @min(path.len, g_osc7_title.len);
+                    @memcpy(g_osc7_title[0..len], path[0..len]);
+                    g_osc7_title_len = len;
+                }
+            }
+        }
+    } else {
+        // OSC 0/1/2 — store as fallback
+        const len = @min(title.len, g_window_title.len);
+        @memcpy(g_window_title[0..len], title[0..len]);
+        g_window_title_len = len;
+    }
+
+    // Pick best title: OSC 7 path if available, else OSC 0/1/2
+    const best_title: []const u8 = if (g_osc7_title_len > 0)
+        g_osc7_title[0..g_osc7_title_len]
+    else
+        g_window_title[0..g_window_title_len];
+
+    if (g_tab_count > 0 and g_tabs[0].kind == .terminal) {
+        g_tabs[0].title = best_title;
+    }
+}
+
+fn initTabs() void {
+    g_tabs[0] = .{ .kind = .terminal, .title = "" };
+    g_tab_count = 1;
+    g_active_tab = 0;
+}
+
+fn addPlaceholderTab() void {
+    if (g_tab_count >= MAX_TABS) return;
+    g_tabs[g_tab_count] = .{ .kind = .placeholder, .title = "New Tab" };
+    g_active_tab = g_tab_count;
+    g_tab_count += 1;
+    std.debug.print("New tab created ({}), active: {}\n", .{ g_tab_count, g_active_tab });
+}
+
+fn closeTab(idx: usize) void {
+    if (g_tab_count <= 1) return; // don't close last tab
+    if (idx >= g_tab_count) return;
+    // Don't allow closing the terminal tab (index 0) for now
+    if (g_tabs[idx].kind == .terminal) return;
+
+    // Shift tabs down
+    var i = idx;
+    while (i + 1 < g_tab_count) : (i += 1) {
+        g_tabs[i] = g_tabs[i + 1];
+    }
+    g_tab_count -= 1;
+    if (g_active_tab >= g_tab_count) {
+        g_active_tab = g_tab_count - 1;
+    }
+    std.debug.print("Tab closed, count: {}, active: {}\n", .{ g_tab_count, g_active_tab });
+}
+
+fn switchTab(idx: usize) void {
+    if (idx < g_tab_count) {
+        g_active_tab = idx;
+    }
+}
+
+fn isActiveTabTerminal() bool {
+    return g_tabs[g_active_tab].kind == .terminal;
+}
 
 // Embed the font
 // Embedded fallback font (JetBrains Mono, like Ghostty)
@@ -219,15 +412,27 @@ const fragment_shader_source: [*c]const u8 =
 
 fn compileShader(shader_type: c.GLenum, source: [*c]const u8) ?c.GLuint {
     const shader = gl.CreateShader.?(shader_type);
+    if (shader == 0) {
+        const gl_err = if (gl.GetError) |getErr| getErr() else 0;
+        std.debug.print("Shader error: glCreateShader returned 0, type=0x{X}, glError=0x{X}\n", .{ shader_type, gl_err });
+        return null;
+    }
+
     gl.ShaderSource.?(shader, 1, &source, null);
     gl.CompileShader.?(shader);
 
     var success: c.GLint = 0;
     gl.GetShaderiv.?(shader, c.GL_COMPILE_STATUS, &success);
     if (success == 0) {
-        var info_log: [512]u8 = undefined;
-        gl.GetShaderInfoLog.?(shader, 512, null, &info_log);
-        std.debug.print("Shader compilation failed: {s}\n", .{&info_log});
+        var info_log: [512]u8 = @splat(0);
+        var log_len: c.GLsizei = 0;
+        gl.GetShaderInfoLog.?(shader, 512, &log_len, &info_log);
+        const len: usize = if (log_len > 0) @intCast(log_len) else 0;
+        if (len > 0) {
+            std.debug.print("Shader compilation failed: {s}\n", .{info_log[0..len]});
+        } else {
+            std.debug.print("Shader compilation failed (no error log, shader={})\n", .{shader});
+        }
         return null;
     }
     return shader;
@@ -248,9 +453,15 @@ fn initShaders() bool {
     var success: c.GLint = 0;
     gl.GetProgramiv.?(shader_program, c.GL_LINK_STATUS, &success);
     if (success == 0) {
-        var info_log: [512]u8 = undefined;
-        gl.GetProgramInfoLog.?(shader_program, 512, null, &info_log);
-        std.debug.print("Shader linking failed: {s}\n", .{&info_log});
+        var info_log: [512]u8 = @splat(0);
+        var log_len: c.GLsizei = 0;
+        gl.GetProgramInfoLog.?(shader_program, 512, &log_len, &info_log);
+        const len: usize = if (log_len > 0) @intCast(log_len) else 0;
+        if (len > 0) {
+            std.debug.print("Shader linking failed: {s}\n", .{info_log[0..len]});
+        } else {
+            std.debug.print("Shader linking failed (no error log available)\n", .{});
+        }
         return false;
     }
 
@@ -740,6 +951,379 @@ fn renderChar(codepoint: u32, x: f32, y: f32, color: [3]f32) void {
     gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
     gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
     gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6);
+}
+
+/// Render a character with uniform scaling applied to the glyph quad.
+/// scale < 1.0 makes text smaller. The position (x, y) is the cell bottom-left.
+fn renderCharScaled(codepoint: u32, x: f32, y: f32, color: [3]f32, scale: f32) void {
+    if (codepoint < 32) return;
+    const ch: Character = loadGlyph(codepoint) orelse return;
+
+    const w = @as(f32, @floatFromInt(ch.size_x)) * scale;
+    const h = @as(f32, @floatFromInt(ch.size_y)) * scale;
+    const bearing_x = @as(f32, @floatFromInt(ch.bearing_x)) * scale;
+    const bearing_y = @as(f32, @floatFromInt(ch.bearing_y)) * scale;
+    const size_y = @as(f32, @floatFromInt(ch.size_y)) * scale;
+
+    const x0 = x + bearing_x;
+    const y0 = y + cell_baseline * scale - (size_y - bearing_y);
+
+    const vertices = [6][4]f32{
+        .{ x0, y0 + h, 0.0, 0.0 },
+        .{ x0, y0, 0.0, 1.0 },
+        .{ x0 + w, y0, 1.0, 1.0 },
+        .{ x0, y0 + h, 0.0, 0.0 },
+        .{ x0 + w, y0, 1.0, 1.0 },
+        .{ x0 + w, y0 + h, 1.0, 0.0 },
+    };
+
+    gl.Uniform3f.?(gl.GetUniformLocation.?(shader_program, "textColor"), color[0], color[1], color[2]);
+    gl.BindTexture.?(c.GL_TEXTURE_2D, ch.texture_id);
+    gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
+    gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
+    gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
+    gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6);
+}
+
+/// Render the Ghostty-style tab bar.
+/// Single row: [tabs...][+][  ][min][max][close]
+///
+/// Design (from Ghostty macOS screenshot):
+/// - Tabs fill available width equally (left of + and caption buttons)
+/// - Active tab: same color as terminal background (merges with content)
+/// - Inactive tabs: slightly lighter shade
+/// - Thin vertical separators between tabs
+/// - No rounded corners, no accent lines — purely shade-based
+/// - + button right of last tab
+/// - Caption buttons on far right
+///
+/// OpenGL Y=0 is BOTTOM, so titlebar top = window_height - titlebar_h.
+fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
+    if (titlebar_h <= 0) return;
+
+    gl.UseProgram.?(shader_program);
+    gl.ActiveTexture.?(c.GL_TEXTURE0);
+    gl.BindVertexArray.?(vao);
+
+    const tb_top = window_height - titlebar_h; // top of titlebar in GL coords
+    const bg = g_theme.background;
+
+    // Colors — Ghostty style:
+    // - Active tab: same as terminal bg, no border (merges with content)
+    // - Inactive tabs & + button: slightly lighter bg with 1px darker inset border
+    const inactive_tab_bg = [3]f32{
+        @min(1.0, bg[0] + 0.05),
+        @min(1.0, bg[1] + 0.05),
+        @min(1.0, bg[2] + 0.05),
+    };
+    const border_color = [3]f32{
+        @max(0.0, bg[0] - 0.02),
+        @max(0.0, bg[1] - 0.02),
+        @max(0.0, bg[2] - 0.02),
+    };
+    const text_active = [3]f32{ 0.9, 0.9, 0.9 };
+    const text_inactive = [3]f32{ 0.55, 0.55, 0.55 };
+    const plus_color = [3]f32{ 0.5, 0.5, 0.5 };
+
+    // Layout constants
+    const caption_btn_w: f32 = 46;
+    const caption_area_w: f32 = caption_btn_w * 3; // min + max + close
+    const plus_btn_w: f32 = 40; // + button width
+    const gap_w: f32 = 42; // breathing room between + and caption buttons
+    const show_plus = g_tab_count > 1;
+    const num_tabs = g_tab_count;
+
+    // Calculate space: tabs fill remaining width after + button, gap, and caption buttons
+    const plus_total: f32 = if (show_plus) plus_btn_w else 0;
+    const right_reserved: f32 = caption_area_w + gap_w + plus_total;
+    const tab_area_w: f32 = window_width - right_reserved;
+    const tab_w: f32 = if (num_tabs > 0) tab_area_w / @as(f32, @floatFromInt(num_tabs)) else tab_area_w;
+
+    // --- Tab bar background (same as terminal bg) ---
+    renderQuad(0, tb_top, window_width, titlebar_h, bg);
+
+    // --- Tabs ---
+    var cursor_x: f32 = 0;
+    const bdr: f32 = 1; // border thickness
+
+    for (0..num_tabs) |tab_idx| {
+        const is_active = (tab_idx == g_active_tab);
+
+        // Inactive tabs: slightly lighter bg with 1px darker inset border
+        // Active tab: no border, same as terminal bg (merges with content)
+        if (!is_active) {
+            // Fill with inactive bg
+            renderQuad(cursor_x, tb_top, tab_w, titlebar_h, inactive_tab_bg);
+            // 1px inset border — left border only (skip on first tab), top, bottom
+            renderQuad(cursor_x, tb_top + titlebar_h - bdr, tab_w, bdr, border_color); // top
+            renderQuad(cursor_x, tb_top, tab_w, bdr, border_color); // bottom
+            if (tab_idx > 0) {
+                renderQuad(cursor_x, tb_top, bdr, titlebar_h, border_color); // left
+            }
+        }
+
+        // Tab title text — centered, scaled down to ~75% of terminal font
+        const title = g_tabs[tab_idx].title;
+        if (title.len > 0) {
+            const text_color = if (is_active) text_active else text_inactive;
+            const text_scale: f32 = 0.75;
+            const scaled_height = cell_height * text_scale;
+            const tab_pad: f32 = 18; // padding on each side (matches caption button padding)
+
+            // Available width for text inside the tab
+            const center_region = if (num_tabs == 1) window_width else tab_w;
+            const center_offset = if (num_tabs == 1) @as(f32, 0) else cursor_x;
+            const avail_w = center_region - tab_pad * 2;
+
+            // Measure full text width (use loadGlyph to ensure glyphs are cached)
+            var text_width: f32 = 0;
+            for (title) |ch| {
+                if (loadGlyph(@intCast(ch))) |glyph| {
+                    text_width += @as(f32, @floatFromInt(glyph.advance >> 6)) * text_scale;
+                } else {
+                    text_width += cell_width * text_scale;
+                }
+            }
+
+            const text_y = tb_top + (titlebar_h - scaled_height) / 2;
+
+            if (text_width <= avail_w) {
+                // Fits — center it
+                var text_x = center_offset + (center_region - text_width) / 2;
+                for (title) |ch| {
+                    renderCharScaled(@intCast(ch), text_x, text_y, text_color, text_scale);
+                    if (loadGlyph(@intCast(ch))) |glyph| {
+                        text_x += @as(f32, @floatFromInt(glyph.advance >> 6)) * text_scale;
+                    } else {
+                        text_x += cell_width * text_scale;
+                    }
+                }
+            } else {
+                // Doesn't fit — middle truncation like macOS: "start…end"
+                const ellipsis_char: u32 = 0x2026; // '…' Unicode ellipsis
+                const ellipsis_w = if (loadGlyph(ellipsis_char)) |glyph|
+                    @as(f32, @floatFromInt(glyph.advance >> 6)) * text_scale
+                else
+                    cell_width * text_scale;
+
+                const text_budget = avail_w - ellipsis_w;
+                const half_budget = text_budget / 2;
+
+                // Measure how many chars fit from the start
+                var start_w: f32 = 0;
+                var start_end: usize = 0;
+                for (title, 0..) |ch, idx| {
+                    const char_w = if (loadGlyph(@intCast(ch))) |glyph|
+                        @as(f32, @floatFromInt(glyph.advance >> 6)) * text_scale
+                    else
+                        cell_width * text_scale;
+                    if (start_w + char_w > half_budget) break;
+                    start_w += char_w;
+                    start_end = idx + 1;
+                }
+
+                // Measure how many chars fit from the end
+                var end_w: f32 = 0;
+                var end_start: usize = title.len;
+                var j: usize = title.len;
+                while (j > start_end) {
+                    j -= 1;
+                    const char_w = if (loadGlyph(@intCast(title[j]))) |glyph|
+                        @as(f32, @floatFromInt(glyph.advance >> 6)) * text_scale
+                    else
+                        cell_width * text_scale;
+                    if (end_w + char_w > half_budget) break;
+                    end_w += char_w;
+                    end_start = j;
+                }
+
+                // Render: left-aligned with padding
+                var text_x = center_offset + tab_pad;
+
+                // Start portion
+                for (title[0..start_end]) |ch| {
+                    renderCharScaled(@intCast(ch), text_x, text_y, text_color, text_scale);
+                    if (loadGlyph(@intCast(ch))) |glyph| {
+                        text_x += @as(f32, @floatFromInt(glyph.advance >> 6)) * text_scale;
+                    } else {
+                        text_x += cell_width * text_scale;
+                    }
+                }
+
+                // Ellipsis
+                renderCharScaled(ellipsis_char, text_x, text_y, text_color, text_scale);
+                text_x += ellipsis_w;
+
+                // End portion
+                for (title[end_start..]) |ch| {
+                    renderCharScaled(@intCast(ch), text_x, text_y, text_color, text_scale);
+                    if (loadGlyph(@intCast(ch))) |glyph| {
+                        text_x += @as(f32, @floatFromInt(glyph.advance >> 6)) * text_scale;
+                    } else {
+                        text_x += cell_width * text_scale;
+                    }
+                }
+            }
+        }
+
+        cursor_x += tab_w;
+    }
+
+    // --- + (new tab) button — shown as a small inset tab, only with 2+ tabs ---
+    if (show_plus) {
+        // Same style as inactive tabs: lighter bg + left border only, top, bottom
+        renderQuad(cursor_x, tb_top, plus_btn_w, titlebar_h, inactive_tab_bg);
+        renderQuad(cursor_x, tb_top + titlebar_h - bdr, plus_btn_w, bdr, border_color); // top
+        renderQuad(cursor_x, tb_top, plus_btn_w, bdr, border_color); // bottom
+        renderQuad(cursor_x, tb_top, bdr, titlebar_h, border_color); // left
+
+        // + icon
+        const plus_cx = cursor_x + plus_btn_w / 2;
+        const plus_cy = tb_top + titlebar_h / 2;
+        const arm: f32 = 5;
+        const t: f32 = 1.0;
+        renderQuad(plus_cx - arm, plus_cy - t / 2, arm * 2, t, plus_color);
+        renderQuad(plus_cx - t / 2, plus_cy - arm, t, arm * 2, plus_color);
+        cursor_x += plus_btn_w;
+    }
+
+    // --- Caption buttons (minimize, maximize, close) ---
+    const btn_h: f32 = titlebar_h;
+    const hovered: win32_backend.CaptionButton = if (build_options.use_win32)
+        (if (g_window) |w| w.hovered_button else .none)
+    else
+        .none;
+
+    const caption_start = window_width - caption_area_w;
+    renderCaptionButton(caption_start, tb_top, caption_btn_w, btn_h, .minimize, hovered == .minimize);
+    renderCaptionButton(caption_start + caption_btn_w, tb_top, caption_btn_w, btn_h, .maximize, hovered == .maximize);
+    renderCaptionButton(caption_start + caption_btn_w * 2, tb_top, caption_btn_w, btn_h, .close, hovered == .close);
+}
+
+const CaptionButtonType = enum { minimize, maximize, close };
+
+/// Draw a Windows Terminal-style caption button with hover support.
+/// Each button is 46×40px with a 10×10 icon centered inside.
+/// Matches Windows Terminal's visual style:
+///   - Normal: transparent bg, light gray icon
+///   - Hover (min/max): subtle light fill bg, white icon
+///   - Hover (close): red #C42B1C bg, white icon
+fn renderCaptionButton(x: f32, y: f32, w: f32, h: f32, btn_type: CaptionButtonType, hovered: bool) void {
+    // Draw hover background
+    if (hovered) {
+        const hover_bg = switch (btn_type) {
+            .close => [3]f32{ 0.77, 0.17, 0.11 }, // #C42B1C
+            else => [3]f32{
+                @min(1.0, g_theme.background[0] + 0.15),
+                @min(1.0, g_theme.background[1] + 0.15),
+                @min(1.0, g_theme.background[2] + 0.15),
+            },
+        };
+        renderQuad(x, y, w, h, hover_bg);
+    }
+
+    // Icon color: white when hovered, light gray otherwise
+    const icon_color: [3]f32 = if (hovered) .{ 1.0, 1.0, 1.0 } else .{ 0.75, 0.75, 0.75 };
+
+    const cx = x + w / 2; // button center x
+    const cy = y + h / 2; // button center y
+
+    // Icon dimensions: 10×10 logical pixels, 1px stroke
+    const icon_size: f32 = 10;
+    const half: f32 = icon_size / 2;
+    const t: f32 = 1.0; // stroke thickness
+
+    switch (btn_type) {
+        .close => {
+            // × icon: two diagonal lines from corner to corner of 10×10 box.
+            // Drawn as overlapping quads along the diagonal for a smooth line.
+            const steps: usize = 20;
+            const step_size = icon_size / @as(f32, @floatFromInt(steps - 1));
+            for (0..steps) |i| {
+                const fi = @as(f32, @floatFromInt(i));
+                const px = cx - half + fi * step_size;
+                // Top-left → bottom-right diagonal
+                const py1 = cy + half - fi * step_size;
+                renderQuad(px - t * 0.5, py1 - t * 0.5, t, t, icon_color);
+                // Top-right → bottom-left diagonal
+                const py2 = cy - half + fi * step_size;
+                renderQuad(px - t * 0.5, py2 - t * 0.5, t, t, icon_color);
+            }
+        },
+        .maximize => {
+            // □ icon: 10×10 square outline, 1px stroke
+            const left = cx - half;
+            const bottom = cy - half;
+            renderQuad(left, bottom + icon_size - t, icon_size, t, icon_color); // top
+            renderQuad(left, bottom, icon_size, t, icon_color); // bottom
+            renderQuad(left, bottom, t, icon_size, icon_color); // left
+            renderQuad(left + icon_size - t, bottom, t, icon_size, icon_color); // right
+        },
+        .minimize => {
+            // ─ icon: single horizontal line, 10px wide, centered
+            renderQuad(cx - half, cy - t / 2, icon_size, t, icon_color);
+        },
+    }
+}
+
+fn getGlyphInfo(codepoint: u32) ?Character {
+    return glyph_cache.get(codepoint);
+}
+
+/// Render placeholder content for tabs that don't have a terminal yet.
+fn renderPlaceholderTab(window_width: f32, window_height: f32, top_pad: f32) void {
+    gl.UseProgram.?(shader_program);
+    gl.ActiveTexture.?(c.GL_TEXTURE0);
+    gl.BindVertexArray.?(vao);
+
+    const msg = "Tabs not yet implemented";
+    const hint = "Press Ctrl+Shift+T to open, Ctrl+W to close";
+    const text_color = [3]f32{ 0.4, 0.4, 0.4 };
+
+    // Center the message vertically and horizontally
+    const content_h = window_height - top_pad;
+    const center_y = content_h / 2;
+
+    // Measure and draw main message
+    var msg_width: f32 = 0;
+    for (msg) |ch| {
+        if (getGlyphInfo(@intCast(ch))) |g| {
+            msg_width += @as(f32, @floatFromInt(g.advance >> 6));
+        } else {
+            msg_width += cell_width;
+        }
+    }
+    var x = (window_width - msg_width) / 2;
+    var y = center_y + cell_height / 2;
+    for (msg) |ch| {
+        renderChar(@intCast(ch), x, y, text_color);
+        if (getGlyphInfo(@intCast(ch))) |g| {
+            x += @as(f32, @floatFromInt(g.advance >> 6));
+        } else {
+            x += cell_width;
+        }
+    }
+
+    // Measure and draw hint below
+    var hint_width: f32 = 0;
+    for (hint) |ch| {
+        if (getGlyphInfo(@intCast(ch))) |g| {
+            hint_width += @as(f32, @floatFromInt(g.advance >> 6));
+        } else {
+            hint_width += cell_width;
+        }
+    }
+    x = (window_width - hint_width) / 2;
+    y = center_y - cell_height;
+    const hint_color = [3]f32{ 0.3, 0.3, 0.3 };
+    for (hint) |ch| {
+        renderChar(@intCast(ch), x, y, hint_color);
+        if (getGlyphInfo(@intCast(ch))) |g| {
+            x += @as(f32, @floatFromInt(g.advance >> 6));
+        } else {
+            x += cell_width;
+        }
+    }
 }
 
 fn renderTerminal(terminal: *ghostty_vt.Terminal, window_height: f32, offset_x: f32, offset_y: f32) void {
@@ -1286,13 +1870,18 @@ fn loadFontFromConfig(
 }
 
 /// Resize the window to fit the current terminal grid and cell dimensions.
-fn resizeWindowToGrid(window: *c.GLFWwindow) void {
+fn resizeWindowToGrid() void {
     const padding: f32 = 10;
+    const tb: f32 = if (build_options.use_win32) @floatFromInt(win32_backend.TITLEBAR_HEIGHT) else 0;
     const content_w: f32 = cell_width * @as(f32, @floatFromInt(term_cols));
     const content_h: f32 = cell_height * @as(f32, @floatFromInt(term_rows));
-    const win_w: c_int = @intFromFloat(content_w + padding * 2);
-    const win_h: c_int = @intFromFloat(content_h + padding * 2);
-    c.glfwSetWindowSize(window, win_w, win_h);
+    const win_w: i32 = @intFromFloat(content_w + padding * 2);
+    const win_h: i32 = @intFromFloat(content_h + padding + (padding + tb));
+    if (build_options.use_win32) {
+        if (g_window) |w| w.setSize(win_w, win_h);
+    } else {
+        c.glfwSetWindowSize(g_window, win_w, win_h);
+    }
 }
 
 /// Check if the config file has changed (via ReadDirectoryChangesW) and reload if so.
@@ -1307,7 +1896,7 @@ fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void
     };
     defer cfg.deinit(allocator);
 
-    const window = g_window orelse return;
+    if (g_window == null) return;
     const ft_lib = g_ft_lib orelse return;
 
     // --- Theme, cursor ---
@@ -1345,7 +1934,7 @@ fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void
         // If window size is configured, apply it; then resize window to match new cell dims
         if (cfg.@"window-width" > 0) term_cols = cfg.@"window-width";
         if (cfg.@"window-height" > 0) term_rows = cfg.@"window-height";
-        resizeWindowToGrid(window);
+        resizeWindowToGrid();
 
         // Resize terminal and PTY to match
         if (g_terminal) |term| {
@@ -1367,186 +1956,38 @@ fn resetCursorBlink() void {
     g_last_blink_time = std.time.milliTimestamp();
 }
 
-// GLFW character callback - handles regular text input
-fn charCallback(_: ?*c.GLFWwindow, codepoint: c_uint) callconv(.c) void {
-    if (g_pty) |pty| {
-        // Reset cursor blink on keystroke (like Ghostty)
-        resetCursorBlink();
-
-        // Scroll viewport to bottom when typing
-        if (g_terminal) |term| {
-            term.scrollViewport(.bottom) catch {};
-        }
-        // Convert unicode codepoint to UTF-8
-        var buf: [4]u8 = undefined;
-        const len = std.unicode.utf8Encode(@intCast(codepoint), &buf) catch return;
-        _ = pty.write(buf[0..len]) catch {};
-    }
-}
+// ============================================================================
+// Shared helpers (used by both backends)
+// ============================================================================
 
 // Convert mouse position to terminal cell coordinates
 fn mouseToCell(xpos: f64, ypos: f64) struct { col: usize, row: usize } {
-    const padding: f64 = 10;
-    const col_f = (xpos - padding) / @as(f64, cell_width);
-    const row_f = (ypos - padding) / @as(f64, cell_height);
-    
+    const padding_d: f64 = 10;
+    const tb_d: f64 = if (build_options.use_win32) @floatFromInt(win32_backend.TITLEBAR_HEIGHT) else 0;
+    const col_f = (xpos - padding_d) / @as(f64, cell_width);
+    const row_f = (ypos - padding_d - tb_d) / @as(f64, cell_height);
+
     const col = if (col_f < 0) 0 else if (col_f >= @as(f64, @floatFromInt(term_cols))) term_cols - 1 else @as(usize, @intFromFloat(col_f));
     const row = if (row_f < 0) 0 else if (row_f >= @as(f64, @floatFromInt(term_rows))) term_rows - 1 else @as(usize, @intFromFloat(row_f));
-    
+
     return .{ .col = col, .row = row };
-}
-
-// GLFW mouse button callback
-fn mouseButtonCallback(window: ?*c.GLFWwindow, button: c_int, action: c_int, _: c_int) callconv(.c) void {
-    if (button == c.GLFW_MOUSE_BUTTON_LEFT) {
-        var xpos: f64 = 0;
-        var ypos: f64 = 0;
-        c.glfwGetCursorPos(window, &xpos, &ypos);
-        const cell = mouseToCell(xpos, ypos);
-        
-        if (action == c.GLFW_PRESS) {
-            // Start selection - record click position for threshold calculation
-            g_selection.start_col = cell.col;
-            g_selection.start_row = cell.row;
-            g_selection.end_col = cell.col;
-            g_selection.end_row = cell.row;
-            g_selection.active = false; // Don't activate until we confirm it's a real selection
-            g_selecting = true;
-            g_click_x = xpos;
-            g_click_y = ypos;
-        } else if (action == c.GLFW_RELEASE) {
-            g_selecting = false;
-            // Selection remains active if it was activated during drag
-        }
-    }
-}
-
-// GLFW cursor position callback - update selection while dragging
-fn cursorPosCallback(_: ?*c.GLFWwindow, xpos: f64, ypos: f64) callconv(.c) void {
-    if (g_selecting) {
-        const cell = mouseToCell(xpos, ypos);
-        g_selection.end_col = cell.col;
-        g_selection.end_row = cell.row;
-        
-        // Use threshold-based selection like Ghostty (60% of cell width)
-        // This determines if we've dragged enough to create a real selection
-        const threshold = cell_width * 0.6;
-        const padding: f64 = 10;
-        
-        // Calculate position within cells
-        const click_cell_x = g_click_x - padding - @as(f64, @floatFromInt(g_selection.start_col)) * @as(f64, cell_width);
-        const drag_cell_x = xpos - padding - @as(f64, @floatFromInt(cell.col)) * @as(f64, cell_width);
-        
-        const same_cell = (g_selection.start_col == cell.col and g_selection.start_row == cell.row);
-        
-        if (same_cell) {
-            // Same cell - check if we've crossed the threshold in either direction
-            const moved_right = drag_cell_x >= threshold and click_cell_x < threshold;
-            const moved_left = drag_cell_x < threshold and click_cell_x >= threshold;
-            g_selection.active = moved_right or moved_left;
-        } else {
-            // Different cells - always activate selection
-            g_selection.active = true;
-        }
-    }
-}
-
-// Copy current selection to clipboard
-fn copySelectionToClipboard() void {
-    const terminal = g_terminal orelse return;
-    const window = g_window orelse return;
-    const allocator = g_allocator orelse return;
-    
-    if (!g_selection.active) return;
-    
-    // Normalize selection (start before end)
-    var start_row = g_selection.start_row;
-    var start_col = g_selection.start_col;
-    var end_row = g_selection.end_row;
-    var end_col = g_selection.end_col;
-    
-    if (start_row > end_row or (start_row == end_row and start_col > end_col)) {
-        std.mem.swap(usize, &start_row, &end_row);
-        std.mem.swap(usize, &start_col, &end_col);
-    }
-    
-    // Build selection string
-    var text: std.ArrayListUnmanaged(u8) = .empty;
-    defer text.deinit(allocator);
-    
-    const screen = terminal.screens.active;
-    
-    var row: usize = start_row;
-    while (row <= end_row) : (row += 1) {
-        const row_start_col = if (row == start_row) start_col else 0;
-        const row_end_col = if (row == end_row) end_col else term_cols - 1;
-        
-        var col: usize = row_start_col;
-        while (col <= row_end_col) : (col += 1) {
-            const cell_data = screen.pages.getCell(.{ .viewport = .{
-                .x = @intCast(col),
-                .y = @intCast(row),
-            } }) orelse continue;
-            
-            const cp = cell_data.cell.codepoint();
-            if (cp == 0 or cp == ' ') {
-                text.append(allocator, ' ') catch continue;
-            } else {
-                var buf: [4]u8 = undefined;
-                const len = std.unicode.utf8Encode(@intCast(cp), &buf) catch continue;
-                text.appendSlice(allocator, buf[0..len]) catch continue;
-            }
-        }
-        
-        // Add newline between rows (but not after last row)
-        if (row < end_row) {
-            text.append(allocator, '\n') catch {};
-        }
-    }
-    
-    // Set clipboard - need null terminated string
-    if (text.items.len > 0) {
-        text.append(allocator, 0) catch return;
-        const str: [*:0]const u8 = @ptrCast(text.items.ptr);
-        c.glfwSetClipboardString(window, str);
-        std.debug.print("Copied {} bytes to clipboard\n", .{text.items.len - 1});
-    }
-}
-
-// Paste from clipboard
-fn pasteFromClipboard() void {
-    const pty = g_pty orelse return;
-    const window = g_window orelse return;
-    
-    const clipboard = c.glfwGetClipboardString(window);
-    if (clipboard) |str| {
-        // Find length
-        var len: usize = 0;
-        while (str[len] != 0) : (len += 1) {}
-        std.debug.print("Pasting {} bytes from clipboard\n", .{len});
-        if (len > 0) {
-            _ = pty.write(str[0..len]) catch {};
-        }
-    } else {
-        std.debug.print("Clipboard is empty or unavailable\n", .{});
-    }
 }
 
 // Check if a cell is within the current selection
 fn isCellSelected(col: usize, row: usize) bool {
     if (!g_selection.active) return false;
-    
+
     var start_row = g_selection.start_row;
     var start_col = g_selection.start_col;
     var end_row = g_selection.end_row;
     var end_col = g_selection.end_col;
-    
+
     // Normalize
     if (start_row > end_row or (start_row == end_row and start_col > end_col)) {
         std.mem.swap(usize, &start_row, &end_row);
         std.mem.swap(usize, &start_col, &end_col);
     }
-    
+
     if (row < start_row or row > end_row) return false;
     if (row == start_row and row == end_row) {
         return col >= start_col and col <= end_col;
@@ -1556,207 +1997,719 @@ fn isCellSelected(col: usize, row: usize) bool {
     return true;
 }
 
-// GLFW window resize callback
-fn windowFocusCallback(_: ?*c.GLFWwindow, focused: c_int) callconv(.c) void {
-    window_focused = focused != 0;
-}
+// ============================================================================
+// GLFW-specific callbacks (only compiled for GLFW backend)
+// ============================================================================
 
-fn framebufferSizeCallback(window: ?*c.GLFWwindow, width: c_int, height: c_int) callconv(.c) void {
-    const padding: f32 = 10;
-    const content_width = @as(f32, @floatFromInt(width)) - padding * 2;
-    const content_height = @as(f32, @floatFromInt(height)) - padding * 2;
-
-    const new_cols: u16 = @intFromFloat(@max(1, content_width / cell_width));
-    const new_rows: u16 = @intFromFloat(@max(1, content_height / cell_height));
-
-    if (new_cols != term_cols or new_rows != term_rows) {
-        // Mark resize as pending - actual resize happens in main loop
-        // to avoid PageList integrity issues during callback
-        // Coalesce rapid resize events (like Ghostty does with 25ms timer)
-        g_pending_resize = true;
-        g_pending_cols = new_cols;
-        g_pending_rows = new_rows;
-        g_last_resize_time = std.time.milliTimestamp();
-    }
-
-    // Immediately render a frame during resize to avoid black areas
-    // We render with current terminal state (before resize) to show something
-    if (!g_resize_in_progress) {
-        if (g_terminal) |terminal| {
-            if (g_post_enabled) {
-                renderFrameWithPost(width, height, terminal, padding);
-            } else {
-                gl.Viewport.?(0, 0, width, height);
-                setProjection(@floatFromInt(width), @floatFromInt(height));
-                gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
-                gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
-                updateCursorBlink();
-                renderTerminal(terminal, @floatFromInt(height), padding, padding);
-            }
-        } else {
-            gl.Viewport.?(0, 0, width, height);
-            gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
-            gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
-        }
-    }
-
-    c.glfwSwapBuffers(window);
-}
-
-// GLFW scroll callback - handles mouse wheel scrollback
-fn scrollCallback(_: ?*c.GLFWwindow, _: f64, yoffset: f64) callconv(.c) void {
-    if (g_terminal) |terminal| {
-        const delta: isize = @intFromFloat(-yoffset * 3); // 3 lines per scroll notch
-        terminal.scrollViewport(.{ .delta = delta }) catch {};
-    }
-}
-
-/// Toggle between windowed and borderless fullscreen (like Alt+Enter in many apps)
-fn toggleFullscreen() void {
-    const window = g_window orelse return;
-
-    if (g_is_fullscreen) {
-        // Restore windowed mode with saved position and size
-        c.glfwSetWindowMonitor(
-            window,
-            null, // no monitor = windowed
-            g_windowed_x,
-            g_windowed_y,
-            g_windowed_width,
-            g_windowed_height,
-            c.GLFW_DONT_CARE,
-        );
-        g_is_fullscreen = false;
-        std.debug.print("Exited fullscreen (restored {}x{} at {},{})\n", .{
-            g_windowed_width, g_windowed_height, g_windowed_x, g_windowed_y,
-        });
-    } else {
-        // Save current windowed position and size before going fullscreen
-        c.glfwGetWindowPos(window, &g_windowed_x, &g_windowed_y);
-        c.glfwGetWindowSize(window, &g_windowed_width, &g_windowed_height);
-
-        // Get the monitor the window is currently on
-        const monitor = c.glfwGetPrimaryMonitor() orelse return;
-        const mode = c.glfwGetVideoMode(monitor) orelse return;
-
-        c.glfwSetWindowMonitor(
-            window,
-            monitor,
-            0,
-            0,
-            mode.*.width,
-            mode.*.height,
-            mode.*.refreshRate,
-        );
-        g_is_fullscreen = true;
-        std.debug.print("Entered fullscreen ({}x{} @{}Hz)\n", .{
-            mode.*.width, mode.*.height, mode.*.refreshRate,
-        });
-    }
-}
-
-// GLFW key callback - handles special keys
-fn keyCallback(_: ?*c.GLFWwindow, key: c_int, _: c_int, action: c_int, mods: c_int) callconv(.c) void {
-    if (action != c.GLFW_PRESS and action != c.GLFW_REPEAT) return;
-
-    const ctrl = (mods & c.GLFW_MOD_CONTROL) != 0;
-    const shift = (mods & c.GLFW_MOD_SHIFT) != 0;
-
-    // Ctrl+Shift+C = Copy (selection already copied on mouse release, but allow manual too)
-    if (ctrl and shift and key == c.GLFW_KEY_C) {
-        copySelectionToClipboard();
-        return;
-    }
-
-    // Ctrl+Shift+V = Paste
-    if (ctrl and shift and key == c.GLFW_KEY_V) {
-        pasteFromClipboard();
-        return;
-    }
-
-    // Ctrl+, = Open config file in editor (like Ghostty)
-    if (ctrl and key == c.GLFW_KEY_COMMA) {
-        std.debug.print("[keybind] Ctrl+, pressed\n", .{});
-        if (g_allocator) |alloc| {
-            Config.openConfigInEditor(alloc);
-        } else {
-            std.debug.print("[keybind] ERROR: g_allocator is null\n", .{});
-        }
-        return;
-    }
-
-    // Alt+Enter = Toggle fullscreen
-    const alt = (mods & c.GLFW_MOD_ALT) != 0;
-    if (alt and key == c.GLFW_KEY_ENTER) {
-        toggleFullscreen();
-        return;
-    }
-
-    if (g_pty) |pty| {
-        // Scroll viewport to bottom when typing (except for scroll keys and modifier-only presses)
-        // This matches Ghostty's behavior: only scroll for non-modifier keys
-        const is_scroll_key = shift and (key == c.GLFW_KEY_PAGE_UP or key == c.GLFW_KEY_PAGE_DOWN);
-        const is_modifier = key == c.GLFW_KEY_LEFT_SHIFT or key == c.GLFW_KEY_RIGHT_SHIFT or
-            key == c.GLFW_KEY_LEFT_CONTROL or key == c.GLFW_KEY_RIGHT_CONTROL or
-            key == c.GLFW_KEY_LEFT_ALT or key == c.GLFW_KEY_RIGHT_ALT or
-            key == c.GLFW_KEY_LEFT_SUPER or key == c.GLFW_KEY_RIGHT_SUPER;
-        if (!is_scroll_key and !is_modifier) {
-            // Reset cursor blink on keystroke (like Ghostty)
+const glfw_callbacks = if (!build_options.use_win32) struct {
+    pub fn charCallback(_: ?*c.GLFWwindow, codepoint: c_uint) callconv(.c) void {
+        if (g_pty) |pty| {
             resetCursorBlink();
             if (g_terminal) |term| {
                 term.scrollViewport(.bottom) catch {};
             }
+            var buf: [4]u8 = undefined;
+            const len = std.unicode.utf8Encode(@intCast(codepoint), &buf) catch return;
+            _ = pty.write(buf[0..len]) catch {};
+        }
+    }
+
+    pub fn mouseButtonCallback(window: ?*c.GLFWwindow, button: c_int, action: c_int, _: c_int) callconv(.c) void {
+        if (button == c.GLFW_MOUSE_BUTTON_LEFT) {
+            var xpos: f64 = 0;
+            var ypos: f64 = 0;
+            c.glfwGetCursorPos(window, &xpos, &ypos);
+            const cell = mouseToCell(xpos, ypos);
+
+            if (action == c.GLFW_PRESS) {
+                g_selection.start_col = cell.col;
+                g_selection.start_row = cell.row;
+                g_selection.end_col = cell.col;
+                g_selection.end_row = cell.row;
+                g_selection.active = false;
+                g_selecting = true;
+                g_click_x = xpos;
+                g_click_y = ypos;
+            } else if (action == c.GLFW_RELEASE) {
+                g_selecting = false;
+            }
+        }
+    }
+
+    pub fn cursorPosCallback(_: ?*c.GLFWwindow, xpos: f64, ypos: f64) callconv(.c) void {
+        if (g_selecting) {
+            const cell = mouseToCell(xpos, ypos);
+            g_selection.end_col = cell.col;
+            g_selection.end_row = cell.row;
+
+            const threshold = cell_width * 0.6;
+            const padding_d: f64 = 10;
+            const click_cell_x = g_click_x - padding_d - @as(f64, @floatFromInt(g_selection.start_col)) * @as(f64, cell_width);
+            const drag_cell_x = xpos - padding_d - @as(f64, @floatFromInt(cell.col)) * @as(f64, cell_width);
+
+            const same_cell = (g_selection.start_col == cell.col and g_selection.start_row == cell.row);
+            if (same_cell) {
+                const moved_right = drag_cell_x >= threshold and click_cell_x < threshold;
+                const moved_left = drag_cell_x < threshold and click_cell_x >= threshold;
+                g_selection.active = moved_right or moved_left;
+            } else {
+                g_selection.active = true;
+            }
+        }
+    }
+
+    pub fn copySelectionToClipboard() void {
+        const terminal = g_terminal orelse return;
+        const window = g_window orelse return;
+        const allocator = g_allocator orelse return;
+
+        if (!g_selection.active) return;
+
+        var start_row = g_selection.start_row;
+        var start_col = g_selection.start_col;
+        var end_row = g_selection.end_row;
+        var end_col = g_selection.end_col;
+
+        if (start_row > end_row or (start_row == end_row and start_col > end_col)) {
+            std.mem.swap(usize, &start_row, &end_row);
+            std.mem.swap(usize, &start_col, &end_col);
         }
 
-        // Handle special keys
-        const seq: ?[]const u8 = switch (key) {
-            c.GLFW_KEY_ENTER => "\r",
-            c.GLFW_KEY_BACKSPACE => "\x7f",
-            c.GLFW_KEY_TAB => "\t",
-            c.GLFW_KEY_ESCAPE => "\x1b",
-            c.GLFW_KEY_UP => "\x1b[A",
-            c.GLFW_KEY_DOWN => "\x1b[B",
-            c.GLFW_KEY_RIGHT => "\x1b[C",
-            c.GLFW_KEY_LEFT => "\x1b[D",
-            c.GLFW_KEY_HOME => "\x1b[H",
-            c.GLFW_KEY_END => "\x1b[F",
-            c.GLFW_KEY_PAGE_UP => blk: {
-                if (shift) {
-                    // Shift+PageUp = scroll up
-                    if (g_terminal) |term| {
-                        term.scrollViewport(.{ .delta = -@as(isize, term_rows / 2) }) catch {};
+        var text: std.ArrayListUnmanaged(u8) = .empty;
+        defer text.deinit(allocator);
+
+        const screen = terminal.screens.active;
+        var row: usize = start_row;
+        while (row <= end_row) : (row += 1) {
+            const row_start_col = if (row == start_row) start_col else 0;
+            const row_end_col = if (row == end_row) end_col else term_cols - 1;
+
+            var col: usize = row_start_col;
+            while (col <= row_end_col) : (col += 1) {
+                const cell_data = screen.pages.getCell(.{ .viewport = .{
+                    .x = @intCast(col),
+                    .y = @intCast(row),
+                } }) orelse continue;
+
+                const cp = cell_data.cell.codepoint();
+                if (cp == 0 or cp == ' ') {
+                    text.append(allocator, ' ') catch continue;
+                } else {
+                    var buf: [4]u8 = undefined;
+                    const len = std.unicode.utf8Encode(@intCast(cp), &buf) catch continue;
+                    text.appendSlice(allocator, buf[0..len]) catch continue;
+                }
+            }
+            if (row < end_row) {
+                text.append(allocator, '\n') catch {};
+            }
+        }
+
+        if (text.items.len > 0) {
+            text.append(allocator, 0) catch return;
+            const str: [*:0]const u8 = @ptrCast(text.items.ptr);
+            c.glfwSetClipboardString(window, str);
+            std.debug.print("Copied {} bytes to clipboard\n", .{text.items.len - 1});
+        }
+    }
+
+    pub fn pasteFromClipboard() void {
+        const pty = g_pty orelse return;
+        const window = g_window orelse return;
+
+        const clipboard = c.glfwGetClipboardString(window);
+        if (clipboard) |str| {
+            var len: usize = 0;
+            while (str[len] != 0) : (len += 1) {}
+            std.debug.print("Pasting {} bytes from clipboard\n", .{len});
+            if (len > 0) {
+                _ = pty.write(str[0..len]) catch {};
+            }
+        } else {
+            std.debug.print("Clipboard is empty or unavailable\n", .{});
+        }
+    }
+
+    pub fn windowFocusCallback(_: ?*c.GLFWwindow, focused: c_int) callconv(.c) void {
+        window_focused = focused != 0;
+    }
+
+    pub fn framebufferSizeCallback(window: ?*c.GLFWwindow, width: c_int, height: c_int) callconv(.c) void {
+        const padding_f: f32 = 10;
+        const content_width = @as(f32, @floatFromInt(width)) - padding_f * 2;
+        const content_height = @as(f32, @floatFromInt(height)) - padding_f * 2;
+
+        const new_cols: u16 = @intFromFloat(@max(1, content_width / cell_width));
+        const new_rows: u16 = @intFromFloat(@max(1, content_height / cell_height));
+
+        if (new_cols != term_cols or new_rows != term_rows) {
+            g_pending_resize = true;
+            g_pending_cols = new_cols;
+            g_pending_rows = new_rows;
+            g_last_resize_time = std.time.milliTimestamp();
+        }
+
+        if (!g_resize_in_progress) {
+            if (g_terminal) |terminal| {
+                if (g_post_enabled) {
+                    renderFrameWithPost(width, height, terminal, padding_f);
+                } else {
+                    gl.Viewport.?(0, 0, width, height);
+                    setProjection(@floatFromInt(width), @floatFromInt(height));
+                    gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
+                    gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
+                    updateCursorBlink();
+                    renderTerminal(terminal, @floatFromInt(height), padding_f, padding_f);
+                }
+            } else {
+                gl.Viewport.?(0, 0, width, height);
+                gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
+                gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
+            }
+        }
+
+        c.glfwSwapBuffers(window);
+    }
+
+    pub fn scrollCallback(_: ?*c.GLFWwindow, _: f64, yoffset: f64) callconv(.c) void {
+        if (g_terminal) |terminal| {
+            const delta: isize = @intFromFloat(-yoffset * 3);
+            terminal.scrollViewport(.{ .delta = delta }) catch {};
+        }
+    }
+
+    pub fn toggleFullscreen() void {
+        const window = g_window orelse return;
+
+        if (g_is_fullscreen) {
+            c.glfwSetWindowMonitor(window, null, g_windowed_x, g_windowed_y, g_windowed_width, g_windowed_height, c.GLFW_DONT_CARE);
+            g_is_fullscreen = false;
+            std.debug.print("Exited fullscreen (restored {}x{} at {},{})\n", .{ g_windowed_width, g_windowed_height, g_windowed_x, g_windowed_y });
+        } else {
+            c.glfwGetWindowPos(window, &g_windowed_x, &g_windowed_y);
+            c.glfwGetWindowSize(window, &g_windowed_width, &g_windowed_height);
+            const monitor = c.glfwGetPrimaryMonitor() orelse return;
+            const mode = c.glfwGetVideoMode(monitor) orelse return;
+            c.glfwSetWindowMonitor(window, monitor, 0, 0, mode.*.width, mode.*.height, mode.*.refreshRate);
+            g_is_fullscreen = true;
+            std.debug.print("Entered fullscreen ({}x{} @{}Hz)\n", .{ mode.*.width, mode.*.height, mode.*.refreshRate });
+        }
+    }
+
+    pub fn keyCallback(_: ?*c.GLFWwindow, key: c_int, _: c_int, action: c_int, mods: c_int) callconv(.c) void {
+        if (action != c.GLFW_PRESS and action != c.GLFW_REPEAT) return;
+
+        const ctrl = (mods & c.GLFW_MOD_CONTROL) != 0;
+        const shift = (mods & c.GLFW_MOD_SHIFT) != 0;
+
+        if (ctrl and shift and key == c.GLFW_KEY_C) { copySelectionToClipboard(); return; }
+        if (ctrl and shift and key == c.GLFW_KEY_V) { pasteFromClipboard(); return; }
+        if (ctrl and shift and key == c.GLFW_KEY_T) { addPlaceholderTab(); return; }
+        if (ctrl and key == c.GLFW_KEY_W) {
+            if (g_tab_count > 1) closeTab(g_active_tab);
+            return;
+        }
+        if (ctrl and key == c.GLFW_KEY_TAB) {
+            if (shift) {
+                if (g_active_tab > 0) switchTab(g_active_tab - 1) else switchTab(g_tab_count - 1);
+            } else {
+                switchTab((g_active_tab + 1) % g_tab_count);
+            }
+            return;
+        }
+        if (ctrl and key == c.GLFW_KEY_COMMA) {
+            std.debug.print("[keybind] Ctrl+, pressed\n", .{});
+            if (g_allocator) |alloc| Config.openConfigInEditor(alloc);
+            return;
+        }
+
+        const alt = (mods & c.GLFW_MOD_ALT) != 0;
+        if (alt and key == c.GLFW_KEY_ENTER) { toggleFullscreen(); return; }
+
+        if (g_pty) |pty| {
+            const is_scroll_key = shift and (key == c.GLFW_KEY_PAGE_UP or key == c.GLFW_KEY_PAGE_DOWN);
+            const is_modifier = key == c.GLFW_KEY_LEFT_SHIFT or key == c.GLFW_KEY_RIGHT_SHIFT or
+                key == c.GLFW_KEY_LEFT_CONTROL or key == c.GLFW_KEY_RIGHT_CONTROL or
+                key == c.GLFW_KEY_LEFT_ALT or key == c.GLFW_KEY_RIGHT_ALT or
+                key == c.GLFW_KEY_LEFT_SUPER or key == c.GLFW_KEY_RIGHT_SUPER;
+            if (!is_scroll_key and !is_modifier) {
+                resetCursorBlink();
+                if (g_terminal) |term| term.scrollViewport(.bottom) catch {};
+            }
+
+            const seq: ?[]const u8 = switch (key) {
+                c.GLFW_KEY_ENTER => "\r",
+                c.GLFW_KEY_BACKSPACE => "\x7f",
+                c.GLFW_KEY_TAB => "\t",
+                c.GLFW_KEY_ESCAPE => "\x1b",
+                c.GLFW_KEY_UP => "\x1b[A",
+                c.GLFW_KEY_DOWN => "\x1b[B",
+                c.GLFW_KEY_RIGHT => "\x1b[C",
+                c.GLFW_KEY_LEFT => "\x1b[D",
+                c.GLFW_KEY_HOME => "\x1b[H",
+                c.GLFW_KEY_END => "\x1b[F",
+                c.GLFW_KEY_PAGE_UP => blk: {
+                    if (shift) {
+                        if (g_terminal) |term| term.scrollViewport(.{ .delta = -@as(isize, term_rows / 2) }) catch {};
+                        break :blk null;
                     }
+                    break :blk "\x1b[5~";
+                },
+                c.GLFW_KEY_PAGE_DOWN => blk: {
+                    if (shift) {
+                        if (g_terminal) |term| term.scrollViewport(.{ .delta = @as(isize, term_rows / 2) }) catch {};
+                        break :blk null;
+                    }
+                    break :blk "\x1b[6~";
+                },
+                c.GLFW_KEY_INSERT => "\x1b[2~",
+                c.GLFW_KEY_DELETE => "\x1b[3~",
+                else => blk: {
+                    if (ctrl and key >= c.GLFW_KEY_A and key <= c.GLFW_KEY_Z) {
+                        const ctrl_char: u8 = @intCast(key - c.GLFW_KEY_A + 1);
+                        _ = pty.write(&[_]u8{ctrl_char}) catch {};
+                    }
+                    break :blk null;
+                },
+            };
+
+            if (seq) |s| _ = pty.write(s) catch {};
+        }
+    }
+} else struct {};
+
+// ============================================================================
+// Win32-specific input processing (only compiled for Win32 backend)
+// ============================================================================
+
+const win32_input = if (build_options.use_win32) struct {
+
+    /// Process all queued Win32 input events. Called once per frame from the main loop.
+    pub fn processEvents(win: *win32_backend.Window) void {
+        processKeyEvents(win);
+        processCharEvents(win);
+        processMouseButtonEvents(win);
+        processMouseMoveEvents(win);
+        processMouseWheelEvents(win);
+        processSizeChange(win);
+    }
+
+    fn processKeyEvents(win: *win32_backend.Window) void {
+        while (win.key_events.pop()) |ev| {
+            handleKey(ev);
+        }
+    }
+
+    fn processCharEvents(win: *win32_backend.Window) void {
+        while (win.char_events.pop()) |ev| {
+            handleChar(ev);
+        }
+    }
+
+    fn processMouseButtonEvents(win: *win32_backend.Window) void {
+        while (win.mouse_button_events.pop()) |ev| {
+            handleMouseButton(ev);
+        }
+    }
+
+    fn processMouseMoveEvents(win: *win32_backend.Window) void {
+        // Only process the latest move event (coalesce)
+        var latest: ?win32_backend.MouseMoveEvent = null;
+        while (win.mouse_move_events.pop()) |ev| {
+            latest = ev;
+        }
+        if (latest) |ev| {
+            handleMouseMove(ev);
+        }
+    }
+
+    fn processMouseWheelEvents(win: *win32_backend.Window) void {
+        while (win.mouse_wheel_events.pop()) |ev| {
+            handleMouseWheel(ev);
+        }
+    }
+
+    fn processSizeChange(win: *win32_backend.Window) void {
+        if (!win.size_changed) return;
+        win.size_changed = false;
+
+        const width = win.width;
+        const height = win.height;
+        const padding_f: f32 = 10;
+        const tb_offset: f32 = @floatFromInt(win32_backend.TITLEBAR_HEIGHT);
+        const content_width = @as(f32, @floatFromInt(width)) - padding_f * 2;
+        const content_height = @as(f32, @floatFromInt(height)) - padding_f - (padding_f + tb_offset);
+
+        const new_cols: u16 = @intFromFloat(@max(1, content_width / cell_width));
+        const new_rows: u16 = @intFromFloat(@max(1, content_height / cell_height));
+
+        if (new_cols != term_cols or new_rows != term_rows) {
+            g_pending_resize = true;
+            g_pending_cols = new_cols;
+            g_pending_rows = new_rows;
+            g_last_resize_time = std.time.milliTimestamp();
+        }
+    }
+
+    fn handleChar(ev: win32_backend.CharEvent) void {
+        if (!isActiveTabTerminal()) return;
+        const pty = g_pty orelse return;
+        resetCursorBlink();
+        if (g_terminal) |term| {
+            term.scrollViewport(.bottom) catch {};
+        }
+        var buf: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(ev.codepoint, &buf) catch return;
+        _ = pty.write(buf[0..len]) catch {};
+    }
+
+    fn handleKey(ev: win32_backend.KeyEvent) void {
+        // Ctrl+Shift+C = copy
+        if (ev.ctrl and ev.shift and ev.vk == 0x43) { // 'C'
+            copySelectionToClipboard();
+            return;
+        }
+        // Ctrl+Shift+V = paste
+        if (ev.ctrl and ev.shift and ev.vk == 0x56) { // 'V'
+            pasteFromClipboard();
+            return;
+        }
+        // Ctrl+Shift+T = new tab
+        if (ev.ctrl and ev.shift and ev.vk == 0x54) { // 'T'
+            addPlaceholderTab();
+            return;
+        }
+        // Ctrl+W = close tab (only placeholder tabs for now)
+        if (ev.ctrl and ev.vk == 0x57) { // 'W'
+            if (g_tab_count > 1) {
+                closeTab(g_active_tab);
+            }
+            return;
+        }
+        // Ctrl+Tab = next tab
+        if (ev.ctrl and ev.vk == win32_backend.VK_TAB) {
+            if (ev.shift) {
+                // Ctrl+Shift+Tab = previous tab
+                if (g_active_tab > 0) switchTab(g_active_tab - 1) else switchTab(g_tab_count - 1);
+            } else {
+                switchTab((g_active_tab + 1) % g_tab_count);
+            }
+            return;
+        }
+        // Ctrl+1-9 = switch to tab N
+        if (ev.ctrl and !ev.shift and ev.vk >= 0x31 and ev.vk <= 0x39) { // '1'-'9'
+            const tab_idx = @as(usize, @intCast(ev.vk - 0x31));
+            if (tab_idx < g_tab_count) switchTab(tab_idx);
+            return;
+        }
+        // Ctrl+, = open config
+        if (ev.ctrl and ev.vk == win32_backend.VK_OEM_COMMA) {
+            std.debug.print("[keybind] Ctrl+, pressed\n", .{});
+            if (g_allocator) |alloc| Config.openConfigInEditor(alloc);
+            return;
+        }
+        // Alt+Enter = toggle fullscreen
+        if (ev.alt and ev.vk == win32_backend.VK_RETURN) {
+            toggleFullscreen();
+            return;
+        }
+
+        // Don't send input to PTY if active tab isn't the terminal
+        if (!isActiveTabTerminal()) return;
+
+        const pty = g_pty orelse return;
+
+        // Don't reset blink / scroll-to-bottom for scroll keys or pure modifiers
+        const is_scroll_key = ev.shift and (ev.vk == win32_backend.VK_PRIOR or ev.vk == win32_backend.VK_NEXT);
+        const is_modifier = ev.vk == win32_backend.VK_SHIFT or ev.vk == win32_backend.VK_CONTROL or ev.vk == win32_backend.VK_MENU;
+        if (!is_scroll_key and !is_modifier) {
+            resetCursorBlink();
+            if (g_terminal) |term| term.scrollViewport(.bottom) catch {};
+        }
+
+        const seq: ?[]const u8 = switch (ev.vk) {
+            win32_backend.VK_RETURN => "\r",
+            win32_backend.VK_BACK => "\x7f",
+            win32_backend.VK_TAB => "\t",
+            win32_backend.VK_ESCAPE => "\x1b",
+            win32_backend.VK_UP => "\x1b[A",
+            win32_backend.VK_DOWN => "\x1b[B",
+            win32_backend.VK_RIGHT => "\x1b[C",
+            win32_backend.VK_LEFT => "\x1b[D",
+            win32_backend.VK_HOME => "\x1b[H",
+            win32_backend.VK_END => "\x1b[F",
+            win32_backend.VK_PRIOR => blk: { // Page Up
+                if (ev.shift) {
+                    if (g_terminal) |term| term.scrollViewport(.{ .delta = -@as(isize, term_rows / 2) }) catch {};
                     break :blk null;
                 }
                 break :blk "\x1b[5~";
             },
-            c.GLFW_KEY_PAGE_DOWN => blk: {
-                if (shift) {
-                    // Shift+PageDown = scroll down
-                    if (g_terminal) |term| {
-                        term.scrollViewport(.{ .delta = @as(isize, term_rows / 2) }) catch {};
-                    }
+            win32_backend.VK_NEXT => blk: { // Page Down
+                if (ev.shift) {
+                    if (g_terminal) |term| term.scrollViewport(.{ .delta = @as(isize, term_rows / 2) }) catch {};
                     break :blk null;
                 }
                 break :blk "\x1b[6~";
             },
-            c.GLFW_KEY_INSERT => "\x1b[2~",
-            c.GLFW_KEY_DELETE => "\x1b[3~",
+            win32_backend.VK_INSERT => "\x1b[2~",
+            win32_backend.VK_DELETE => "\x1b[3~",
+            win32_backend.VK_F11 => blk: {
+                toggleFullscreen();
+                break :blk null;
+            },
             else => blk: {
-                // Handle Ctrl+key combinations
-                if (ctrl and key >= c.GLFW_KEY_A and key <= c.GLFW_KEY_Z) {
-                    const ctrl_char: u8 = @intCast(key - c.GLFW_KEY_A + 1);
-                    _ = pty.write(&[_]u8{ctrl_char}) catch {};
+                // Ctrl+A through Ctrl+Z
+                if (ev.ctrl and ev.vk >= 0x41 and ev.vk <= 0x5A) {
+                    // Don't send Ctrl+C/V when shift is held (those are copy/paste)
+                    if (!ev.shift) {
+                        const ctrl_char: u8 = @intCast(ev.vk - 0x41 + 1);
+                        _ = pty.write(&[_]u8{ctrl_char}) catch {};
+                    }
                 }
                 break :blk null;
             },
         };
 
-        if (seq) |s| {
-            _ = pty.write(s) catch {};
+        if (seq) |s| _ = pty.write(s) catch {};
+    }
+
+    fn handleMouseButton(ev: win32_backend.MouseButtonEvent) void {
+        if (ev.button == .left) {
+            const xpos: f64 = @floatFromInt(ev.x);
+            const ypos: f64 = @floatFromInt(ev.y);
+
+            // Check if click is in the titlebar (tab bar area)
+            if (ev.action == .press) {
+                const titlebar_h: f64 = if (g_window) |w| @floatFromInt(w.titlebar_height) else 40;
+                if (ypos < titlebar_h) {
+                    handleTabBarClick(xpos);
+                    return;
+                }
+            }
+
+            const cell_pos = mouseToCell(xpos, ypos);
+
+            if (ev.action == .press) {
+                g_selection.start_col = cell_pos.col;
+                g_selection.start_row = cell_pos.row;
+                g_selection.end_col = cell_pos.col;
+                g_selection.end_row = cell_pos.row;
+                g_selection.active = false;
+                g_selecting = true;
+                g_click_x = xpos;
+                g_click_y = ypos;
+            } else {
+                g_selecting = false;
+            }
         }
     }
-}
+
+    fn handleTabBarClick(xpos: f64) void {
+        const win = g_window orelse return;
+        const window_width: f64 = blk: {
+            var rect: win32_backend.RECT = undefined;
+            _ = win32_backend.GetClientRect(win.hwnd, &rect);
+            break :blk @floatFromInt(rect.right);
+        };
+
+        const caption_area_w: f64 = 46 * 3;
+        const gap_w: f64 = 42;
+        const plus_btn_w: f64 = 40;
+        const show_plus = g_tab_count > 1;
+        const num_tabs = g_tab_count;
+
+        const plus_total: f64 = if (show_plus) plus_btn_w else 0;
+        const right_reserved: f64 = caption_area_w + gap_w + plus_total;
+        const tab_area_w: f64 = window_width - right_reserved;
+        const tab_w: f64 = if (num_tabs > 0) tab_area_w / @as(f64, @floatFromInt(num_tabs)) else tab_area_w;
+
+        // Check which tab was clicked
+        var cursor: f64 = 0;
+        for (0..num_tabs) |tab_idx| {
+            if (xpos >= cursor and xpos < cursor + tab_w) {
+                switchTab(tab_idx);
+                return;
+            }
+            cursor += tab_w;
+        }
+
+        // Check if + button was clicked
+        if (show_plus and xpos >= cursor and xpos < cursor + plus_btn_w) {
+            addPlaceholderTab();
+        }
+    }
+
+    fn handleMouseMove(ev: win32_backend.MouseMoveEvent) void {
+        if (!g_selecting) return;
+
+        const xpos: f64 = @floatFromInt(ev.x);
+        const ypos: f64 = @floatFromInt(ev.y);
+        const cell_pos = mouseToCell(xpos, ypos);
+        g_selection.end_col = cell_pos.col;
+        g_selection.end_row = cell_pos.row;
+
+        const threshold = cell_width * 0.6;
+        const padding_d: f64 = 10;
+        const click_cell_x = g_click_x - padding_d - @as(f64, @floatFromInt(g_selection.start_col)) * @as(f64, cell_width);
+        const drag_cell_x = xpos - padding_d - @as(f64, @floatFromInt(cell_pos.col)) * @as(f64, cell_width);
+
+        const same_cell = (g_selection.start_col == cell_pos.col and g_selection.start_row == cell_pos.row);
+        if (same_cell) {
+            const moved_right = drag_cell_x >= threshold and click_cell_x < threshold;
+            const moved_left = drag_cell_x < threshold and click_cell_x >= threshold;
+            g_selection.active = moved_right or moved_left;
+        } else {
+            g_selection.active = true;
+        }
+    }
+
+    fn handleMouseWheel(ev: win32_backend.MouseWheelEvent) void {
+        if (g_terminal) |terminal| {
+            // WHEEL_DELTA is 120 per notch. Convert to lines (3 lines per notch, like GLFW).
+            const notches = @as(f64, @floatFromInt(ev.delta)) / 120.0;
+            const delta: isize = @intFromFloat(-notches * 3);
+            terminal.scrollViewport(.{ .delta = delta }) catch {};
+        }
+    }
+
+    // --- Clipboard (Win32 native) ---
+
+    fn copySelectionToClipboard() void {
+        const terminal = g_terminal orelse return;
+        const allocator = g_allocator orelse return;
+        const win = g_window orelse return;
+
+        if (!g_selection.active) return;
+
+        var start_row = g_selection.start_row;
+        var start_col = g_selection.start_col;
+        var end_row = g_selection.end_row;
+        var end_col = g_selection.end_col;
+
+        if (start_row > end_row or (start_row == end_row and start_col > end_col)) {
+            std.mem.swap(usize, &start_row, &end_row);
+            std.mem.swap(usize, &start_col, &end_col);
+        }
+
+        var text: std.ArrayListUnmanaged(u8) = .empty;
+        defer text.deinit(allocator);
+
+        const screen = terminal.screens.active;
+        var row: usize = start_row;
+        while (row <= end_row) : (row += 1) {
+            const row_start_col = if (row == start_row) start_col else 0;
+            const row_end_col = if (row == end_row) end_col else term_cols - 1;
+
+            var col: usize = row_start_col;
+            while (col <= row_end_col) : (col += 1) {
+                const cell_data = screen.pages.getCell(.{ .viewport = .{
+                    .x = @intCast(col),
+                    .y = @intCast(row),
+                } }) orelse continue;
+
+                const cp = cell_data.cell.codepoint();
+                if (cp == 0 or cp == ' ') {
+                    text.append(allocator, ' ') catch continue;
+                } else {
+                    var buf: [4]u8 = undefined;
+                    const len = std.unicode.utf8Encode(@intCast(cp), &buf) catch continue;
+                    text.appendSlice(allocator, buf[0..len]) catch continue;
+                }
+            }
+            if (row < end_row) {
+                text.append(allocator, '\n') catch {};
+            }
+        }
+
+        if (text.items.len == 0) return;
+
+        // Win32 clipboard: OpenClipboard → EmptyClipboard → SetClipboardData → CloseClipboard
+        if (win32_backend.OpenClipboard(win.hwnd) == 0) return;
+        defer _ = win32_backend.CloseClipboard();
+        _ = win32_backend.EmptyClipboard();
+
+        // Clipboard wants a GlobalAlloc'd GMEM_MOVEABLE buffer with null-terminated data
+        const size = text.items.len + 1;
+        const hmem = win32_backend.GlobalAlloc(0x0002, size) orelse return; // GMEM_MOVEABLE
+        const ptr = win32_backend.GlobalLock(hmem) orelse return;
+        const dest: [*]u8 = @ptrCast(ptr);
+        @memcpy(dest[0..text.items.len], text.items);
+        dest[text.items.len] = 0;
+        _ = win32_backend.GlobalUnlock(hmem);
+
+        _ = win32_backend.SetClipboardData(1, hmem); // CF_TEXT = 1
+        std.debug.print("Copied {} bytes to clipboard\n", .{text.items.len});
+    }
+
+    fn pasteFromClipboard() void {
+        const pty = g_pty orelse return;
+        const win = g_window orelse return;
+
+        if (win32_backend.OpenClipboard(win.hwnd) == 0) return;
+        defer _ = win32_backend.CloseClipboard();
+
+        const hmem = win32_backend.GetClipboardData(1) orelse return; // CF_TEXT
+        const ptr = win32_backend.GlobalLock(hmem) orelse return;
+        defer _ = win32_backend.GlobalUnlock(hmem);
+
+        const data: [*]const u8 = @ptrCast(ptr);
+        var len: usize = 0;
+        while (data[len] != 0) : (len += 1) {}
+
+        if (len > 0) {
+            std.debug.print("Pasting {} bytes from clipboard\n", .{len});
+            _ = pty.write(data[0..len]) catch {};
+        }
+    }
+
+    // --- Fullscreen toggle (Win32 native) ---
+
+    var saved_style: win32_backend.DWORD = 0;
+    var saved_rect: win32_backend.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    var is_fullscreen: bool = false;
+
+    fn toggleFullscreen() void {
+        const win = g_window orelse return;
+
+        if (is_fullscreen) {
+            // Restore windowed mode
+            _ = win32_backend.SetWindowLongW(win.hwnd, -16, @bitCast(saved_style)); // GWL_STYLE
+            _ = win32_backend.SetWindowPos(
+                win.hwnd, null,
+                saved_rect.left, saved_rect.top,
+                saved_rect.right - saved_rect.left,
+                saved_rect.bottom - saved_rect.top,
+                0x0020 | 0x0040, // SWP_FRAMECHANGED | SWP_SHOWWINDOW
+            );
+            is_fullscreen = false;
+            std.debug.print("Exited fullscreen\n", .{});
+        } else {
+            // Save current state
+            _ = win32_backend.GetWindowRect(win.hwnd, &saved_rect);
+            saved_style = @bitCast(win32_backend.GetWindowLongW(win.hwnd, -16));
+
+            // Set borderless style
+            const new_style = saved_style & ~@as(u32, 0x00CF0000); // remove WS_OVERLAPPEDWINDOW
+            _ = win32_backend.SetWindowLongW(win.hwnd, -16, @bitCast(new_style));
+
+            // Get monitor info for the monitor containing this window
+            const monitor = win32_backend.MonitorFromWindow(win.hwnd, 0x00000002) orelse return; // MONITOR_DEFAULTTONEAREST
+            var mi = win32_backend.MONITORINFO{ .cbSize = @sizeOf(win32_backend.MONITORINFO) };
+            if (win32_backend.GetMonitorInfoW(monitor, &mi) != 0) {
+                _ = win32_backend.SetWindowPos(
+                    win.hwnd, null,
+                    mi.rcMonitor.left, mi.rcMonitor.top,
+                    mi.rcMonitor.right - mi.rcMonitor.left,
+                    mi.rcMonitor.bottom - mi.rcMonitor.top,
+                    0x0020 | 0x0040, // SWP_FRAMECHANGED | SWP_SHOWWINDOW
+                );
+            }
+            is_fullscreen = true;
+            std.debug.print("Entered fullscreen\n", .{});
+        }
+    }
+} else struct {};
 
 fn setProjection(width: f32, height: f32) void {
     const projection = [16]f32{
@@ -1856,44 +2809,85 @@ pub fn main() !void {
     g_terminal = &terminal;
     g_allocator = allocator;
 
-    // Initialize GLFW
-    if (c.glfwInit() == 0) {
-        std.debug.print("Failed to initialize GLFW\n", .{});
-        return error.GLFWInitFailed;
+    // Initialize tab model
+    initTabs();
+
+    // ================================================================
+    // Initialize windowing backend
+    // Defers MUST be at function scope so the window/GL context
+    // stays alive for the rest of main().
+    // ================================================================
+
+    // --- Win32 backend state (only used when use_win32=true) ---
+    var win32_window: if (build_options.use_win32) win32_backend.Window else void = undefined;
+    if (build_options.use_win32) {
+        const title = std.unicode.utf8ToUtf16LeStringLiteral("Phantty [win32]");
+        win32_window = win32_backend.Window.init(800, 600, title) catch |err| {
+            std.debug.print("Failed to create Win32 window: {}\n", .{err});
+            return err;
+        };
+        win32_backend.setGlobalWindow(&win32_window);
+        g_window = &win32_window;
     }
-    defer c.glfwTerminate();
+    defer if (build_options.use_win32) {
+        win32_window.deinit();
+    };
 
-    c.glfwWindowHint(c.GLFW_CONTEXT_VERSION_MAJOR, 3);
-    c.glfwWindowHint(c.GLFW_CONTEXT_VERSION_MINOR, 3);
-    c.glfwWindowHint(c.GLFW_OPENGL_PROFILE, c.GLFW_OPENGL_CORE_PROFILE);
-
-    const window = c.glfwCreateWindow(800, 600, "Phantty", null, null);
-    if (window == null) {
-        std.debug.print("Failed to create GLFW window\n", .{});
-        return error.WindowCreationFailed;
+    // --- GLFW backend state (only used when use_win32=false) ---
+    if (!build_options.use_win32) {
+        if (c.glfwInit() == 0) {
+            std.debug.print("Failed to initialize GLFW\n", .{});
+            return error.GLFWInitFailed;
+        }
     }
-    defer c.glfwDestroyWindow(window);
+    defer if (!build_options.use_win32) {
+        c.glfwTerminate();
+    };
 
-    c.glfwMakeContextCurrent(window);
+    // GLFW window handle — needs to be at function scope so the defer works
+    var glfw_window: if (build_options.use_win32) void else ?*c.GLFWwindow = if (build_options.use_win32) {} else null;
+    if (!build_options.use_win32) {
+        c.glfwWindowHint(c.GLFW_CONTEXT_VERSION_MAJOR, 3);
+        c.glfwWindowHint(c.GLFW_CONTEXT_VERSION_MINOR, 3);
+        c.glfwWindowHint(c.GLFW_OPENGL_PROFILE, c.GLFW_OPENGL_CORE_PROFILE);
 
-    // Set up input callbacks
-    _ = c.glfwSetCharCallback(window, charCallback);
-    _ = c.glfwSetKeyCallback(window, keyCallback);
-    _ = c.glfwSetScrollCallback(window, scrollCallback);
-    _ = c.glfwSetMouseButtonCallback(window, mouseButtonCallback);
-    _ = c.glfwSetCursorPosCallback(window, cursorPosCallback);
-    _ = c.glfwSetFramebufferSizeCallback(window, framebufferSizeCallback);
-    _ = c.glfwSetWindowFocusCallback(window, windowFocusCallback);
+        glfw_window = c.glfwCreateWindow(800, 600, "Phantty [glfw]", null, null);
+        if (glfw_window == null) {
+            std.debug.print("Failed to create GLFW window\n", .{});
+            return error.WindowCreationFailed;
+        }
 
-    // Set window pointer for clipboard access
-    g_window = window;
+        c.glfwMakeContextCurrent(glfw_window);
 
-    const version = c.gladLoadGLContext(&gl, @ptrCast(&c.glfwGetProcAddress));
-    if (version == 0) {
-        std.debug.print("Failed to initialize GLAD\n", .{});
-        return error.GLADInitFailed;
+        // Set up input callbacks
+        _ = c.glfwSetCharCallback(glfw_window, glfw_callbacks.charCallback);
+        _ = c.glfwSetKeyCallback(glfw_window, glfw_callbacks.keyCallback);
+        _ = c.glfwSetScrollCallback(glfw_window, glfw_callbacks.scrollCallback);
+        _ = c.glfwSetMouseButtonCallback(glfw_window, glfw_callbacks.mouseButtonCallback);
+        _ = c.glfwSetCursorPosCallback(glfw_window, glfw_callbacks.cursorPosCallback);
+        _ = c.glfwSetFramebufferSizeCallback(glfw_window, glfw_callbacks.framebufferSizeCallback);
+        _ = c.glfwSetWindowFocusCallback(glfw_window, glfw_callbacks.windowFocusCallback);
+
+        g_window = glfw_window;
     }
-    std.debug.print("OpenGL {}.{}\n", .{ c.GLAD_VERSION_MAJOR(version), c.GLAD_VERSION_MINOR(version) });
+    defer if (!build_options.use_win32) {
+        if (glfw_window) |w| c.glfwDestroyWindow(w);
+    };
+
+    // --- Load OpenGL via GLAD ---
+    {
+        const version = if (build_options.use_win32)
+            c.gladLoadGLContext(&gl, @ptrCast(&win32_backend.glGetProcAddress))
+        else
+            c.gladLoadGLContext(&gl, @ptrCast(&c.glfwGetProcAddress));
+
+        if (version == 0) {
+            std.debug.print("Failed to initialize GLAD\n", .{});
+            return error.GLADInitFailed;
+        }
+        const backend_tag = if (build_options.use_win32) " (Win32 backend)" else "";
+        std.debug.print("OpenGL {}.{}{s}\n", .{ c.GLAD_VERSION_MAJOR(version), c.GLAD_VERSION_MINOR(version), backend_tag });
+    }
 
     // Initialize FreeType
     const ft_lib = freetype.Library.init() catch |err| {
@@ -2008,11 +3002,19 @@ pub fn main() !void {
 
     // Calculate window size based on cell dimensions (small padding for aesthetics)
     const padding: f32 = 10;
+    // Extra top offset for custom title bar (Win32 backend only)
+    const titlebar_offset: f32 = if (build_options.use_win32) @floatFromInt(win32_backend.TITLEBAR_HEIGHT) else 0;
+    const top_padding: f32 = padding + titlebar_offset;
+
     const content_width: f32 = cell_width * @as(f32, @floatFromInt(term_cols));
     const content_height: f32 = cell_height * @as(f32, @floatFromInt(term_rows));
-    const window_width: c_int = @intFromFloat(content_width + padding * 2);
-    const window_height: c_int = @intFromFloat(content_height + padding * 2);
-    c.glfwSetWindowSize(window, window_width, window_height);
+    const window_width: i32 = @intFromFloat(content_width + padding * 2);
+    const window_height: i32 = @intFromFloat(content_height + padding + top_padding);
+    if (build_options.use_win32) {
+        if (g_window) |w| w.setSize(window_width, window_height);
+    } else {
+        c.glfwSetWindowSize(glfw_window, window_width, window_height);
+    }
 
     gl.Enable.?(c.GL_BLEND);
     gl.BlendFunc.?(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
@@ -2033,8 +3035,9 @@ pub fn main() !void {
     var pty_buffer: [4096]u8 = undefined;
     var stream = terminal.vtStream();
 
-    // Main loop
-    while (c.glfwWindowShouldClose(window) == 0) {
+    // Main loop — shared logic with backend-specific window management
+    var running = true;
+    while (running) {
         // Check for config file changes
         if (config_watcher) |*w| checkConfigReload(allocator, w);
 
@@ -2073,34 +3076,76 @@ pub fn main() !void {
         while (pty.dataAvailable() > 0) {
             const bytes_read = pty.read(&pty_buffer) catch break;
             if (bytes_read == 0) break;
+            // Scan for OSC title sequences before feeding to terminal
+            scanForOscTitle(pty_buffer[0..bytes_read]);
             // Feed data to terminal
             stream.nextSlice(pty_buffer[0..bytes_read]) catch {};
         }
 
-        // Get actual framebuffer size (handles DPI scaling too)
-        var fb_width: c_int = 0;
-        var fb_height: c_int = 0;
-        c.glfwGetFramebufferSize(window, &fb_width, &fb_height);
+        // Get framebuffer size and render
+        if (build_options.use_win32) {
+            const win = g_window orelse break;
 
-        if (g_post_enabled) {
-            // Render terminal to FBO, then apply custom shader to screen
-            renderFrameWithPost(fb_width, fb_height, &terminal, padding);
+            // Poll Win32 messages (fills event queues + checks WM_QUIT)
+            running = win.pollEvents();
+
+            // Sync tab count to win32 for hit-testing
+            win.tab_count = g_tab_count;
+
+            // Process all queued input events (keyboard, mouse, resize)
+            win32_input.processEvents(win);
+
+            // Update focus state
+            window_focused = win.focused;
+
+            const fb = win.getFramebufferSize();
+            const fb_width: c_int = fb.width;
+            const fb_height: c_int = fb.height;
+
+            if (g_post_enabled) {
+                renderFrameWithPost(fb_width, fb_height, &terminal, padding);
+            } else {
+                gl.Viewport.?(0, 0, fb_width, fb_height);
+                setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
+                gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
+                gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
+
+                // Draw titlebar background
+                renderTitlebar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
+
+                if (isActiveTabTerminal()) {
+                    updateCursorBlink();
+                    renderTerminal(&terminal, @floatFromInt(fb_height), padding, top_padding);
+                } else {
+                    renderPlaceholderTab(@floatFromInt(fb_width), @floatFromInt(fb_height), top_padding);
+                }
+            }
+
+            win.swapBuffers();
         } else {
-            gl.Viewport.?(0, 0, fb_width, fb_height);
-            setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
+            var fb_width: c_int = 0;
+            var fb_height: c_int = 0;
+            c.glfwGetFramebufferSize(glfw_window, &fb_width, &fb_height);
 
-            gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
-            gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
+            if (g_post_enabled) {
+                renderFrameWithPost(fb_width, fb_height, &terminal, padding);
+            } else {
+                gl.Viewport.?(0, 0, fb_width, fb_height);
+                setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
+                gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
+                gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
+                if (isActiveTabTerminal()) {
+                    updateCursorBlink();
+                    renderTerminal(&terminal, @floatFromInt(fb_height), padding, padding);
+                } else {
+                    renderPlaceholderTab(@floatFromInt(fb_width), @floatFromInt(fb_height), padding);
+                }
+            }
 
-            // Update cursor blink state
-            updateCursorBlink();
-
-            // Render with padding from edges
-            renderTerminal(&terminal, @floatFromInt(fb_height), padding, padding);
+            c.glfwSwapBuffers(glfw_window);
+            c.glfwPollEvents();
+            running = c.glfwWindowShouldClose(glfw_window) == 0;
         }
-
-        c.glfwSwapBuffers(window);
-        c.glfwPollEvents();
     }
 
     std.debug.print("Phantty exiting...\n", .{});
