@@ -203,14 +203,20 @@ A terminal has very few traditional UI controls:
 > **Goal**: Full tabbed terminal experience matching Chrome/Windows Terminal.
 
 **Done (implemented early in Phase 1):**
-- [x] Tab model: placeholder tabs + terminal tab (g_tabs array, max 16)
-- [x] New tab: `Ctrl+Shift+T` or click (+) button
-- [x] Close tab: `Ctrl+W`, middle-click, or close any tab (adjusts active index correctly)
+- [x] Tab model: each tab owns its own PTY + terminal + OSC state + selection (TabState struct, max 16)
+- [x] New tab: `Ctrl+Shift+T` or click (+) button — spawns real PTY + terminal
+- [x] Close tab: `Ctrl+W`, middle-click, or close any tab (deinits PTY/terminal, adjusts active index)
 - [x] Switch tabs: `Ctrl+Tab` / `Ctrl+Shift+Tab` / `Ctrl+1-9`
-- [x] Tab title from shell (OSC 0/2/7 sequences, shell-friendly names, ~/ substitution)
+- [x] Tab title from shell (per-tab OSC 0/2/7 sequences, shell-friendly names, ~/ substitution)
+- [x] Each tab owns its own terminal instance + PTY (all tabs are real terminals)
+- [x] Main loop drains all tabs' PTYs (background tabs don't block)
+- [x] Resize applies to all tabs' terminals and PTYs
+- [x] Config reload (cursor style, font, etc.) applies to all tabs
 
 **Remaining:**
-- [ ] Each tab owns its own terminal instance + PTY (currently only tab 0 is a real terminal)
+- [ ] Per-tab I/O threads: move PTY reads off the main thread so a busy tab (e.g. `cat /dev/urandom`) can't starve others. Each tab gets a reader thread that feeds the VT parser and signals the main thread to re-render. (See [ghostty_ui_research.md](ghostty_ui_research.md) — Ghostty uses 2 threads per surface: I/O + renderer.)
+- [ ] New tab inherits working directory from active tab (Ghostty does this via `Surface.setParent`)
+- [ ] Bell attention indicator: mark unfocused tabs when their shell rings the bell (Ghostty sets `needsAttention` on the tab page + 🔔 title prefix)
 - [ ] Reorder tabs: drag and drop
 - [ ] Tab overflow: scroll or dropdown when too many tabs
 - [ ] Right-click tab context menu (close, close others, duplicate, rename)

@@ -95,118 +95,160 @@ fn testFontDiscovery(allocator: std.mem.Allocator) !void {
 }
 
 // Global pointers for callbacks
-var g_pty: ?*Pty = null;
-var g_terminal: ?*ghostty_vt.Terminal = null;
 var g_window: if (build_options.use_win32) ?*win32_backend.Window else ?*c.GLFWwindow = null;
 var g_allocator: ?std.mem.Allocator = null;
 
-// Selection state
+// Selection state (per-tab)
 const Selection = struct {
-    start_col: usize,
-    start_row: usize,
-    end_col: usize,
-    end_row: usize,
-    active: bool,
+    start_col: usize = 0,
+    start_row: usize = 0,
+    end_col: usize = 0,
+    end_row: usize = 0,
+    active: bool = false,
 };
-var g_selection: Selection = .{
-    .start_col = 0,
-    .start_row = 0,
-    .end_col = 0,
-    .end_row = 0,
-    .active = false,
-};
+
 var g_should_close: bool = false; // Set by Ctrl+W with 1 tab
 var g_selecting: bool = false; // True while mouse button is held
 var g_click_x: f64 = 0; // X position of initial click (for threshold calculation)
 var g_click_y: f64 = 0; // Y position of initial click
 
 // ============================================================================
-// Tab model
+// Tab model — each tab owns its own PTY, terminal, and OSC state
 // ============================================================================
-
-const Tab = struct {
-    kind: enum { terminal, placeholder },
-    title: []const u8,
-};
-
-const MAX_TABS = 16;
-var g_tabs: [MAX_TABS]Tab = undefined;
-var g_tab_count: usize = 0;
-var g_active_tab: usize = 0;
-
-// Window/tab title from OSC 0/2 sequences
-var g_window_title: [256]u8 = undefined;
-var g_window_title_len: usize = 0;
 
 // OSC parser state machine — handles sequences split across PTY reads
 const OscParseState = enum { ground, esc, osc_num, osc_semi, osc_title };
-var g_osc_state: OscParseState = .ground;
-var g_osc_is_title: bool = false; // true if the OSC number is 0, 1, or 2
-var g_osc_num: u8 = 0; // which OSC number we're parsing
-var g_osc_buf: [512]u8 = undefined;
-var g_osc_buf_len: usize = 0;
 
-/// Scan PTY output for OSC 0 / OSC 2 title sequences.
+const TabState = struct {
+    pty: Pty,
+    terminal: ghostty_vt.Terminal,
+    selection: Selection,
+
+    // Per-tab OSC title state
+    window_title: [256]u8 = undefined,
+    window_title_len: usize = 0,
+    osc_state: OscParseState = .ground,
+    osc_is_title: bool = false,
+    osc_num: u8 = 0,
+    osc_buf: [512]u8 = undefined,
+    osc_buf_len: usize = 0,
+    osc7_title: [256]u8 = undefined,
+    osc7_title_len: usize = 0,
+    got_osc7_this_batch: bool = false,
+
+    /// Get the display title for this tab
+    fn getTitle(self: *const TabState) []const u8 {
+        if (self.osc7_title_len > 0)
+            return self.osc7_title[0..self.osc7_title_len];
+        if (self.window_title_len > 0)
+            return self.window_title[0..self.window_title_len];
+        return "phantty";
+    }
+
+    fn deinit(self: *TabState, allocator: std.mem.Allocator) void {
+        self.pty.deinit();
+        self.terminal.deinit(allocator);
+    }
+};
+
+const MAX_TABS = 16;
+var g_tabs: [MAX_TABS]?*TabState = .{null} ** MAX_TABS;
+var g_tab_count: usize = 0;
+var g_active_tab: usize = 0;
+
+// Global shell command for spawning new tabs (set once at startup from config)
+var g_shell_cmd_buf: [256]u16 = undefined;
+var g_shell_cmd_len: usize = 0;
+var g_scrollback_limit: u32 = 10_000_000;
+
+fn getShellCmd() [:0]const u16 {
+    return g_shell_cmd_buf[0..g_shell_cmd_len :0];
+}
+
+/// Get the active tab's PTY, or null
+fn activePty() ?*Pty {
+    if (g_tab_count == 0) return null;
+    const tab = g_tabs[g_active_tab] orelse return null;
+    return &tab.pty;
+}
+
+/// Get the active tab's terminal, or null
+fn activeTerminal() ?*ghostty_vt.Terminal {
+    if (g_tab_count == 0) return null;
+    const tab = g_tabs[g_active_tab] orelse return null;
+    return &tab.terminal;
+}
+
+/// Get the active tab's selection
+fn activeSelection() *Selection {
+    if (g_tab_count > 0) {
+        if (g_tabs[g_active_tab]) |tab| {
+            return &tab.selection;
+        }
+    }
+    // Fallback — should never happen in practice
+    const S = struct {
+        var dummy: Selection = .{};
+    };
+    return &S.dummy;
+}
+
+/// Scan PTY output for OSC 0 / OSC 2 title sequences (per-tab).
 /// Handles sequences split across multiple reads via state machine.
-fn scanForOscTitle(data: []const u8) void {
+fn scanForOscTitle(tab: *TabState, data: []const u8) void {
     for (data) |byte| {
-        switch (g_osc_state) {
+        switch (tab.osc_state) {
             .ground => {
                 if (byte == 0x1b) {
-                    g_osc_state = .esc;
+                    tab.osc_state = .esc;
                 }
             },
             .esc => {
                 if (byte == ']') {
-                    g_osc_state = .osc_num;
-                    g_osc_is_title = false;
+                    tab.osc_state = .osc_num;
+                    tab.osc_is_title = false;
                 } else {
-                    g_osc_state = .ground;
+                    tab.osc_state = .ground;
                 }
             },
             .osc_num => {
                 if (byte == '0' or byte == '1' or byte == '2' or byte == '7') {
-                    g_osc_is_title = true;
-                    g_osc_num = byte;
-                    g_osc_state = .osc_semi;
+                    tab.osc_is_title = true;
+                    tab.osc_num = byte;
+                    tab.osc_state = .osc_semi;
                 } else if (byte >= '0' and byte <= '9') {
-                    // Multi-digit OSC number — could be 7x, etc.
-                    // Store first digit and move to osc_semi to check for ';'
-                    g_osc_is_title = false;
-                    g_osc_num = byte;
-                    g_osc_state = .osc_semi;
+                    tab.osc_is_title = false;
+                    tab.osc_num = byte;
+                    tab.osc_state = .osc_semi;
                 } else {
-                    g_osc_state = .ground;
+                    tab.osc_state = .ground;
                 }
             },
             .osc_semi => {
                 if (byte == ';') {
-                    if (g_osc_is_title) {
-                        g_osc_buf_len = 0;
-                        g_osc_state = .osc_title;
+                    if (tab.osc_is_title) {
+                        tab.osc_buf_len = 0;
+                        tab.osc_state = .osc_title;
                     } else {
-                        g_osc_state = .ground;
+                        tab.osc_state = .ground;
                     }
                 } else if (byte >= '0' and byte <= '9') {
                     // Multi-digit OSC number, stay in osc_semi
                 } else {
-                    g_osc_state = .ground;
+                    tab.osc_state = .ground;
                 }
             },
             .osc_title => {
                 if (byte == 0x07) {
-                    // BEL terminates
-                    updateWindowTitle(g_osc_buf[0..g_osc_buf_len], g_osc_num);
-                    g_osc_state = .ground;
+                    updateTabTitle(tab, tab.osc_buf[0..tab.osc_buf_len], tab.osc_num);
+                    tab.osc_state = .ground;
                 } else if (byte == 0x1b) {
-                    // Could be ST (ESC \) — treat ESC as terminator
-                    updateWindowTitle(g_osc_buf[0..g_osc_buf_len], g_osc_num);
-                    g_osc_state = .esc; // re-enter esc state in case it's ESC ]
-                } else if (g_osc_buf_len < g_osc_buf.len) {
-                    g_osc_buf[g_osc_buf_len] = byte;
-                    g_osc_buf_len += 1;
+                    updateTabTitle(tab, tab.osc_buf[0..tab.osc_buf_len], tab.osc_num);
+                    tab.osc_state = .esc;
+                } else if (tab.osc_buf_len < tab.osc_buf.len) {
+                    tab.osc_buf[tab.osc_buf_len] = byte;
+                    tab.osc_buf_len += 1;
                 }
-                // If buffer full, just keep consuming until terminator
             },
         }
     }
@@ -248,16 +290,16 @@ fn shellFriendlyName(title: []const u8) []const u8 {
     return title;
 }
 
-fn resetOscBatch() void {
-    g_got_osc7_this_batch = false;
+fn resetOscBatch(tab: *TabState) void {
+    tab.got_osc7_this_batch = false;
 }
 
-fn updateWindowTitle(title: []const u8, osc_num: u8) void {
+fn updateTabTitle(tab: *TabState, title: []const u8, osc_num: u8) void {
     if (title.len == 0) return;
 
     if (osc_num == '7') {
         // OSC 7: file://host/path — extract the path, replace /home/<user> with ~
-        g_got_osc7_this_batch = true;
+        tab.got_osc7_this_batch = true;
         const prefix = "file://";
         if (std.mem.startsWith(u8, title, prefix)) {
             const after_prefix = title[prefix.len..];
@@ -271,89 +313,142 @@ fn updateWindowTitle(title: []const u8, osc_num: u8) void {
                     const home_len = home_prefix.len + user_end;
 
                     const rest = path[home_len..];
-                    g_osc7_title[0] = '~';
-                    const rest_len = @min(rest.len, g_osc7_title.len - 1);
-                    @memcpy(g_osc7_title[1 .. 1 + rest_len], rest[0..rest_len]);
-                    g_osc7_title_len = 1 + rest_len;
+                    tab.osc7_title[0] = '~';
+                    const rest_len = @min(rest.len, tab.osc7_title.len - 1);
+                    @memcpy(tab.osc7_title[1 .. 1 + rest_len], rest[0..rest_len]);
+                    tab.osc7_title_len = 1 + rest_len;
                 } else {
-                    const len = @min(path.len, g_osc7_title.len);
-                    @memcpy(g_osc7_title[0..len], path[0..len]);
-                    g_osc7_title_len = len;
+                    const len = @min(path.len, tab.osc7_title.len);
+                    @memcpy(tab.osc7_title[0..len], path[0..len]);
+                    tab.osc7_title_len = len;
                 }
             }
         }
     } else {
         // OSC 0/1/2 — skip if we already got OSC 7 in this same batch
-        if (g_got_osc7_this_batch) return;
+        if (tab.got_osc7_this_batch) return;
 
         // Map known shell paths/titles to friendly names
         const friendly = shellFriendlyName(title);
 
         // Accept and clear OSC 7 cache (new shell may not send OSC 7)
-        g_osc7_title_len = 0;
-        const len = @min(friendly.len, g_window_title.len);
-        @memcpy(g_window_title[0..len], friendly[0..len]);
-        g_window_title_len = len;
-    }
-
-    // Pick best title: OSC 7 if available, else OSC 0/1/2
-    const best_title: []const u8 = if (g_osc7_title_len > 0)
-        g_osc7_title[0..g_osc7_title_len]
-    else
-        g_window_title[0..g_window_title_len];
-
-    if (g_tab_count > 0 and g_tabs[0].kind == .terminal) {
-        g_tabs[0].title = best_title;
+        tab.osc7_title_len = 0;
+        const len = @min(friendly.len, tab.window_title.len);
+        @memcpy(tab.window_title[0..len], friendly[0..len]);
+        tab.window_title_len = len;
     }
 }
 
-fn initTabs() void {
-    g_tabs[0] = .{ .kind = .terminal, .title = "" };
-    g_tab_count = 1;
-    g_active_tab = 0;
-}
+/// Spawn a new tab with its own PTY + terminal instance.
+/// Called for both the initial tab and Ctrl+Shift+T.
+fn spawnTab(allocator: std.mem.Allocator) bool {
+    if (g_tab_count >= MAX_TABS) return false;
 
-fn addPlaceholderTab() void {
-    if (g_tab_count >= MAX_TABS) return;
-    g_tabs[g_tab_count] = .{ .kind = .placeholder, .title = "New Tab" };
+    // Allocate TabState on the heap so pointers stay stable when tabs shift
+    const tab = allocator.create(TabState) catch {
+        std.debug.print("Failed to allocate TabState\n", .{});
+        return false;
+    };
+
+    // Initialize terminal
+    tab.terminal = ghostty_vt.Terminal.init(allocator, .{
+        .cols = term_cols,
+        .rows = term_rows,
+        .max_scrollback = g_scrollback_limit,
+    }) catch {
+        std.debug.print("Failed to init terminal for new tab\n", .{});
+        allocator.destroy(tab);
+        return false;
+    };
+
+    // Set cursor style/blink from config
+    tab.terminal.screens.active.cursor.cursor_style = switch (g_cursor_style) {
+        .bar => .bar,
+        .block => .block,
+        .underline => .underline,
+        .block_hollow => .block_hollow,
+    };
+    tab.terminal.modes.set(.cursor_blinking, g_cursor_blink);
+
+    // Spawn PTY
+    tab.pty = Pty.spawn(term_cols, term_rows, getShellCmd()) catch {
+        std.debug.print("Failed to spawn PTY for new tab\n", .{});
+        tab.terminal.deinit(allocator);
+        allocator.destroy(tab);
+        return false;
+    };
+
+    // Init per-tab state
+    tab.selection = .{};
+    tab.window_title_len = 0;
+    tab.osc_state = .ground;
+    tab.osc_is_title = false;
+    tab.osc_num = 0;
+    tab.osc_buf_len = 0;
+    tab.osc7_title_len = 0;
+    tab.got_osc7_this_batch = false;
+
+    g_tabs[g_tab_count] = tab;
     g_active_tab = g_tab_count;
     g_tab_count += 1;
 
-    std.debug.print("New tab created ({}), active: {}\n", .{ g_tab_count, g_active_tab });
+    // Clear selection state when switching to new tab
+    g_selecting = false;
+
+    std.debug.print("New tab spawned (count={}), active: {}\n", .{ g_tab_count, g_active_tab });
+    return true;
 }
 
 fn closeTab(idx: usize) void {
     if (g_tab_count <= 1) return; // last tab closed via g_should_close instead
     if (idx >= g_tab_count) return;
 
+    const allocator = g_allocator orelse return;
+
+    // Deinit and free the tab
+    if (g_tabs[idx]) |tab| {
+        tab.deinit(allocator);
+        allocator.destroy(tab);
+    }
+
     // Shift tabs down
     var i = idx;
     while (i + 1 < g_tab_count) : (i += 1) {
         g_tabs[i] = g_tabs[i + 1];
     }
+    g_tabs[g_tab_count - 1] = null;
     g_tab_count -= 1;
 
     // Adjust active tab index
     if (g_active_tab == idx) {
-        // Closed the active tab — switch to the one that took its place,
-        // or the last tab if we closed the rightmost
         if (g_active_tab >= g_tab_count) {
             g_active_tab = g_tab_count - 1;
         }
     } else if (g_active_tab > idx) {
-        // Closed a tab before the active one — shift index left
         g_active_tab -= 1;
     }
+
+    // Clear selection state when tab changes
+    g_selecting = false;
 }
 
 fn switchTab(idx: usize) void {
     if (idx < g_tab_count) {
         g_active_tab = idx;
+        // Clear selection state when switching tabs
+        g_selecting = false;
     }
 }
 
 fn isActiveTabTerminal() bool {
-    return g_tabs[g_active_tab].kind == .terminal;
+    if (g_tab_count == 0) return false;
+    return g_tabs[g_active_tab] != null;
+}
+
+/// Get the active tab, or null
+fn activeTab() ?*TabState {
+    if (g_tab_count == 0) return null;
+    return g_tabs[g_active_tab];
 }
 
 // Embed the font
@@ -1135,7 +1230,7 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
 
         // Tab title text — centered, scaled down to ~75% of terminal font
         // Shortcut label (^1 through ^0) rendered right-aligned, only for tabs 1–10 in multi-tab
-        const title = g_tabs[tab_idx].title;
+        const title = if (g_tabs[tab_idx]) |t| t.getTitle() else "New Tab";
         if (title.len > 0) {
             const text_color = if (is_active) text_active else text_inactive;
             const shortcut_color = [3]f32{ 0.45, 0.45, 0.45 };
@@ -2149,14 +2244,16 @@ fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void
     g_cursor_style = cfg.@"cursor-style";
     g_cursor_blink = cfg.@"cursor-style-blink";
 
-    // Sync cursor style to terminal (rendering reads from terminal state)
-    if (g_terminal) |term| {
-        term.screens.active.cursor.cursor_style = switch (g_cursor_style) {
-            .bar => .bar,
-            .block => .block,
-            .underline => .underline,
-            .block_hollow => .block_hollow,
-        };
+    // Sync cursor style to all tabs' terminals (rendering reads from terminal state)
+    for (0..g_tab_count) |ti| {
+        if (g_tabs[ti]) |tab| {
+            tab.terminal.screens.active.cursor.cursor_style = switch (g_cursor_style) {
+                .bar => .bar,
+                .block => .block,
+                .underline => .underline,
+                .block_hollow => .block_hollow,
+            };
+        }
     }
 
     // --- Font ---
@@ -2181,12 +2278,12 @@ fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void
         if (cfg.@"window-height" > 0) term_rows = cfg.@"window-height";
         resizeWindowToGrid();
 
-        // Resize terminal and PTY to match
-        if (g_terminal) |term| {
-            term.resize(allocator, term_cols, term_rows) catch {};
-        }
-        if (g_pty) |pty| {
-            pty.resize(term_cols, term_rows);
+        // Resize ALL tabs' terminals and PTYs to match
+        for (0..g_tab_count) |ti| {
+            if (g_tabs[ti]) |tab| {
+                tab.terminal.resize(allocator, term_cols, term_rows) catch {};
+                tab.pty.resize(term_cols, term_rows);
+            }
         }
     } else {
         std.debug.print("Reload: failed to load font, keeping current font\n", .{});
@@ -2220,12 +2317,12 @@ fn mouseToCell(xpos: f64, ypos: f64) struct { col: usize, row: usize } {
 
 // Check if a cell is within the current selection
 fn isCellSelected(col: usize, row: usize) bool {
-    if (!g_selection.active) return false;
+    if (!activeSelection().active) return false;
 
-    var start_row = g_selection.start_row;
-    var start_col = g_selection.start_col;
-    var end_row = g_selection.end_row;
-    var end_col = g_selection.end_col;
+    var start_row = activeSelection().start_row;
+    var start_col = activeSelection().start_col;
+    var end_row = activeSelection().end_row;
+    var end_col = activeSelection().end_col;
 
     // Normalize
     if (start_row > end_row or (start_row == end_row and start_col > end_col)) {
@@ -2248,9 +2345,9 @@ fn isCellSelected(col: usize, row: usize) bool {
 
 const glfw_callbacks = if (!build_options.use_win32) struct {
     pub fn charCallback(_: ?*c.GLFWwindow, codepoint: c_uint) callconv(.c) void {
-        if (g_pty) |pty| {
+        if (activePty()) |pty| {
             resetCursorBlink();
-            if (g_terminal) |term| {
+            if (activeTerminal()) |term| {
                 term.scrollViewport(.bottom) catch {};
             }
             var buf: [4]u8 = undefined;
@@ -2267,11 +2364,11 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
             const cell = mouseToCell(xpos, ypos);
 
             if (action == c.GLFW_PRESS) {
-                g_selection.start_col = cell.col;
-                g_selection.start_row = cell.row;
-                g_selection.end_col = cell.col;
-                g_selection.end_row = cell.row;
-                g_selection.active = false;
+                activeSelection().start_col = cell.col;
+                activeSelection().start_row = cell.row;
+                activeSelection().end_col = cell.col;
+                activeSelection().end_row = cell.row;
+                activeSelection().active = false;
                 g_selecting = true;
                 g_click_x = xpos;
                 g_click_y = ypos;
@@ -2284,36 +2381,36 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
     pub fn cursorPosCallback(_: ?*c.GLFWwindow, xpos: f64, ypos: f64) callconv(.c) void {
         if (g_selecting) {
             const cell = mouseToCell(xpos, ypos);
-            g_selection.end_col = cell.col;
-            g_selection.end_row = cell.row;
+            activeSelection().end_col = cell.col;
+            activeSelection().end_row = cell.row;
 
             const threshold = cell_width * 0.6;
             const padding_d: f64 = 10;
-            const click_cell_x = g_click_x - padding_d - @as(f64, @floatFromInt(g_selection.start_col)) * @as(f64, cell_width);
+            const click_cell_x = g_click_x - padding_d - @as(f64, @floatFromInt(activeSelection().start_col)) * @as(f64, cell_width);
             const drag_cell_x = xpos - padding_d - @as(f64, @floatFromInt(cell.col)) * @as(f64, cell_width);
 
-            const same_cell = (g_selection.start_col == cell.col and g_selection.start_row == cell.row);
+            const same_cell = (activeSelection().start_col == cell.col and activeSelection().start_row == cell.row);
             if (same_cell) {
                 const moved_right = drag_cell_x >= threshold and click_cell_x < threshold;
                 const moved_left = drag_cell_x < threshold and click_cell_x >= threshold;
-                g_selection.active = moved_right or moved_left;
+                activeSelection().active = moved_right or moved_left;
             } else {
-                g_selection.active = true;
+                activeSelection().active = true;
             }
         }
     }
 
     pub fn copySelectionToClipboard() void {
-        const terminal = g_terminal orelse return;
+        const terminal = activeTerminal() orelse return;
         const window = g_window orelse return;
         const allocator = g_allocator orelse return;
 
-        if (!g_selection.active) return;
+        if (!activeSelection().active) return;
 
-        var start_row = g_selection.start_row;
-        var start_col = g_selection.start_col;
-        var end_row = g_selection.end_row;
-        var end_col = g_selection.end_col;
+        var start_row = activeSelection().start_row;
+        var start_col = activeSelection().start_col;
+        var end_row = activeSelection().end_row;
+        var end_col = activeSelection().end_col;
 
         if (start_row > end_row or (start_row == end_row and start_col > end_col)) {
             std.mem.swap(usize, &start_row, &end_row);
@@ -2359,7 +2456,7 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
     }
 
     pub fn pasteFromClipboard() void {
-        const pty = g_pty orelse return;
+        const pty = activePty() orelse return;
         const window = g_window orelse return;
 
         const clipboard = c.glfwGetClipboardString(window);
@@ -2395,7 +2492,7 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
         }
 
         if (!g_resize_in_progress) {
-            if (g_terminal) |terminal| {
+            if (activeTerminal()) |terminal| {
                 if (g_post_enabled) {
                     renderFrameWithPost(width, height, terminal, padding_f);
                 } else {
@@ -2417,7 +2514,7 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
     }
 
     pub fn scrollCallback(_: ?*c.GLFWwindow, _: f64, yoffset: f64) callconv(.c) void {
-        if (g_terminal) |terminal| {
+        if (activeTerminal()) |terminal| {
             const delta: isize = @intFromFloat(-yoffset * 3);
             terminal.scrollViewport(.{ .delta = delta }) catch {};
         }
@@ -2449,7 +2546,7 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
 
         if (ctrl and shift and key == c.GLFW_KEY_C) { copySelectionToClipboard(); return; }
         if (ctrl and shift and key == c.GLFW_KEY_V) { pasteFromClipboard(); return; }
-        if (ctrl and shift and key == c.GLFW_KEY_T) { addPlaceholderTab(); return; }
+        if (ctrl and shift and key == c.GLFW_KEY_T) { _ = spawnTab(g_allocator orelse return); return; }
         if (ctrl and key == c.GLFW_KEY_W) {
             if (g_tab_count <= 1) {
                 g_should_close = true;
@@ -2475,7 +2572,7 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
         const alt = (mods & c.GLFW_MOD_ALT) != 0;
         if (alt and key == c.GLFW_KEY_ENTER) { toggleFullscreen(); return; }
 
-        if (g_pty) |pty| {
+        if (activePty()) |pty| {
             const is_scroll_key = shift and (key == c.GLFW_KEY_PAGE_UP or key == c.GLFW_KEY_PAGE_DOWN);
             const is_modifier = key == c.GLFW_KEY_LEFT_SHIFT or key == c.GLFW_KEY_RIGHT_SHIFT or
                 key == c.GLFW_KEY_LEFT_CONTROL or key == c.GLFW_KEY_RIGHT_CONTROL or
@@ -2483,7 +2580,7 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
                 key == c.GLFW_KEY_LEFT_SUPER or key == c.GLFW_KEY_RIGHT_SUPER;
             if (!is_scroll_key and !is_modifier) {
                 resetCursorBlink();
-                if (g_terminal) |term| term.scrollViewport(.bottom) catch {};
+                if (activeTerminal()) |term| term.scrollViewport(.bottom) catch {};
             }
 
             const seq: ?[]const u8 = switch (key) {
@@ -2499,14 +2596,14 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
                 c.GLFW_KEY_END => "\x1b[F",
                 c.GLFW_KEY_PAGE_UP => blk: {
                     if (shift) {
-                        if (g_terminal) |term| term.scrollViewport(.{ .delta = -@as(isize, term_rows / 2) }) catch {};
+                        if (activeTerminal()) |term| term.scrollViewport(.{ .delta = -@as(isize, term_rows / 2) }) catch {};
                         break :blk null;
                     }
                     break :blk "\x1b[5~";
                 },
                 c.GLFW_KEY_PAGE_DOWN => blk: {
                     if (shift) {
-                        if (g_terminal) |term| term.scrollViewport(.{ .delta = @as(isize, term_rows / 2) }) catch {};
+                        if (activeTerminal()) |term| term.scrollViewport(.{ .delta = @as(isize, term_rows / 2) }) catch {};
                         break :blk null;
                     }
                     break :blk "\x1b[6~";
@@ -2602,9 +2699,9 @@ const win32_input = if (build_options.use_win32) struct {
 
     fn handleChar(ev: win32_backend.CharEvent) void {
         if (!isActiveTabTerminal()) return;
-        const pty = g_pty orelse return;
+        const pty = activePty() orelse return;
         resetCursorBlink();
-        if (g_terminal) |term| {
+        if (activeTerminal()) |term| {
             term.scrollViewport(.bottom) catch {};
         }
         var buf: [4]u8 = undefined;
@@ -2625,7 +2722,7 @@ const win32_input = if (build_options.use_win32) struct {
         }
         // Ctrl+Shift+T = new tab
         if (ev.ctrl and ev.shift and ev.vk == 0x54) { // 'T'
-            addPlaceholderTab();
+            _ = spawnTab(g_allocator orelse return);
             return;
         }
         // Ctrl+W = close tab, or close app if only 1 tab
@@ -2668,14 +2765,14 @@ const win32_input = if (build_options.use_win32) struct {
         // Don't send input to PTY if active tab isn't the terminal
         if (!isActiveTabTerminal()) return;
 
-        const pty = g_pty orelse return;
+        const pty = activePty() orelse return;
 
         // Don't reset blink / scroll-to-bottom for scroll keys or pure modifiers
         const is_scroll_key = ev.shift and (ev.vk == win32_backend.VK_PRIOR or ev.vk == win32_backend.VK_NEXT);
         const is_modifier = ev.vk == win32_backend.VK_SHIFT or ev.vk == win32_backend.VK_CONTROL or ev.vk == win32_backend.VK_MENU;
         if (!is_scroll_key and !is_modifier) {
             resetCursorBlink();
-            if (g_terminal) |term| term.scrollViewport(.bottom) catch {};
+            if (activeTerminal()) |term| term.scrollViewport(.bottom) catch {};
         }
 
         const seq: ?[]const u8 = switch (ev.vk) {
@@ -2691,14 +2788,14 @@ const win32_input = if (build_options.use_win32) struct {
             win32_backend.VK_END => "\x1b[F",
             win32_backend.VK_PRIOR => blk: { // Page Up
                 if (ev.shift) {
-                    if (g_terminal) |term| term.scrollViewport(.{ .delta = -@as(isize, term_rows / 2) }) catch {};
+                    if (activeTerminal()) |term| term.scrollViewport(.{ .delta = -@as(isize, term_rows / 2) }) catch {};
                     break :blk null;
                 }
                 break :blk "\x1b[5~";
             },
             win32_backend.VK_NEXT => blk: { // Page Down
                 if (ev.shift) {
-                    if (g_terminal) |term| term.scrollViewport(.{ .delta = @as(isize, term_rows / 2) }) catch {};
+                    if (activeTerminal()) |term| term.scrollViewport(.{ .delta = @as(isize, term_rows / 2) }) catch {};
                     break :blk null;
                 }
                 break :blk "\x1b[6~";
@@ -2758,11 +2855,11 @@ const win32_input = if (build_options.use_win32) struct {
                 }
 
                 const cell_pos = mouseToCell(xpos, ypos);
-                g_selection.start_col = cell_pos.col;
-                g_selection.start_row = cell_pos.row;
-                g_selection.end_col = cell_pos.col;
-                g_selection.end_row = cell_pos.row;
-                g_selection.active = false;
+                activeSelection().start_col = cell_pos.col;
+                activeSelection().start_row = cell_pos.row;
+                activeSelection().end_col = cell_pos.col;
+                activeSelection().end_row = cell_pos.row;
+                activeSelection().active = false;
                 g_selecting = true;
                 g_click_x = xpos;
                 g_click_y = ypos;
@@ -2772,7 +2869,7 @@ const win32_input = if (build_options.use_win32) struct {
                     plus_btn_pressed = false;
                     // Only fire if still in the + button area
                     if (ypos < titlebar_h and hitTestPlusButton(xpos)) {
-                        addPlaceholderTab();
+                        _ = spawnTab(g_allocator orelse return);
                     }
                     return;
                 }
@@ -2872,26 +2969,26 @@ const win32_input = if (build_options.use_win32) struct {
         const xpos: f64 = @floatFromInt(ev.x);
         const ypos: f64 = @floatFromInt(ev.y);
         const cell_pos = mouseToCell(xpos, ypos);
-        g_selection.end_col = cell_pos.col;
-        g_selection.end_row = cell_pos.row;
+        activeSelection().end_col = cell_pos.col;
+        activeSelection().end_row = cell_pos.row;
 
         const threshold = cell_width * 0.6;
         const padding_d: f64 = 10;
-        const click_cell_x = g_click_x - padding_d - @as(f64, @floatFromInt(g_selection.start_col)) * @as(f64, cell_width);
+        const click_cell_x = g_click_x - padding_d - @as(f64, @floatFromInt(activeSelection().start_col)) * @as(f64, cell_width);
         const drag_cell_x = xpos - padding_d - @as(f64, @floatFromInt(cell_pos.col)) * @as(f64, cell_width);
 
-        const same_cell = (g_selection.start_col == cell_pos.col and g_selection.start_row == cell_pos.row);
+        const same_cell = (activeSelection().start_col == cell_pos.col and activeSelection().start_row == cell_pos.row);
         if (same_cell) {
             const moved_right = drag_cell_x >= threshold and click_cell_x < threshold;
             const moved_left = drag_cell_x < threshold and click_cell_x >= threshold;
-            g_selection.active = moved_right or moved_left;
+            activeSelection().active = moved_right or moved_left;
         } else {
-            g_selection.active = true;
+            activeSelection().active = true;
         }
     }
 
     fn handleMouseWheel(ev: win32_backend.MouseWheelEvent) void {
-        if (g_terminal) |terminal| {
+        if (activeTerminal()) |terminal| {
             // WHEEL_DELTA is 120 per notch. Convert to lines (3 lines per notch, like GLFW).
             const notches = @as(f64, @floatFromInt(ev.delta)) / 120.0;
             const delta: isize = @intFromFloat(-notches * 3);
@@ -2902,16 +2999,16 @@ const win32_input = if (build_options.use_win32) struct {
     // --- Clipboard (Win32 native) ---
 
     fn copySelectionToClipboard() void {
-        const terminal = g_terminal orelse return;
+        const terminal = activeTerminal() orelse return;
         const allocator = g_allocator orelse return;
         const win = g_window orelse return;
 
-        if (!g_selection.active) return;
+        if (!activeSelection().active) return;
 
-        var start_row = g_selection.start_row;
-        var start_col = g_selection.start_col;
-        var end_row = g_selection.end_row;
-        var end_col = g_selection.end_col;
+        var start_row = activeSelection().start_row;
+        var start_col = activeSelection().start_col;
+        var end_row = activeSelection().end_row;
+        var end_col = activeSelection().end_col;
 
         if (start_row > end_row or (start_row == end_row and start_col > end_col)) {
             std.mem.swap(usize, &start_row, &end_row);
@@ -2969,7 +3066,7 @@ const win32_input = if (build_options.use_win32) struct {
     }
 
     fn pasteFromClipboard() void {
-        const pty = g_pty orelse return;
+        const pty = activePty() orelse return;
         const win = g_window orelse return;
 
         if (win32_backend.OpenClipboard(win.hwnd) == 0) return;
@@ -3103,60 +3200,46 @@ pub fn main() !void {
         std.debug.print("No config file found, using defaults\n", .{});
     }
 
-    // Initialize ghostty-vt terminal
-    var terminal: ghostty_vt.Terminal = try .init(allocator, .{
-        .cols = term_cols,
-        .rows = term_rows,
-        .max_scrollback = cfg.@"scrollback-limit",
-    });
-    defer terminal.deinit(allocator);
-    std.debug.print("Terminal initialized: {}x{}\n", .{ term_cols, term_rows });
+    // Store allocator and config globals (needed by spawnTab, closeTab, etc.)
+    g_allocator = allocator;
+    g_scrollback_limit = cfg.@"scrollback-limit";
 
-    // Set initial cursor style from config (like Ghostty does in Termio.zig)
-    terminal.screens.active.cursor.cursor_style = switch (g_cursor_style) {
-        .bar => .bar,
-        .block => .block,
-        .underline => .underline,
-        .block_hollow => .block_hollow,
-    };
-
-    // Set initial cursor blink mode (Ghostty defaults to true in Termio.zig:219)
-    terminal.modes.set(.cursor_blinking, g_cursor_blink);
-
-    // Resolve shell from config
-    const shell_cmd: [:0]const u16 = blk: {
+    // Resolve shell command from config and store globally for tab spawning
+    {
         const cmd = cfg.shell;
         if (std.mem.eql(u8, cmd, "cmd")) {
-            break :blk std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe");
+            const lit = std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe");
+            @memcpy(g_shell_cmd_buf[0..lit.len], lit);
+            g_shell_cmd_buf[lit.len] = 0;
+            g_shell_cmd_len = lit.len;
         } else if (std.mem.eql(u8, cmd, "powershell")) {
-            break :blk std.unicode.utf8ToUtf16LeStringLiteral("powershell.exe");
+            const lit = std.unicode.utf8ToUtf16LeStringLiteral("powershell.exe");
+            @memcpy(g_shell_cmd_buf[0..lit.len], lit);
+            g_shell_cmd_buf[lit.len] = 0;
+            g_shell_cmd_len = lit.len;
         } else if (std.mem.eql(u8, cmd, "pwsh")) {
-            break :blk std.unicode.utf8ToUtf16LeStringLiteral("pwsh.exe");
+            const lit = std.unicode.utf8ToUtf16LeStringLiteral("pwsh.exe");
+            @memcpy(g_shell_cmd_buf[0..lit.len], lit);
+            g_shell_cmd_buf[lit.len] = 0;
+            g_shell_cmd_len = lit.len;
         } else if (std.mem.eql(u8, cmd, "wsl")) {
-            break :blk std.unicode.utf8ToUtf16LeStringLiteral("wsl.exe");
+            const lit = std.unicode.utf8ToUtf16LeStringLiteral("wsl.exe");
+            @memcpy(g_shell_cmd_buf[0..lit.len], lit);
+            g_shell_cmd_buf[lit.len] = 0;
+            g_shell_cmd_len = lit.len;
         } else {
-            // Raw command path — convert UTF-8 to UTF-16
-            var buf: [256]u16 = undefined;
-            const len = std.unicode.utf8ToUtf16Le(&buf, cmd) catch 0;
-            buf[len] = 0;
-            break :blk buf[0..len :0];
+            const len = std.unicode.utf8ToUtf16Le(&g_shell_cmd_buf, cmd) catch 0;
+            g_shell_cmd_buf[len] = 0;
+            g_shell_cmd_len = len;
         }
-    };
+        std.debug.print("Shell command resolved: '{s}'\n", .{cfg.shell});
+    }
 
-    var pty = Pty.spawn(term_cols, term_rows, shell_cmd) catch |err| {
-        std.debug.print("Failed to spawn PTY with shell '{s}': {}\n", .{ cfg.shell, err });
-        return err;
-    };
-    defer pty.deinit();
-    std.debug.print("PTY spawned with shell '{s}'\n", .{cfg.shell});
-
-    // Set some global pointers for callbacks (window set later)
-    g_pty = &pty;
-    g_terminal = &terminal;
-    g_allocator = allocator;
-
-    // Initialize tab model
-    initTabs();
+    // Spawn the initial tab (PTY + terminal)
+    if (!spawnTab(allocator)) {
+        std.debug.print("Failed to spawn initial tab\n", .{});
+        return error.SpawnFailed;
+    }
 
     // ================================================================
     // Initialize windowing backend
@@ -3407,7 +3490,6 @@ pub fn main() !void {
 
     // Buffer for reading PTY output
     var pty_buffer: [4096]u8 = undefined;
-    var stream = terminal.vtStream();
 
     // Main loop — shared logic with backend-specific window management
     var running = true;
@@ -3430,31 +3512,36 @@ pub fn main() !void {
                     term_cols = g_pending_cols;
                     term_rows = g_pending_rows;
 
-                    // Resize terminal
-                    terminal.resize(allocator, term_cols, term_rows) catch |err| {
-                        std.debug.print("Terminal resize error: {}\n", .{err});
-                    };
+                    // Resize ALL tabs' terminals and PTYs
+                    for (0..g_tab_count) |ti| {
+                        if (g_tabs[ti]) |tab| {
+                            tab.terminal.resize(allocator, term_cols, term_rows) catch |err| {
+                                std.debug.print("Terminal resize error (tab {}): {}\n", .{ ti, err });
+                            };
+                            tab.pty.resize(term_cols, term_rows);
+                        }
+                    }
 
-                    // Resize PTY
-                    // TODO: ConPTY sends a full screen redraw on resize which overwrites
-                    // our scrollback content when growing. See GitHub issue #2.
-                    pty.resize(term_cols, term_rows);
-
-                    // Scroll to bottom after resize to ensure we see the active area
-                    terminal.scrollViewport(.{ .bottom = {} }) catch {};
+                    // Scroll active tab to bottom after resize
+                    if (activeTerminal()) |term| {
+                        term.scrollViewport(.{ .bottom = {} }) catch {};
+                    }
                 }
             }
         }
 
-        // Read from PTY (non-blocking check first)
-        resetOscBatch();
-        while (pty.dataAvailable() > 0) {
-            const bytes_read = pty.read(&pty_buffer) catch break;
-            if (bytes_read == 0) break;
-            // Scan for OSC title sequences before feeding to terminal
-            scanForOscTitle(pty_buffer[0..bytes_read]);
-            // Feed data to terminal
-            stream.nextSlice(pty_buffer[0..bytes_read]) catch {};
+        // Read from ALL tabs' PTYs (drain background tabs so they don't block)
+        for (0..g_tab_count) |ti| {
+            if (g_tabs[ti]) |tab| {
+                resetOscBatch(tab);
+                var stream = tab.terminal.vtStream();
+                while (tab.pty.dataAvailable() > 0) {
+                    const bytes_read = tab.pty.read(&pty_buffer) catch break;
+                    if (bytes_read == 0) break;
+                    scanForOscTitle(tab, pty_buffer[0..bytes_read]);
+                    stream.nextSlice(pty_buffer[0..bytes_read]) catch {};
+                }
+            }
         }
 
         // Get framebuffer size and render
@@ -3478,7 +3565,9 @@ pub fn main() !void {
             const fb_height: c_int = fb.height;
 
             if (g_post_enabled) {
-                renderFrameWithPost(fb_width, fb_height, &terminal, padding);
+                if (activeTerminal()) |term| {
+                    renderFrameWithPost(fb_width, fb_height, term, padding);
+                }
             } else {
                 gl.Viewport.?(0, 0, fb_width, fb_height);
                 setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
@@ -3488,11 +3577,9 @@ pub fn main() !void {
                 // Draw titlebar background
                 renderTitlebar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
 
-                if (isActiveTabTerminal()) {
+                if (activeTerminal()) |term| {
                     updateCursorBlink();
-                    renderTerminal(&terminal, @floatFromInt(fb_height), padding, top_padding);
-                } else {
-                    renderPlaceholderTab(@floatFromInt(fb_width), @floatFromInt(fb_height), top_padding);
+                    renderTerminal(term, @floatFromInt(fb_height), padding, top_padding);
                 }
             }
 
@@ -3503,17 +3590,17 @@ pub fn main() !void {
             c.glfwGetFramebufferSize(glfw_window, &fb_width, &fb_height);
 
             if (g_post_enabled) {
-                renderFrameWithPost(fb_width, fb_height, &terminal, padding);
+                if (activeTerminal()) |term| {
+                    renderFrameWithPost(fb_width, fb_height, term, padding);
+                }
             } else {
                 gl.Viewport.?(0, 0, fb_width, fb_height);
                 setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
                 gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
                 gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
-                if (isActiveTabTerminal()) {
+                if (activeTerminal()) |term| {
                     updateCursorBlink();
-                    renderTerminal(&terminal, @floatFromInt(fb_height), padding, padding);
-                } else {
-                    renderPlaceholderTab(@floatFromInt(fb_width), @floatFromInt(fb_height), padding);
+                    renderTerminal(term, @floatFromInt(fb_height), padding, padding);
                 }
             }
 
@@ -3522,6 +3609,16 @@ pub fn main() !void {
             running = c.glfwWindowShouldClose(glfw_window) == 0 and !g_should_close;
         }
     }
+
+    // Clean up all tabs
+    for (0..g_tab_count) |ti| {
+        if (g_tabs[ti]) |tab| {
+            tab.deinit(allocator);
+            allocator.destroy(tab);
+            g_tabs[ti] = null;
+        }
+    }
+    g_tab_count = 0;
 
     std.debug.print("Phantty exiting...\n", .{});
 }
