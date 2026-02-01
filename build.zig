@@ -11,18 +11,7 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{});
 
-    // Backend selection: "glfw", "win32", or "all" (default: "all")
-    const backend = b.option([]const u8, "backend", "Windowing backend: 'glfw', 'win32', or 'all' (default)") orelse "all";
-
-    const build_glfw = std.mem.eql(u8, backend, "glfw") or std.mem.eql(u8, backend, "all");
-    const build_win32 = std.mem.eql(u8, backend, "win32") or std.mem.eql(u8, backend, "all");
-
-    if (build_glfw) {
-        buildBackend(b, target, optimize, false);
-    }
-    if (build_win32) {
-        buildBackend(b, target, optimize, true);
-    }
+    buildBackend(b, target, optimize, true);
 }
 
 fn buildBackend(
@@ -96,7 +85,7 @@ fn buildBackend(
     // Link OpenGL on Windows
     exe_mod.linkSystemLibrary("opengl32", .{});
 
-    const name = if (use_win32) "phantty-win32" else "phantty-glfw";
+    const name = "phantty";
 
     const exe = b.addExecutable(.{
         .name = name,
