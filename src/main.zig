@@ -6,6 +6,8 @@ const Pty = @import("pty.zig").Pty;
 const sprite = @import("font/sprite.zig");
 const directwrite = @import("directwrite.zig");
 const Config = @import("config.zig");
+const Surface = @import("Surface.zig");
+const renderer = @import("renderer.zig");
 const win32_backend = if (build_options.use_win32) @import("win32.zig") else struct {};
 
 const c = @cImport({
@@ -98,14 +100,8 @@ fn testFontDiscovery(allocator: std.mem.Allocator) !void {
 var g_window: if (build_options.use_win32) ?*win32_backend.Window else ?*c.GLFWwindow = null;
 var g_allocator: ?std.mem.Allocator = null;
 
-// Selection state (per-tab)
-const Selection = struct {
-    start_col: usize = 0,
-    start_row: usize = 0,
-    end_col: usize = 0,
-    end_row: usize = 0,
-    active: bool = false,
-};
+// Selection is defined in Surface.zig
+const Selection = Surface.Selection;
 
 var g_should_close: bool = false; // Set by Ctrl+W with 1 tab
 var g_selecting: bool = false; // True while mouse button is held
@@ -113,41 +109,19 @@ var g_click_x: f64 = 0; // X position of initial click (for threshold calculatio
 var g_click_y: f64 = 0; // Y position of initial click
 
 // ============================================================================
-// Tab model — each tab owns its own PTY, terminal, and OSC state
+// Tab model — each tab owns a Surface (PTY + terminal + OSC state)
 // ============================================================================
 
-// OSC parser state machine — handles sequences split across PTY reads
-const OscParseState = enum { ground, esc, osc_num, osc_semi, osc_title };
-
 const TabState = struct {
-    pty: Pty,
-    terminal: ghostty_vt.Terminal,
-    selection: Selection,
+    surface: *Surface,
 
-    // Per-tab OSC title state
-    window_title: [256]u8 = undefined,
-    window_title_len: usize = 0,
-    osc_state: OscParseState = .ground,
-    osc_is_title: bool = false,
-    osc_num: u8 = 0,
-    osc_buf: [512]u8 = undefined,
-    osc_buf_len: usize = 0,
-    osc7_title: [256]u8 = undefined,
-    osc7_title_len: usize = 0,
-    got_osc7_this_batch: bool = false,
-
-    /// Get the display title for this tab
+    /// Get the display title for this tab (delegates to Surface)
     fn getTitle(self: *const TabState) []const u8 {
-        if (self.osc7_title_len > 0)
-            return self.osc7_title[0..self.osc7_title_len];
-        if (self.window_title_len > 0)
-            return self.window_title[0..self.window_title_len];
-        return "phantty";
+        return self.surface.getTitle();
     }
 
     fn deinit(self: *TabState, allocator: std.mem.Allocator) void {
-        self.pty.deinit();
-        self.terminal.deinit(allocator);
+        self.surface.deinit(allocator);
     }
 };
 
@@ -169,21 +143,21 @@ fn getShellCmd() [:0]const u16 {
 fn activePty() ?*Pty {
     if (g_tab_count == 0) return null;
     const tab = g_tabs[g_active_tab] orelse return null;
-    return &tab.pty;
+    return &tab.surface.pty;
 }
 
 /// Get the active tab's terminal, or null
 fn activeTerminal() ?*ghostty_vt.Terminal {
     if (g_tab_count == 0) return null;
     const tab = g_tabs[g_active_tab] orelse return null;
-    return &tab.terminal;
+    return &tab.surface.terminal;
 }
 
 /// Get the active tab's selection
 fn activeSelection() *Selection {
     if (g_tab_count > 0) {
         if (g_tabs[g_active_tab]) |tab| {
-            return &tab.selection;
+            return &tab.surface.selection;
         }
     }
     // Fallback — should never happen in practice
@@ -193,200 +167,41 @@ fn activeSelection() *Selection {
     return &S.dummy;
 }
 
-/// Scan PTY output for OSC 0 / OSC 2 title sequences (per-tab).
-/// Handles sequences split across multiple reads via state machine.
-fn scanForOscTitle(tab: *TabState, data: []const u8) void {
-    for (data) |byte| {
-        switch (tab.osc_state) {
-            .ground => {
-                if (byte == 0x1b) {
-                    tab.osc_state = .esc;
-                }
-            },
-            .esc => {
-                if (byte == ']') {
-                    tab.osc_state = .osc_num;
-                    tab.osc_is_title = false;
-                } else {
-                    tab.osc_state = .ground;
-                }
-            },
-            .osc_num => {
-                if (byte == '0' or byte == '1' or byte == '2' or byte == '7') {
-                    tab.osc_is_title = true;
-                    tab.osc_num = byte;
-                    tab.osc_state = .osc_semi;
-                } else if (byte >= '0' and byte <= '9') {
-                    tab.osc_is_title = false;
-                    tab.osc_num = byte;
-                    tab.osc_state = .osc_semi;
-                } else {
-                    tab.osc_state = .ground;
-                }
-            },
-            .osc_semi => {
-                if (byte == ';') {
-                    if (tab.osc_is_title) {
-                        tab.osc_buf_len = 0;
-                        tab.osc_state = .osc_title;
-                    } else {
-                        tab.osc_state = .ground;
-                    }
-                } else if (byte >= '0' and byte <= '9') {
-                    // Multi-digit OSC number, stay in osc_semi
-                } else {
-                    tab.osc_state = .ground;
-                }
-            },
-            .osc_title => {
-                if (byte == 0x07) {
-                    updateTabTitle(tab, tab.osc_buf[0..tab.osc_buf_len], tab.osc_num);
-                    tab.osc_state = .ground;
-                } else if (byte == 0x1b) {
-                    updateTabTitle(tab, tab.osc_buf[0..tab.osc_buf_len], tab.osc_num);
-                    tab.osc_state = .esc;
-                } else if (tab.osc_buf_len < tab.osc_buf.len) {
-                    tab.osc_buf[tab.osc_buf_len] = byte;
-                    tab.osc_buf_len += 1;
-                }
-            },
-        }
-    }
+/// Get the active Surface, or null
+fn activeSurface() ?*Surface {
+    if (g_tab_count == 0) return null;
+    const tab = g_tabs[g_active_tab] orelse return null;
+    return tab.surface;
 }
 
-/// OSC 7 gives us a reliable CWD. OSC 0/1/2 give us whatever the shell sets.
-/// Within the same PTY read batch, OSC 7 wins over 0/1/2 (OMZ sends truncated
-/// OSC 0 after the full OSC 7). Between batches, any new title is accepted.
-var g_osc7_title: [256]u8 = undefined;
-var g_osc7_title_len: usize = 0;
-var g_got_osc7_this_batch: bool = false;
+// OSC scanning and title management moved to Surface.zig
 
-/// Map known shell executable paths/titles to friendly display names.
-/// Windows Terminal does the same — "Windows PowerShell", "Command Prompt", etc.
-fn shellFriendlyName(title: []const u8) []const u8 {
-    // Case-insensitive check helpers
-    const lower_buf = blk: {
-        var buf: [512]u8 = undefined;
-        const len = @min(title.len, buf.len);
-        for (0..len) |i| {
-            buf[i] = if (title[i] >= 'A' and title[i] <= 'Z') title[i] + 32 else title[i];
-        }
-        break :blk buf[0..len];
-    };
-
-    // PowerShell (Windows PowerShell or pwsh)
-    if (std.mem.indexOf(u8, lower_buf, "powershell.exe") != null) return "Windows PowerShell";
-    if (std.mem.indexOf(u8, lower_buf, "pwsh.exe") != null) return "PowerShell";
-    if (std.mem.indexOf(u8, lower_buf, "powershell") != null and
-        std.mem.indexOf(u8, lower_buf, ".exe") == null) return "Windows PowerShell";
-    if (std.mem.indexOf(u8, lower_buf, "pwsh") != null and
-        std.mem.indexOf(u8, lower_buf, ".exe") == null) return "PowerShell";
-
-    // Command Prompt
-    if (std.mem.indexOf(u8, lower_buf, "cmd.exe") != null) return "Command Prompt";
-    if (std.mem.eql(u8, lower_buf, "cmd")) return "Command Prompt";
-
-    // Return original title if no match
-    return title;
-}
-
-fn resetOscBatch(tab: *TabState) void {
-    tab.got_osc7_this_batch = false;
-}
-
-fn updateTabTitle(tab: *TabState, title: []const u8, osc_num: u8) void {
-    if (title.len == 0) return;
-
-    if (osc_num == '7') {
-        // OSC 7: file://host/path — extract the path, replace /home/<user> with ~
-        tab.got_osc7_this_batch = true;
-        const prefix = "file://";
-        if (std.mem.startsWith(u8, title, prefix)) {
-            const after_prefix = title[prefix.len..];
-            if (std.mem.indexOfScalar(u8, after_prefix, '/')) |slash| {
-                const path = after_prefix[slash..];
-
-                const home_prefix = "/home/";
-                if (std.mem.startsWith(u8, path, home_prefix)) {
-                    const after_home = path[home_prefix.len..];
-                    const user_end = std.mem.indexOfScalar(u8, after_home, '/') orelse after_home.len;
-                    const home_len = home_prefix.len + user_end;
-
-                    const rest = path[home_len..];
-                    tab.osc7_title[0] = '~';
-                    const rest_len = @min(rest.len, tab.osc7_title.len - 1);
-                    @memcpy(tab.osc7_title[1 .. 1 + rest_len], rest[0..rest_len]);
-                    tab.osc7_title_len = 1 + rest_len;
-                } else {
-                    const len = @min(path.len, tab.osc7_title.len);
-                    @memcpy(tab.osc7_title[0..len], path[0..len]);
-                    tab.osc7_title_len = len;
-                }
-            }
-        }
-    } else {
-        // OSC 0/1/2 — skip if we already got OSC 7 in this same batch
-        if (tab.got_osc7_this_batch) return;
-
-        // Map known shell paths/titles to friendly names
-        const friendly = shellFriendlyName(title);
-
-        // Accept and clear OSC 7 cache (new shell may not send OSC 7)
-        tab.osc7_title_len = 0;
-        const len = @min(friendly.len, tab.window_title.len);
-        @memcpy(tab.window_title[0..len], friendly[0..len]);
-        tab.window_title_len = len;
-    }
-}
-
-/// Spawn a new tab with its own PTY + terminal instance.
+/// Spawn a new tab with its own Surface (PTY + terminal).
 /// Called for both the initial tab and Ctrl+Shift+T.
 fn spawnTab(allocator: std.mem.Allocator) bool {
     if (g_tab_count >= MAX_TABS) return false;
 
+    // Create Surface (owns PTY + terminal + OSC state)
+    const surface = Surface.init(
+        allocator,
+        term_cols,
+        term_rows,
+        getShellCmd(),
+        g_scrollback_limit,
+        g_cursor_style,
+        g_cursor_blink,
+    ) catch {
+        std.debug.print("Failed to create Surface for new tab\n", .{});
+        return false;
+    };
+
     // Allocate TabState on the heap so pointers stay stable when tabs shift
     const tab = allocator.create(TabState) catch {
         std.debug.print("Failed to allocate TabState\n", .{});
+        surface.deinit(allocator);
         return false;
     };
-
-    // Initialize terminal
-    tab.terminal = ghostty_vt.Terminal.init(allocator, .{
-        .cols = term_cols,
-        .rows = term_rows,
-        .max_scrollback = g_scrollback_limit,
-    }) catch {
-        std.debug.print("Failed to init terminal for new tab\n", .{});
-        allocator.destroy(tab);
-        return false;
-    };
-
-    // Set cursor style/blink from config
-    tab.terminal.screens.active.cursor.cursor_style = switch (g_cursor_style) {
-        .bar => .bar,
-        .block => .block,
-        .underline => .underline,
-        .block_hollow => .block_hollow,
-    };
-    tab.terminal.modes.set(.cursor_blinking, g_cursor_blink);
-
-    // Spawn PTY
-    tab.pty = Pty.spawn(term_cols, term_rows, getShellCmd()) catch {
-        std.debug.print("Failed to spawn PTY for new tab\n", .{});
-        tab.terminal.deinit(allocator);
-        allocator.destroy(tab);
-        return false;
-    };
-
-    // Init per-tab state
-    tab.selection = .{};
-    tab.window_title_len = 0;
-    tab.osc_state = .ground;
-    tab.osc_is_title = false;
-    tab.osc_num = 0;
-    tab.osc_buf_len = 0;
-    tab.osc7_title_len = 0;
-    tab.got_osc7_this_batch = false;
+    tab.surface = surface;
 
     g_tabs[g_tab_count] = tab;
     g_active_tab = g_tab_count;
@@ -2068,14 +1883,8 @@ fn renderQuad(x: f32, y: f32, w: f32, h: f32, color: [3]f32) void {
     gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6);
 }
 
-/// Terminal cursor style (matches ghostty's terminal/cursor.zig)
-/// Set by DECSCUSR escape sequence from programs like vim
-const TerminalCursorStyle = enum {
-    bar,
-    block,
-    underline,
-    block_hollow,
-};
+// Terminal cursor style defined in renderer/cursor.zig
+const TerminalCursorStyle = renderer.cursor.TerminalCursorStyle;
 
 /// Render the cursor with style and blink support (like Ghostty)
 /// Returns whether foreground should be inverted (for block cursor)
@@ -2314,7 +2123,7 @@ fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void
     // Sync cursor style to all tabs' terminals (rendering reads from terminal state)
     for (0..g_tab_count) |ti| {
         if (g_tabs[ti]) |tab| {
-            tab.terminal.screens.active.cursor.cursor_style = switch (g_cursor_style) {
+            tab.surface.terminal.screens.active.cursor.cursor_style = switch (g_cursor_style) {
                 .bar => .bar,
                 .block => .block,
                 .underline => .underline,
@@ -2348,8 +2157,8 @@ fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void
         // Resize ALL tabs' terminals and PTYs to match
         for (0..g_tab_count) |ti| {
             if (g_tabs[ti]) |tab| {
-                tab.terminal.resize(allocator, term_cols, term_rows) catch {};
-                tab.pty.resize(term_cols, term_rows);
+                tab.surface.terminal.resize(allocator, term_cols, term_rows) catch {};
+                tab.surface.pty.resize(term_cols, term_rows);
             }
         }
     } else {
@@ -3586,10 +3395,10 @@ pub fn main() !void {
                     // Resize ALL tabs' terminals and PTYs
                     for (0..g_tab_count) |ti| {
                         if (g_tabs[ti]) |tab| {
-                            tab.terminal.resize(allocator, term_cols, term_rows) catch |err| {
+                            tab.surface.terminal.resize(allocator, term_cols, term_rows) catch |err| {
                                 std.debug.print("Terminal resize error (tab {}): {}\n", .{ ti, err });
                             };
-                            tab.pty.resize(term_cols, term_rows);
+                            tab.surface.pty.resize(term_cols, term_rows);
                         }
                     }
 
@@ -3604,12 +3413,13 @@ pub fn main() !void {
         // Read from ALL tabs' PTYs (drain background tabs so they don't block)
         for (0..g_tab_count) |ti| {
             if (g_tabs[ti]) |tab| {
-                resetOscBatch(tab);
-                var stream = tab.terminal.vtStream();
-                while (tab.pty.dataAvailable() > 0) {
-                    const bytes_read = tab.pty.read(&pty_buffer) catch break;
+                const surface = tab.surface;
+                surface.resetOscBatch();
+                var stream = surface.terminal.vtStream();
+                while (surface.pty.dataAvailable() > 0) {
+                    const bytes_read = surface.pty.read(&pty_buffer) catch break;
                     if (bytes_read == 0) break;
-                    scanForOscTitle(tab, pty_buffer[0..bytes_read]);
+                    surface.scanForOscTitle(pty_buffer[0..bytes_read]);
                     stream.nextSlice(pty_buffer[0..bytes_read]) catch {};
                 }
             }
