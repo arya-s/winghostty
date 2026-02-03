@@ -171,3 +171,88 @@ When a surface rings the bell:
 - **Split panes**: Binary tree of surfaces within a tab (Phase 6 in UI_PLAN)
 - **Reference-counted font grids**: Not needed until split panes (multiple surfaces visible simultaneously)
 - **Per-surface renderer threads**: Overkill until split panes exist — we only render one tab at a time
+
+---
+
+## Font Atlas Architecture
+
+Ghostty uses a lazy, on-demand font atlas system. Glyphs are rasterized into a CPU buffer the first time they're needed, then synced to the GPU via atomic dirty tracking.
+
+### Atlas Data Structure (`src/font/Atlas.zig`)
+
+A 2D rectangle bin packer stored as a square texture. Uses a **best-height-then-best-width** heuristic (from Jukka Jylänki's "A Thousand Ways to Pack the Bin").
+
+```zig
+data: []u8,                                    // CPU-side pixel buffer
+size: u32,                                     // width = height (always square)
+nodes: std.ArrayListUnmanaged(Node),           // available horizontal spans
+format: Format,                                // .grayscale | .bgr | .bgra
+modified: std.atomic.Value(usize),             // bumped on every pixel write
+resized: std.atomic.Value(usize),              // bumped on dimension change
+```
+
+Packing algorithm (`reserve`):
+1. Walk all nodes to find the best-fit location (minimum height, then minimum width)
+2. `fit()` checks contiguous horizontal space across adjacent nodes
+3. Insert new node, shrink/remove overlapping nodes, merge adjacent same-y nodes
+4. 1px border around atlas edges to prevent sampling artifacts
+
+Formats: `.grayscale` (1 bpp, text glyphs), `.bgr` (3 bpp), `.bgra` (4 bpp, color emoji).
+
+### When Atlas Building Happens
+
+Glyphs are rasterized **on demand during rendering**, not at startup. The atlas starts at 512x512 and doubles when full.
+
+Flow:
+1. Renderer thread calls `rebuildCells()` → for each visible cell, calls `SharedGrid.renderGlyph()`
+2. **Fast path** (shared/read lock): look up `GlyphKey` in hash map → cache hit, return immediately
+3. **Slow path** (exclusive/write lock): FreeType rasterizes glyph → `atlas.reserve()` packs it → `atlas.set()` copies pixels, bumps `modified`
+4. On `error.AtlasFull`: `atlas.grow(size * 2)` doubles the atlas and retries
+
+### Storage: CPU + GPU
+
+**CPU** (`SharedGrid`): Two atlas instances:
+- `atlas_grayscale` — for text glyphs (1 byte/pixel)
+- `atlas_color` — for color emoji (4 bytes/pixel)
+
+**GPU** (per swap chain frame): Each `FrameState` holds its own texture copies with last-seen modified counters:
+```zig
+grayscale: Texture,        grayscale_modified: usize = 0,
+color: Texture,            color_modified: usize = 0,
+```
+
+### GPU Sync Protocol
+
+During `drawFrame()`, the renderer compares atomic counters:
+
+```zig
+const modified = self.font_grid.atlas_grayscale.modified.load(.monotonic);
+if (modified <= frame.grayscale_modified) break :texture;  // skip upload
+```
+
+If modified: acquire shared lock on font grid, call `syncAtlasTexture()`:
+- If atlas grew beyond GPU texture size → destroy old texture, allocate new one
+- `replaceRegion()` — full CPU-to-GPU blit of atlas data
+- On Metal: `MTLTexture replaceRegion:mipmapLevel:withBytes:bytesPerRow:`
+- On OpenGL: equivalent `glTexSubImage2D`
+
+When the font grid is replaced entirely (config change), frame modified counters reset to 0, forcing a full re-upload.
+
+### Full Pipeline
+
+```
+rebuildCells (per visible cell)
+    → SharedGrid.renderGlyph
+        → cache hit (shared lock): return Glyph with atlas_x, atlas_y
+        → cache miss (exclusive lock):
+            FreeType rasterize → atlas.reserve() → atlas.set()
+            → bumps atlas.modified atomically
+    → Glyph coordinates written into GPU cell vertex data
+
+drawFrame
+    → check atlas.modified > frame.grayscale_modified?
+        YES → syncAtlasTexture (re-upload to GPU)
+        NO  → skip
+    → bind grayscale + color textures to shader
+    → draw cells (vertex data references atlas UV coordinates)
+```

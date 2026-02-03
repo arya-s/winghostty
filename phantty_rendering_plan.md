@@ -151,22 +151,51 @@ next phase until the current one compiles and runs correctly.
 
 ### Phase 3: Font Atlas
 
-**Goal**: Replace per-glyph textures with a single font atlas.
+**Goal**: Replace per-glyph textures with a single font atlas. Modeled after
+Ghostty's `src/font/Atlas.zig` -- a lazy, on-demand 2D rectangle bin packer
+with atomic dirty tracking for GPU sync.
 
 **Files**: `src/font/Atlas.zig`, `src/renderer/OpenGL.zig`
 
-1. Implement `src/font/Atlas.zig`:
-   - `init()`: allocate 1024x1024 `u8` buffer, create GL texture
-   - `addGlyph(bitmap, width, height) -> AtlasRegion` -- pack glyph, return UV rect
-   - Row-based packing (left-to-right, new row when full)
-   - `modified: bool` flag, `sync()` to upload dirty region via `glTexSubImage2D`
-   - `getUV(region) -> {u0, v0, u1, v1}`
-2. Modify `Character` struct: replace `texture_id` with `AtlasRegion`
-3. `loadGlyph()` in OpenGL.zig: render with FreeType, add to atlas instead of creating texture
-4. Font fallback: skip rendering missing glyphs (empty cell). No DirectWrite on render path.
-5. Delete per-glyph `glGenTextures`/`glDeleteTexture`
+**Reference**: Ghostty uses a best-height-then-best-width bin packing algorithm
+(from Jukka Jylänki's "A Thousand Ways to Pack the Bin"). Glyphs are rasterized
+on first use, not at startup. The atlas starts at 512x512 and doubles when full.
+Two atlases: grayscale (text) and BGRA (color emoji, later).
 
-**Verification**: Build and run. ASCII text looks correct. Colors work. No visual regressions.
+1. Implement `src/font/Atlas.zig`:
+   - Core struct:
+     ```zig
+     data: []u8,                                // CPU-side pixel buffer
+     size: u32,                                 // width = height (always square)
+     nodes: std.ArrayListUnmanaged(Node),       // free-space horizontal spans
+     format: Format,                            // .grayscale | .bgra
+     modified: std.atomic.Value(usize),         // bumped on every pixel write
+     ```
+   - `Node = struct { x: u32, y: u32, width: u32 }` -- tracks available spans
+   - `init()`: allocate 512x512 `u8` buffer, seed nodes with single span `(1, 1, size-2)` (1px border)
+   - `reserve(width, height) -> Region`: best-height-then-best-width bin pack
+     - Walk nodes for best fit, insert new node, shrink/remove overlaps, merge adjacent
+     - Returns `Region { x, y, width, height }` for UV calculation
+   - `set(region, bitmap_data)`: copy pixels into `data`, bump `modified` atomically
+   - `grow(new_size)`: realloc to larger square, re-pack is NOT needed (just expand), bump `modified` and `resized`
+   - On `error.AtlasFull`: caller calls `grow(size * 2)` and retries
+2. Glyph cache (in `OpenGL.zig` or a `GlyphCache` struct):
+   - `HashMap(GlyphKey, Glyph)` where `Glyph = struct { region: Atlas.Region, offset_x, offset_y, advance }`
+   - Lookup before rasterizing -- cache hit = return atlas coordinates immediately
+   - Cache miss = FreeType rasterize → `atlas.reserve()` → `atlas.set()` → insert into map
+3. GPU texture sync (in `OpenGL.zig`):
+   - Store `atlas_texture: GLuint` and `atlas_modified: usize = 0`
+   - Before drawing: compare `atlas.modified.load(.monotonic)` vs `atlas_modified`
+     - If changed and atlas grew: `glDeleteTextures` + `glGenTextures` + `glTexImage2D` at new size
+     - If changed same size: `glTexSubImage2D` to upload full atlas
+     - Update `atlas_modified`
+   - Bind atlas texture to shader sampler
+4. Modify `Character` struct: replace `texture_id: GLuint` with `region: Atlas.Region`
+5. `loadGlyph()`: rasterize with FreeType, pack into atlas instead of creating per-glyph texture
+6. Font fallback: skip rendering missing glyphs (empty cell). No DirectWrite on render path.
+7. Delete all per-glyph `glGenTextures`/`glDeleteTexture` calls
+
+**Verification**: Build and run. ASCII text looks correct. Colors work. No visual regressions. Confirm single atlas texture with `glGetIntegerv(GL_TEXTURE_BINDING_2D)`.
 
 ---
 
