@@ -222,11 +222,23 @@ pub const Pty = struct {
             std.heap.page_allocator.free(slice_ptr[0..4096]); // Approximate
         }
 
-        // Close pipes
-        windows.CloseHandle(self.pipe_in_read);
+        // Close pipes (pipe_in_read may already be closed by closeReadPipe)
+        if (self.pipe_in_read != INVALID_HANDLE_VALUE)
+            windows.CloseHandle(self.pipe_in_read);
         windows.CloseHandle(self.pipe_in_write);
         windows.CloseHandle(self.pipe_out_read);
         windows.CloseHandle(self.pipe_out_write);
+    }
+
+    /// Close only the read pipe. This unblocks any blocking ReadFile()
+    /// call on pipe_in_read, causing it to fail with BROKEN_PIPE.
+    /// Used by Surface.deinit() to signal the IO thread to exit.
+    /// After calling this, do NOT call read() or dataAvailable().
+    pub fn closeReadPipe(self: *Pty) void {
+        if (self.pipe_in_read != INVALID_HANDLE_VALUE) {
+            windows.CloseHandle(self.pipe_in_read);
+            self.pipe_in_read = INVALID_HANDLE_VALUE;
+        }
     }
 
     /// Check if there's data available to read (non-blocking)

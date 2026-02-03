@@ -13,6 +13,7 @@ const std = @import("std");
 const ghostty_vt = @import("ghostty-vt");
 const Pty = @import("pty.zig").Pty;
 const renderer = @import("renderer.zig");
+const termio = @import("termio.zig");
 const Config = @import("config.zig");
 
 const Surface = @This();
@@ -125,11 +126,33 @@ pub fn init(
     surface.osc7_title_len = 0;
     surface.got_osc7_this_batch = false;
 
+    // Spawn IO thread — must be last, after all state is initialized.
+    // The thread starts reading from the PTY immediately.
+    surface.io_thread = std.Thread.spawn(.{}, termio.Thread.threadMain, .{surface}) catch |err| {
+        std.debug.print("Failed to spawn IO thread: {}\n", .{err});
+        surface.pty.deinit();
+        surface.terminal.deinit(allocator);
+        return err;
+    };
+
     return surface;
 }
 
 /// Deinitialize and free a Surface.
+/// Stops the IO thread first, then cleans up PTY and terminal.
 pub fn deinit(self: *Surface, allocator: std.mem.Allocator) void {
+    // 1. Close the PTY read pipe to unblock the IO thread's ReadFile().
+    //    This causes ReadFile to fail with BROKEN_PIPE, which makes
+    //    the thread exit its loop and return.
+    self.pty.closeReadPipe();
+
+    // 2. Join the IO thread — wait for it to finish.
+    if (self.io_thread) |thread| {
+        thread.join();
+        self.io_thread = null;
+    }
+
+    // 3. Now safe to tear down everything — no other thread is accessing.
     self.pty.deinit();
     self.terminal.deinit(allocator);
     allocator.destroy(self);

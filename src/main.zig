@@ -139,20 +139,6 @@ fn getShellCmd() [:0]const u16 {
     return g_shell_cmd_buf[0..g_shell_cmd_len :0];
 }
 
-/// Get the active tab's PTY, or null
-fn activePty() ?*Pty {
-    if (g_tab_count == 0) return null;
-    const tab = g_tabs[g_active_tab] orelse return null;
-    return &tab.surface.pty;
-}
-
-/// Get the active tab's terminal, or null
-fn activeTerminal() ?*ghostty_vt.Terminal {
-    if (g_tab_count == 0) return null;
-    const tab = g_tabs[g_active_tab] orelse return null;
-    return &tab.surface.terminal;
-}
-
 /// Get the active tab's selection
 fn activeSelection() *Selection {
     if (g_tab_count > 0) {
@@ -2123,12 +2109,14 @@ fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void
     // Sync cursor style to all tabs' terminals (rendering reads from terminal state)
     for (0..g_tab_count) |ti| {
         if (g_tabs[ti]) |tab| {
+            tab.surface.render_state.mutex.lock();
             tab.surface.terminal.screens.active.cursor.cursor_style = switch (g_cursor_style) {
                 .bar => .bar,
                 .block => .block,
                 .underline => .underline,
                 .block_hollow => .block_hollow,
             };
+            tab.surface.render_state.mutex.unlock();
         }
     }
 
@@ -2157,7 +2145,9 @@ fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void
         // Resize ALL tabs' terminals and PTYs to match
         for (0..g_tab_count) |ti| {
             if (g_tabs[ti]) |tab| {
+                tab.surface.render_state.mutex.lock();
                 tab.surface.terminal.resize(allocator, term_cols, term_rows) catch {};
+                tab.surface.render_state.mutex.unlock();
                 tab.surface.pty.resize(term_cols, term_rows);
             }
         }
@@ -2221,14 +2211,16 @@ fn isCellSelected(col: usize, row: usize) bool {
 
 const glfw_callbacks = if (!build_options.use_win32) struct {
     pub fn charCallback(_: ?*c.GLFWwindow, codepoint: c_uint) callconv(.c) void {
-        if (activePty()) |pty| {
+        if (activeSurface()) |surface| {
             resetCursorBlink();
-            if (activeTerminal()) |term| {
-                term.scrollViewport(.bottom) catch {};
+            {
+                surface.render_state.mutex.lock();
+                defer surface.render_state.mutex.unlock();
+                surface.terminal.scrollViewport(.bottom) catch {};
             }
             var buf: [4]u8 = undefined;
             const len = std.unicode.utf8Encode(@intCast(codepoint), &buf) catch return;
-            _ = pty.write(buf[0..len]) catch {};
+            _ = surface.pty.write(buf[0..len]) catch {};
         }
     }
 
@@ -2277,7 +2269,7 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
     }
 
     pub fn copySelectionToClipboard() void {
-        const terminal = activeTerminal() orelse return;
+        const surface = activeSurface() orelse return;
         const window = g_window orelse return;
         const allocator = g_allocator orelse return;
 
@@ -2296,7 +2288,9 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
         var text: std.ArrayListUnmanaged(u8) = .empty;
         defer text.deinit(allocator);
 
-        const screen = terminal.screens.active;
+        // Lock while reading terminal cells
+        surface.render_state.mutex.lock();
+        const screen = surface.terminal.screens.active;
         var row: usize = start_row;
         while (row <= end_row) : (row += 1) {
             const row_start_col = if (row == start_row) start_col else 0;
@@ -2322,6 +2316,7 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
                 text.append(allocator, '\n') catch {};
             }
         }
+        surface.render_state.mutex.unlock();
 
         if (text.items.len > 0) {
             text.append(allocator, 0) catch return;
@@ -2332,7 +2327,7 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
     }
 
     pub fn pasteFromClipboard() void {
-        const pty = activePty() orelse return;
+        const surface = activeSurface() orelse return;
         const window = g_window orelse return;
 
         const clipboard = c.glfwGetClipboardString(window);
@@ -2341,7 +2336,7 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
             while (str[len] != 0) : (len += 1) {}
             std.debug.print("Pasting {} bytes from clipboard\n", .{len});
             if (len > 0) {
-                _ = pty.write(str[0..len]) catch {};
+                _ = surface.pty.write(str[0..len]) catch {};
             }
         } else {
             std.debug.print("Clipboard is empty or unavailable\n", .{});
@@ -2368,16 +2363,18 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
         }
 
         if (!g_resize_in_progress) {
-            if (activeTerminal()) |terminal| {
+            if (activeSurface()) |surface| {
+                surface.render_state.mutex.lock();
+                defer surface.render_state.mutex.unlock();
                 if (g_post_enabled) {
-                    renderFrameWithPost(width, height, terminal, padding_f);
+                    renderFrameWithPost(width, height, &surface.terminal, padding_f);
                 } else {
                     gl.Viewport.?(0, 0, width, height);
                     setProjection(@floatFromInt(width), @floatFromInt(height));
                     gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
                     gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
                     updateCursorBlink();
-                    renderTerminal(terminal, @floatFromInt(height), padding_f, padding_f);
+                    renderTerminal(&surface.terminal, @floatFromInt(height), padding_f, padding_f);
                 }
             } else {
                 gl.Viewport.?(0, 0, width, height);
@@ -2390,9 +2387,11 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
     }
 
     pub fn scrollCallback(_: ?*c.GLFWwindow, _: f64, yoffset: f64) callconv(.c) void {
-        if (activeTerminal()) |terminal| {
+        if (activeSurface()) |surface| {
+            surface.render_state.mutex.lock();
+            defer surface.render_state.mutex.unlock();
             const delta: isize = @intFromFloat(-yoffset * 3);
-            terminal.scrollViewport(.{ .delta = delta }) catch {};
+            surface.terminal.scrollViewport(.{ .delta = delta }) catch {};
         }
     }
 
@@ -2448,7 +2447,7 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
         const alt = (mods & c.GLFW_MOD_ALT) != 0;
         if (alt and key == c.GLFW_KEY_ENTER) { toggleFullscreen(); return; }
 
-        if (activePty()) |pty| {
+        if (activeSurface()) |surface| {
             const is_scroll_key = shift and (key == c.GLFW_KEY_PAGE_UP or key == c.GLFW_KEY_PAGE_DOWN);
             const is_modifier = key == c.GLFW_KEY_LEFT_SHIFT or key == c.GLFW_KEY_RIGHT_SHIFT or
                 key == c.GLFW_KEY_LEFT_CONTROL or key == c.GLFW_KEY_RIGHT_CONTROL or
@@ -2456,9 +2455,12 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
                 key == c.GLFW_KEY_LEFT_SUPER or key == c.GLFW_KEY_RIGHT_SUPER;
             if (!is_scroll_key and !is_modifier) {
                 resetCursorBlink();
-                if (activeTerminal()) |term| term.scrollViewport(.bottom) catch {};
+                surface.render_state.mutex.lock();
+                surface.terminal.scrollViewport(.bottom) catch {};
+                surface.render_state.mutex.unlock();
             }
 
+            const pty = &surface.pty;
             const seq: ?[]const u8 = switch (key) {
                 c.GLFW_KEY_ENTER => "\r",
                 c.GLFW_KEY_BACKSPACE => "\x7f",
@@ -2472,14 +2474,18 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
                 c.GLFW_KEY_END => "\x1b[F",
                 c.GLFW_KEY_PAGE_UP => blk: {
                     if (shift) {
-                        if (activeTerminal()) |term| term.scrollViewport(.{ .delta = -@as(isize, term_rows / 2) }) catch {};
+                        surface.render_state.mutex.lock();
+                        surface.terminal.scrollViewport(.{ .delta = -@as(isize, term_rows / 2) }) catch {};
+                        surface.render_state.mutex.unlock();
                         break :blk null;
                     }
                     break :blk "\x1b[5~";
                 },
                 c.GLFW_KEY_PAGE_DOWN => blk: {
                     if (shift) {
-                        if (activeTerminal()) |term| term.scrollViewport(.{ .delta = @as(isize, term_rows / 2) }) catch {};
+                        surface.render_state.mutex.lock();
+                        surface.terminal.scrollViewport(.{ .delta = @as(isize, term_rows / 2) }) catch {};
+                        surface.render_state.mutex.unlock();
                         break :blk null;
                     }
                     break :blk "\x1b[6~";
@@ -2575,14 +2581,16 @@ const win32_input = if (build_options.use_win32) struct {
 
     fn handleChar(ev: win32_backend.CharEvent) void {
         if (!isActiveTabTerminal()) return;
-        const pty = activePty() orelse return;
+        const surface = activeSurface() orelse return;
         resetCursorBlink();
-        if (activeTerminal()) |term| {
-            term.scrollViewport(.bottom) catch {};
+        {
+            surface.render_state.mutex.lock();
+            defer surface.render_state.mutex.unlock();
+            surface.terminal.scrollViewport(.bottom) catch {};
         }
         var buf: [4]u8 = undefined;
         const len = std.unicode.utf8Encode(ev.codepoint, &buf) catch return;
-        _ = pty.write(buf[0..len]) catch {};
+        _ = surface.pty.write(buf[0..len]) catch {};
     }
 
     fn handleKey(ev: win32_backend.KeyEvent) void {
@@ -2641,14 +2649,17 @@ const win32_input = if (build_options.use_win32) struct {
         // Don't send input to PTY if active tab isn't the terminal
         if (!isActiveTabTerminal()) return;
 
-        const pty = activePty() orelse return;
+        const surface = activeSurface() orelse return;
+        const pty = &surface.pty;
 
         // Don't reset blink / scroll-to-bottom for scroll keys or pure modifiers
         const is_scroll_key = ev.shift and (ev.vk == win32_backend.VK_PRIOR or ev.vk == win32_backend.VK_NEXT);
         const is_modifier = ev.vk == win32_backend.VK_SHIFT or ev.vk == win32_backend.VK_CONTROL or ev.vk == win32_backend.VK_MENU;
         if (!is_scroll_key and !is_modifier) {
             resetCursorBlink();
-            if (activeTerminal()) |term| term.scrollViewport(.bottom) catch {};
+            surface.render_state.mutex.lock();
+            surface.terminal.scrollViewport(.bottom) catch {};
+            surface.render_state.mutex.unlock();
         }
 
         const seq: ?[]const u8 = switch (ev.vk) {
@@ -2664,14 +2675,18 @@ const win32_input = if (build_options.use_win32) struct {
             win32_backend.VK_END => "\x1b[F",
             win32_backend.VK_PRIOR => blk: { // Page Up
                 if (ev.shift) {
-                    if (activeTerminal()) |term| term.scrollViewport(.{ .delta = -@as(isize, term_rows / 2) }) catch {};
+                    surface.render_state.mutex.lock();
+                    surface.terminal.scrollViewport(.{ .delta = -@as(isize, term_rows / 2) }) catch {};
+                    surface.render_state.mutex.unlock();
                     break :blk null;
                 }
                 break :blk "\x1b[5~";
             },
             win32_backend.VK_NEXT => blk: { // Page Down
                 if (ev.shift) {
-                    if (activeTerminal()) |term| term.scrollViewport(.{ .delta = @as(isize, term_rows / 2) }) catch {};
+                    surface.render_state.mutex.lock();
+                    surface.terminal.scrollViewport(.{ .delta = @as(isize, term_rows / 2) }) catch {};
+                    surface.render_state.mutex.unlock();
                     break :blk null;
                 }
                 break :blk "\x1b[6~";
@@ -2864,18 +2879,20 @@ const win32_input = if (build_options.use_win32) struct {
     }
 
     fn handleMouseWheel(ev: win32_backend.MouseWheelEvent) void {
-        if (activeTerminal()) |terminal| {
+        if (activeSurface()) |surface| {
+            surface.render_state.mutex.lock();
+            defer surface.render_state.mutex.unlock();
             // WHEEL_DELTA is 120 per notch. Convert to lines (3 lines per notch, like GLFW).
             const notches = @as(f64, @floatFromInt(ev.delta)) / 120.0;
             const delta: isize = @intFromFloat(-notches * 3);
-            terminal.scrollViewport(.{ .delta = delta }) catch {};
+            surface.terminal.scrollViewport(.{ .delta = delta }) catch {};
         }
     }
 
     // --- Clipboard (Win32 native) ---
 
     fn copySelectionToClipboard() void {
-        const terminal = activeTerminal() orelse return;
+        const surface = activeSurface() orelse return;
         const allocator = g_allocator orelse return;
         const win = g_window orelse return;
 
@@ -2894,7 +2911,9 @@ const win32_input = if (build_options.use_win32) struct {
         var text: std.ArrayListUnmanaged(u8) = .empty;
         defer text.deinit(allocator);
 
-        const screen = terminal.screens.active;
+        // Lock while reading terminal cells
+        surface.render_state.mutex.lock();
+        const screen = surface.terminal.screens.active;
         var row: usize = start_row;
         while (row <= end_row) : (row += 1) {
             const row_start_col = if (row == start_row) start_col else 0;
@@ -2920,6 +2939,7 @@ const win32_input = if (build_options.use_win32) struct {
                 text.append(allocator, '\n') catch {};
             }
         }
+        surface.render_state.mutex.unlock();
 
         if (text.items.len == 0) return;
 
@@ -2942,7 +2962,7 @@ const win32_input = if (build_options.use_win32) struct {
     }
 
     fn pasteFromClipboard() void {
-        const pty = activePty() orelse return;
+        const surface = activeSurface() orelse return;
         const win = g_window orelse return;
 
         if (win32_backend.OpenClipboard(win.hwnd) == 0) return;
@@ -2958,7 +2978,7 @@ const win32_input = if (build_options.use_win32) struct {
 
         if (len > 0) {
             std.debug.print("Pasting {} bytes from clipboard\n", .{len});
-            _ = pty.write(data[0..len]) catch {};
+            _ = surface.pty.write(data[0..len]) catch {};
         }
     }
 
@@ -3365,9 +3385,6 @@ pub fn main() !void {
     }
     defer if (config_watcher) |*w| w.deinit();
 
-    // Buffer for reading PTY output
-    var pty_buffer: [4096]u8 = undefined;
-
     // Initialize FPS timer
     g_fps_last_time = std.time.milliTimestamp();
 
@@ -3392,38 +3409,32 @@ pub fn main() !void {
                     term_cols = g_pending_cols;
                     term_rows = g_pending_rows;
 
-                    // Resize ALL tabs' terminals and PTYs
+                    // Resize ALL tabs' terminals and PTYs (lock each surface)
                     for (0..g_tab_count) |ti| {
                         if (g_tabs[ti]) |tab| {
+                            tab.surface.render_state.mutex.lock();
                             tab.surface.terminal.resize(allocator, term_cols, term_rows) catch |err| {
                                 std.debug.print("Terminal resize error (tab {}): {}\n", .{ ti, err });
                             };
+                            tab.surface.render_state.mutex.unlock();
+                            // PTY resize doesn't need the mutex (independent Win32 call)
                             tab.surface.pty.resize(term_cols, term_rows);
                         }
                     }
 
                     // Scroll active tab to bottom after resize
-                    if (activeTerminal()) |term| {
-                        term.scrollViewport(.{ .bottom = {} }) catch {};
+                    if (activeSurface()) |surface| {
+                        surface.render_state.mutex.lock();
+                        defer surface.render_state.mutex.unlock();
+                        surface.terminal.scrollViewport(.{ .bottom = {} }) catch {};
                     }
                 }
             }
         }
 
-        // Read from ALL tabs' PTYs (drain background tabs so they don't block)
-        for (0..g_tab_count) |ti| {
-            if (g_tabs[ti]) |tab| {
-                const surface = tab.surface;
-                surface.resetOscBatch();
-                var stream = surface.terminal.vtStream();
-                while (surface.pty.dataAvailable() > 0) {
-                    const bytes_read = surface.pty.read(&pty_buffer) catch break;
-                    if (bytes_read == 0) break;
-                    surface.scanForOscTitle(pty_buffer[0..bytes_read]);
-                    stream.nextSlice(pty_buffer[0..bytes_read]) catch {};
-                }
-            }
-        }
+        // PTY reading is handled by per-surface IO threads (termio.Thread).
+        // We just need to render. The IO threads set surface.dirty when
+        // new data arrives.
 
         // Get framebuffer size and render
         if (build_options.use_win32) {
@@ -3448,8 +3459,10 @@ pub fn main() !void {
             updateFps();
 
             if (g_post_enabled) {
-                if (activeTerminal()) |term| {
-                    renderFrameWithPost(fb_width, fb_height, term, padding);
+                if (activeSurface()) |surface| {
+                    surface.render_state.mutex.lock();
+                    defer surface.render_state.mutex.unlock();
+                    renderFrameWithPost(fb_width, fb_height, &surface.terminal, padding);
                 }
             } else {
                 gl.Viewport.?(0, 0, fb_width, fb_height);
@@ -3457,12 +3470,15 @@ pub fn main() !void {
                 gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
                 gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
 
-                // Draw titlebar background
+                // Draw titlebar (tab titles read without lock — acceptable
+                // race, worst case is a stale title for one frame)
                 renderTitlebar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
 
-                if (activeTerminal()) |term| {
+                if (activeSurface()) |surface| {
+                    surface.render_state.mutex.lock();
+                    defer surface.render_state.mutex.unlock();
                     updateCursorBlink();
-                    renderTerminal(term, @floatFromInt(fb_height), padding, top_padding);
+                    renderTerminal(&surface.terminal, @floatFromInt(fb_height), padding, top_padding);
                 }
             }
 
@@ -3477,17 +3493,21 @@ pub fn main() !void {
             updateFps();
 
             if (g_post_enabled) {
-                if (activeTerminal()) |term| {
-                    renderFrameWithPost(fb_width, fb_height, term, padding);
+                if (activeSurface()) |surface| {
+                    surface.render_state.mutex.lock();
+                    defer surface.render_state.mutex.unlock();
+                    renderFrameWithPost(fb_width, fb_height, &surface.terminal, padding);
                 }
             } else {
                 gl.Viewport.?(0, 0, fb_width, fb_height);
                 setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
                 gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
                 gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
-                if (activeTerminal()) |term| {
+                if (activeSurface()) |surface| {
+                    surface.render_state.mutex.lock();
+                    defer surface.render_state.mutex.unlock();
                     updateCursorBlink();
-                    renderTerminal(term, @floatFromInt(fb_height), padding, padding);
+                    renderTerminal(&surface.terminal, @floatFromInt(fb_height), padding, padding);
                 }
             }
 
