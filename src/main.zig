@@ -526,6 +526,12 @@ const CURSOR_BLINK_INTERVAL_MS: i64 = 600; // Blink interval in ms (same as Ghos
 
 const ConfigWatcher = @import("config_watcher.zig");
 
+// FPS debug overlay state
+var g_debug_fps: bool = false; // Whether to show FPS overlay
+var g_fps_frame_count: u32 = 0; // Frames since last FPS update
+var g_fps_last_time: i64 = 0; // Timestamp of last FPS calculation
+var g_fps_value: f32 = 0; // Current FPS value to display
+
 // Font fallback system
 var g_ft_lib: ?freetype.Library = null;
 var g_font_discovery: ?*directwrite.FontDiscovery = null;
@@ -2139,6 +2145,66 @@ fn renderCursor(x: f32, y: f32, w: f32, h: f32, terminal_style: TerminalCursorSt
     }
 }
 
+/// Update the FPS counter. Call once per frame.
+fn updateFps() void {
+    g_fps_frame_count += 1;
+    const now = std.time.milliTimestamp();
+    const elapsed = now - g_fps_last_time;
+    if (elapsed >= 1000) {
+        g_fps_value = @as(f32, @floatFromInt(g_fps_frame_count)) * 1000.0 / @as(f32, @floatFromInt(elapsed));
+        g_fps_frame_count = 0;
+        g_fps_last_time = now;
+    }
+}
+
+/// Render the FPS debug overlay in the bottom-right corner.
+fn renderFpsOverlay(window_width: f32) void {
+    if (!g_debug_fps) return;
+
+    gl.UseProgram.?(shader_program);
+    gl.ActiveTexture.?(c.GL_TEXTURE0);
+    gl.BindVertexArray.?(vao);
+
+    // Format FPS string: "XXX fps"
+    var buf: [32]u8 = undefined;
+    const fps_int: u32 = @intFromFloat(@round(g_fps_value));
+    const text = std.fmt.bufPrint(&buf, "{d} fps", .{fps_int}) catch return;
+
+    // Use a fixed small scale for the overlay text
+    const target_height: f32 = 11.0 * 96.0 / 72.0; // 11pt at 96 DPI
+    const text_scale: f32 = target_height / cell_height;
+
+    // Measure text width
+    var text_width: f32 = 0;
+    for (text) |ch| {
+        text_width += glyphAdvanceScaled(@intCast(ch), text_scale);
+    }
+
+    // Position: bottom-right with some padding
+    const margin: f32 = 8;
+    const pad_h: f32 = 4;
+    const pad_v: f32 = 2;
+    const bg_w = text_width + pad_h * 2;
+    const bg_h = target_height + pad_v * 2;
+    const bg_x = window_width - bg_w - margin;
+    const bg_y = margin;
+
+    // Semi-transparent dark background
+    const bg_color = [3]f32{ 0.0, 0.0, 0.0 };
+    // Draw background with reduced opacity by using a darker shade
+    // (We don't have alpha control per-quad, so approximate with a dark color)
+    renderQuad(bg_x, bg_y, bg_w, bg_h, bg_color);
+
+    // Draw text
+    const text_color = [3]f32{ 0.0, 1.0, 0.0 }; // Bright green
+    var x = bg_x + pad_h;
+    const y = bg_y + pad_v;
+    for (text) |ch| {
+        renderCharScaled(@intCast(ch), x, y, text_color, text_scale);
+        x += glyphAdvanceScaled(@intCast(ch), text_scale);
+    }
+}
+
 /// Update cursor blink state based on time (call once per frame)
 fn updateCursorBlink() void {
     if (!g_cursor_blink) {
@@ -2239,10 +2305,11 @@ fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void
     if (g_window == null) return;
     const ft_lib = g_ft_lib orelse return;
 
-    // --- Theme, cursor ---
+    // --- Theme, cursor, debug ---
     g_theme = cfg.resolved_theme;
     g_cursor_style = cfg.@"cursor-style";
     g_cursor_blink = cfg.@"cursor-style-blink";
+    g_debug_fps = cfg.@"phantty-debug-fps";
 
     // Sync cursor style to all tabs' terminals (rendering reads from terminal state)
     for (0..g_tab_count) |ti| {
@@ -3185,6 +3252,7 @@ pub fn main() !void {
     g_theme = cfg.resolved_theme;
     g_cursor_style = cfg.@"cursor-style";
     g_cursor_blink = cfg.@"cursor-style-blink";
+    g_debug_fps = cfg.@"phantty-debug-fps";
     // Apply window size from config (0 = auto, use defaults)
     if (cfg.@"window-width" > 0) term_cols = cfg.@"window-width";
     if (cfg.@"window-height" > 0) term_rows = cfg.@"window-height";
@@ -3491,6 +3559,9 @@ pub fn main() !void {
     // Buffer for reading PTY output
     var pty_buffer: [4096]u8 = undefined;
 
+    // Initialize FPS timer
+    g_fps_last_time = std.time.milliTimestamp();
+
     // Main loop — shared logic with backend-specific window management
     var running = true;
     while (running) {
@@ -3564,6 +3635,8 @@ pub fn main() !void {
             const fb_width: c_int = fb.width;
             const fb_height: c_int = fb.height;
 
+            updateFps();
+
             if (g_post_enabled) {
                 if (activeTerminal()) |term| {
                     renderFrameWithPost(fb_width, fb_height, term, padding);
@@ -3583,11 +3656,15 @@ pub fn main() !void {
                 }
             }
 
+            renderFpsOverlay(@floatFromInt(fb_width));
+
             win.swapBuffers();
         } else {
             var fb_width: c_int = 0;
             var fb_height: c_int = 0;
             c.glfwGetFramebufferSize(glfw_window, &fb_width, &fb_height);
+
+            updateFps();
 
             if (g_post_enabled) {
                 if (activeTerminal()) |term| {
@@ -3603,6 +3680,8 @@ pub fn main() !void {
                     renderTerminal(term, @floatFromInt(fb_height), padding, padding);
                 }
             }
+
+            renderFpsOverlay(@floatFromInt(fb_width));
 
             c.glfwSwapBuffers(glfw_window);
             c.glfwPollEvents();

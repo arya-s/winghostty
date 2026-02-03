@@ -219,6 +219,9 @@ theme: ?[]const u8 = null,
 ///   - Any other value is treated as a raw command path
 shell: []const u8 = "cmd",
 
+/// Show a debug FPS overlay in the bottom-right corner.
+@"phantty-debug-fps": bool = false,
+
 /// Load an additional config file. Can be repeated. Relative paths are
 /// resolved relative to the file containing the directive. Prefix with
 /// `?` to make optional (missing file is silently ignored).
@@ -425,6 +428,14 @@ fn applyKeyValue(self: *Config, allocator: std.mem.Allocator, key: []const u8, v
         };
     } else if (std.mem.eql(u8, key, "shell")) {
         self.shell = self.dupeString(allocator, value) orelse return;
+    } else if (std.mem.eql(u8, key, "phantty-debug-fps")) {
+        if (std.mem.eql(u8, value, "true")) {
+            self.@"phantty-debug-fps" = true;
+        } else if (std.mem.eql(u8, value, "false")) {
+            self.@"phantty-debug-fps" = false;
+        } else {
+            log.warn("invalid phantty-debug-fps: {s}", .{value});
+        }
     } else if (std.mem.eql(u8, key, "config-file")) {
         self.loadConfigFileDirective(allocator, value, base_dir);
     } else {
@@ -602,6 +613,8 @@ pub fn printHelp() void {
         \\  --scrollback-limit <bytes>   Scrollback buffer size (default: 10000000)
         \\  --config-file <path>         Load additional config file (prefix ? for optional)
         \\
+        \\  --phantty-debug-fps <bool>   Show FPS overlay (default: false)
+        \\
         \\  --show-config-path           Print the config file path and exit
         \\  --list-fonts                 List all available system fonts
         \\  --list-themes                List all available themes
@@ -743,6 +756,9 @@ const default_config_template =
     \\
     \\# Scrollback buffer size in bytes (default: 10MB)
     \\# scrollback-limit = 10000000
+    \\
+    \\# Debug
+    \\# phantty-debug-fps = false
     \\
     \\# Load additional config files
     \\# config-file = ?optional/extra-config
