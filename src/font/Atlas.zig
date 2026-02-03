@@ -85,6 +85,11 @@ pub fn deinit(self: *Atlas, allocator: std.mem.Allocator) void {
 /// Returns the region (top-left x, y, width, height) where pixels should be written.
 /// Returns `error.AtlasFull` if the glyph doesn't fit.
 pub fn reserve(self: *Atlas, allocator: std.mem.Allocator, width: u32, height: u32) !Region {
+    // Add 1px padding around each glyph to prevent GL_LINEAR from
+    // sampling neighboring glyphs in the atlas.
+    const padded_width = width + 1;
+    const padded_height = height + 1;
+
     // Find best position using best-height-then-best-width heuristic.
     var best_idx: ?usize = null;
     var best_height: u32 = std.math.maxInt(u32);
@@ -92,9 +97,9 @@ pub fn reserve(self: *Atlas, allocator: std.mem.Allocator, width: u32, height: u
     var best_y: u32 = 0;
 
     for (self.nodes.items, 0..) |_, idx| {
-        if (self.fit(idx, width, height)) |y| {
+        if (self.fit(idx, padded_width, padded_height)) |y| {
             // Height heuristic: minimize the resulting top edge (y + height).
-            const result_height = y + height;
+            const result_height = y + padded_height;
             if (result_height < best_height or
                 (result_height == best_height and self.nodes.items[idx].width < best_width))
             {
@@ -109,8 +114,8 @@ pub fn reserve(self: *Atlas, allocator: std.mem.Allocator, width: u32, height: u
     const idx = best_idx orelse return error.AtlasFull;
     const x = self.nodes.items[idx].x;
 
-    // Insert a new node for the placed rectangle.
-    const new_node = Node{ .x = x, .y = best_y + height, .width = width };
+    // Insert a new node for the padded rectangle (padding is below/right).
+    const new_node = Node{ .x = x, .y = best_y + padded_height, .width = padded_width };
     try self.nodes.insert(allocator, idx, new_node);
 
     // Shrink or remove overlapping nodes to the right.

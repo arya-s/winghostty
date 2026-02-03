@@ -294,6 +294,17 @@ var g_atlas_modified: usize = 0; // Last synced modified counter
 var g_icon_atlas: ?FontAtlas = null;
 var g_icon_atlas_texture: c.GLuint = 0;
 var g_icon_atlas_modified: usize = 0;
+
+// Titlebar font — separate face/cache/atlas at fixed 14pt for crisp titlebar text.
+// Avoids scaling artifacts from rendering terminal-size glyphs at a smaller size.
+var g_titlebar_face: ?freetype.Face = null;
+var g_titlebar_cache: std.AutoHashMapUnmanaged(u32, Character) = .empty;
+var g_titlebar_atlas: ?FontAtlas = null;
+var g_titlebar_atlas_texture: c.GLuint = 0;
+var g_titlebar_atlas_modified: usize = 0;
+var g_titlebar_cell_width: f32 = 8;
+var g_titlebar_cell_height: f32 = 14;
+var g_titlebar_baseline: f32 = 3;
 var vao: c.GLuint = 0;
 var vbo: c.GLuint = 0;
 var shader_program: c.GLuint = 0;
@@ -990,6 +1001,95 @@ fn syncAtlasTexture(atlas_ptr: *?FontAtlas, texture_ptr: *c.GLuint, modified_ptr
     modified_ptr.* = modified;
 }
 
+/// Load a glyph for the titlebar (14pt, separate cache/atlas).
+fn loadTitlebarGlyph(codepoint: u32) ?Character {
+    if (g_titlebar_cache.get(codepoint)) |ch| return ch;
+
+    const alloc = g_allocator orelse return null;
+    const face = g_titlebar_face orelse return null;
+
+    var glyph_index = face.getCharIndex(codepoint) orelse 0;
+    var face_to_use = face;
+
+    // Try fallback for missing glyphs
+    if (glyph_index == 0) {
+        if (findOrLoadFallbackFace(codepoint, alloc)) |fallback| {
+            const fi = fallback.getCharIndex(codepoint) orelse 0;
+            if (fi != 0) {
+                glyph_index = fi;
+                face_to_use = fallback;
+            }
+        }
+    }
+
+    face_to_use.loadGlyph(@intCast(glyph_index), .{ .target = .light }) catch return null;
+    face_to_use.renderGlyph(.light) catch return null;
+
+    const glyph = face_to_use.handle.*.glyph;
+    const bitmap = glyph.*.bitmap;
+
+    const region = packBitmapIntoAtlas(
+        &g_titlebar_atlas,
+        alloc,
+        bitmap.width,
+        bitmap.rows,
+        bitmap.buffer,
+        @intCast(bitmap.pitch),
+    ) orelse return null;
+
+    const ch = Character{
+        .region = region,
+        .size_x = @intCast(bitmap.width),
+        .size_y = @intCast(bitmap.rows),
+        .bearing_x = glyph.*.bitmap_left,
+        .bearing_y = glyph.*.bitmap_top,
+        .advance = glyph.*.advance.x,
+        .valid = true,
+    };
+
+    g_titlebar_cache.put(alloc, codepoint, ch) catch return null;
+    return ch;
+}
+
+/// Render a titlebar glyph at 1:1 atlas size (no scaling).
+fn renderTitlebarChar(codepoint: u32, x: f32, y: f32, color: [3]f32) void {
+    if (codepoint < 32) return;
+    const ch: Character = loadTitlebarGlyph(codepoint) orelse return;
+    if (ch.region.width == 0 or ch.region.height == 0) return;
+
+    const x0 = x + @as(f32, @floatFromInt(ch.bearing_x));
+    const y0 = y + g_titlebar_baseline - @as(f32, @floatFromInt(ch.size_y - ch.bearing_y));
+    const w = @as(f32, @floatFromInt(ch.size_x));
+    const h = @as(f32, @floatFromInt(ch.size_y));
+
+    const atlas_size = if (g_titlebar_atlas) |a| @as(f32, @floatFromInt(a.size)) else 512.0;
+    const uv = glyphUV(ch.region, atlas_size);
+
+    const vertices = [6][4]f32{
+        .{ x0, y0 + h, uv.u0, uv.v0 },
+        .{ x0, y0, uv.u0, uv.v1 },
+        .{ x0 + w, y0, uv.u1, uv.v1 },
+        .{ x0, y0 + h, uv.u0, uv.v0 },
+        .{ x0 + w, y0, uv.u1, uv.v1 },
+        .{ x0 + w, y0 + h, uv.u1, uv.v0 },
+    };
+
+    gl.Uniform3f.?(gl.GetUniformLocation.?(shader_program, "textColor"), color[0], color[1], color[2]);
+    gl.BindTexture.?(c.GL_TEXTURE_2D, g_titlebar_atlas_texture);
+    gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
+    gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
+    gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
+    gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6);
+}
+
+/// Get the advance width of a titlebar glyph.
+fn titlebarGlyphAdvance(codepoint: u32) f32 {
+    if (loadTitlebarGlyph(codepoint)) |g| {
+        return @as(f32, @floatFromInt(g.advance >> 6));
+    }
+    return g_titlebar_cell_width;
+}
+
 /// Render an icon glyph centered within a button rect, using the icon atlas.
 fn renderIconGlyph(ch: Character, btn_x: f32, btn_y: f32, btn_w: f32, btn_h: f32, color: [3]f32, scale: f32) void {
     if (ch.region.width == 0 or ch.region.height == 0) return;
@@ -1065,49 +1165,6 @@ fn renderChar(codepoint: u32, x: f32, y: f32, color: [3]f32) void {
     gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6);
 }
 
-/// Render a character with uniform scaling applied to the glyph quad.
-/// scale < 1.0 makes text smaller. The position (x, y) is the cell bottom-left.
-/// Get scaled advance width for a codepoint.
-fn glyphAdvanceScaled(codepoint: u32, scale: f32) f32 {
-    if (loadGlyph(codepoint)) |glyph| {
-        return @as(f32, @floatFromInt(glyph.advance >> 6)) * scale;
-    }
-    return cell_width * scale;
-}
-
-fn renderCharScaled(codepoint: u32, x: f32, y: f32, color: [3]f32, scale: f32) void {
-    if (codepoint < 32) return;
-    const ch: Character = loadGlyph(codepoint) orelse return;
-    if (ch.region.width == 0 or ch.region.height == 0) return;
-
-    const w = @as(f32, @floatFromInt(ch.size_x)) * scale;
-    const h = @as(f32, @floatFromInt(ch.size_y)) * scale;
-    const bearing_x = @as(f32, @floatFromInt(ch.bearing_x)) * scale;
-    const bearing_y = @as(f32, @floatFromInt(ch.bearing_y)) * scale;
-    const size_y = @as(f32, @floatFromInt(ch.size_y)) * scale;
-
-    const x0 = x + bearing_x;
-    const y0 = y + cell_baseline * scale - (size_y - bearing_y);
-
-    const atlas_size = if (g_atlas) |a| @as(f32, @floatFromInt(a.size)) else 512.0;
-    const uv = glyphUV(ch.region, atlas_size);
-
-    const vertices = [6][4]f32{
-        .{ x0, y0 + h, uv.u0, uv.v0 },
-        .{ x0, y0, uv.u0, uv.v1 },
-        .{ x0 + w, y0, uv.u1, uv.v1 },
-        .{ x0, y0 + h, uv.u0, uv.v0 },
-        .{ x0 + w, y0, uv.u1, uv.v1 },
-        .{ x0 + w, y0 + h, uv.u1, uv.v0 },
-    };
-
-    gl.Uniform3f.?(gl.GetUniformLocation.?(shader_program, "textColor"), color[0], color[1], color[2]);
-    gl.BindTexture.?(c.GL_TEXTURE_2D, g_atlas_texture);
-    gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
-    gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
-    gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
-    gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6);
-}
 
 /// Render the Ghostty-style tab bar.
 /// Single row: [tabs...][+][  ][min][max][close]
@@ -1199,17 +1256,12 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
             }
         }
 
-        // Tab title text — centered, scaled down to ~75% of terminal font
+        // Tab title text — rendered at native 14pt via titlebar font (no scaling)
         // Shortcut label (^1 through ^0) rendered right-aligned, only for tabs 1–10 in multi-tab
         const title = if (g_tabs[tab_idx]) |t| t.getTitle() else "New Tab";
         if (title.len > 0) {
             const text_color = if (is_active) text_active else text_inactive;
             const shortcut_color = [3]f32{ 0.45, 0.45, 0.45 };
-            // Fixed 14pt for tab titles regardless of terminal font size
-            // At 96 DPI, 14pt ≈ 18.7px. Scale factor = target / actual.
-            const target_height: f32 = 14.0 * 96.0 / 72.0; // 14pt at 96 DPI
-            const text_scale: f32 = target_height / cell_height;
-            const scaled_height = target_height;
             const tab_pad: f32 = 18;
 
             // Shortcut label: "^1" through "^9", "^0" for tab 10
@@ -1222,8 +1274,8 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
             // Measure shortcut width
             var shortcut_w: f32 = 0;
             if (has_shortcut) {
-                shortcut_w += glyphAdvanceScaled('^', text_scale);
-                shortcut_w += glyphAdvanceScaled(@intCast(shortcut_digit), text_scale);
+                shortcut_w += titlebarGlyphAdvance('^');
+                shortcut_w += titlebarGlyphAdvance(@intCast(shortcut_digit));
             }
 
             const shortcut_gap: f32 = if (has_shortcut) 6 else 0;
@@ -1243,25 +1295,25 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
                 while (it.nextCodepoint()) |cp| {
                     if (cp_count >= 256) break;
                     codepoints[cp_count] = cp;
-                    text_width += glyphAdvanceScaled(cp, text_scale);
+                    text_width += titlebarGlyphAdvance(cp);
                     cp_count += 1;
                 }
             }
 
-            const text_y = tb_top + (titlebar_h - scaled_height) / 2;
+            const text_y = tb_top + (titlebar_h - g_titlebar_cell_height) / 2;
 
             if (text_width <= avail_w) {
                 // Fits — center it
                 const text_area = center_region - shortcut_reserved;
                 var text_x = center_offset + (text_area - text_width) / 2;
                 for (codepoints[0..cp_count]) |cp| {
-                    renderCharScaled(cp, text_x, text_y, text_color, text_scale);
-                    text_x += glyphAdvanceScaled(cp, text_scale);
+                    renderTitlebarChar(cp, text_x, text_y, text_color);
+                    text_x += titlebarGlyphAdvance(cp);
                 }
             } else {
                 // Middle truncation
                 const ellipsis_char: u32 = 0x2026;
-                const ellipsis_w = glyphAdvanceScaled(ellipsis_char, text_scale);
+                const ellipsis_w = titlebarGlyphAdvance(ellipsis_char);
                 const text_budget = avail_w - ellipsis_w;
                 const half_budget = text_budget / 2;
 
@@ -1269,7 +1321,7 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
                 var start_w: f32 = 0;
                 var start_end: usize = 0;
                 for (codepoints[0..cp_count], 0..) |cp, idx| {
-                    const char_w = glyphAdvanceScaled(cp, text_scale);
+                    const char_w = titlebarGlyphAdvance(cp);
                     if (start_w + char_w > half_budget) break;
                     start_w += char_w;
                     start_end = idx + 1;
@@ -1281,7 +1333,7 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
                 var j: usize = cp_count;
                 while (j > start_end) {
                     j -= 1;
-                    const char_w = glyphAdvanceScaled(codepoints[j], text_scale);
+                    const char_w = titlebarGlyphAdvance(codepoints[j]);
                     if (end_w + char_w > half_budget) break;
                     end_w += char_w;
                     end_start = j;
@@ -1289,14 +1341,14 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
 
                 var text_x = center_offset + tab_pad;
                 for (codepoints[0..start_end]) |cp| {
-                    renderCharScaled(cp, text_x, text_y, text_color, text_scale);
-                    text_x += glyphAdvanceScaled(cp, text_scale);
+                    renderTitlebarChar(cp, text_x, text_y, text_color);
+                    text_x += titlebarGlyphAdvance(cp);
                 }
-                renderCharScaled(ellipsis_char, text_x, text_y, text_color, text_scale);
+                renderTitlebarChar(ellipsis_char, text_x, text_y, text_color);
                 text_x += ellipsis_w;
                 for (codepoints[end_start..cp_count]) |cp| {
-                    renderCharScaled(cp, text_x, text_y, text_color, text_scale);
-                    text_x += glyphAdvanceScaled(cp, text_scale);
+                    renderTitlebarChar(cp, text_x, text_y, text_color);
+                    text_x += titlebarGlyphAdvance(cp);
                 }
             }
 
@@ -1304,9 +1356,9 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
             if (has_shortcut) {
                 const sc_color = if (is_active) text_active else shortcut_color;
                 var sc_x = center_offset + center_region - tab_pad - shortcut_w;
-                renderCharScaled('^', sc_x, text_y, sc_color, text_scale);
-                sc_x += glyphAdvanceScaled('^', text_scale);
-                renderCharScaled(@intCast(shortcut_digit), sc_x, text_y, sc_color, text_scale);
+                renderTitlebarChar('^', sc_x, text_y, sc_color);
+                sc_x += titlebarGlyphAdvance('^');
+                renderTitlebarChar(@intCast(shortcut_digit), sc_x, text_y, sc_color);
             }
         }
 
@@ -2080,14 +2132,10 @@ fn renderFpsOverlay(window_width: f32) void {
     const fps_int: u32 = @intFromFloat(@round(g_fps_value));
     const text = std.fmt.bufPrint(&buf, "{d} fps", .{fps_int}) catch return;
 
-    // Use a fixed small scale for the overlay text
-    const target_height: f32 = 11.0 * 96.0 / 72.0; // 11pt at 96 DPI
-    const text_scale: f32 = target_height / cell_height;
-
-    // Measure text width
+    // Measure text width using titlebar font
     var text_width: f32 = 0;
     for (text) |ch| {
-        text_width += glyphAdvanceScaled(@intCast(ch), text_scale);
+        text_width += titlebarGlyphAdvance(@intCast(ch));
     }
 
     // Position: bottom-right with some padding
@@ -2095,23 +2143,21 @@ fn renderFpsOverlay(window_width: f32) void {
     const pad_h: f32 = 4;
     const pad_v: f32 = 2;
     const bg_w = text_width + pad_h * 2;
-    const bg_h = target_height + pad_v * 2;
+    const bg_h = g_titlebar_cell_height + pad_v * 2;
     const bg_x = window_width - bg_w - margin;
     const bg_y = margin;
 
     // Semi-transparent dark background
     const bg_color = [3]f32{ 0.0, 0.0, 0.0 };
-    // Draw background with reduced opacity by using a darker shade
-    // (We don't have alpha control per-quad, so approximate with a dark color)
     renderQuad(bg_x, bg_y, bg_w, bg_h, bg_color);
 
-    // Draw text
+    // Draw text using titlebar font (native size, no scaling)
     const text_color = [3]f32{ 0.0, 1.0, 0.0 }; // Bright green
     var x = bg_x + pad_h;
     const y = bg_y + pad_v;
     for (text) |ch| {
-        renderCharScaled(@intCast(ch), x, y, text_color, text_scale);
-        x += glyphAdvanceScaled(@intCast(ch), text_scale);
+        renderTitlebarChar(@intCast(ch), x, y, text_color);
+        x += titlebarGlyphAdvance(@intCast(ch));
     }
 }
 
@@ -2257,6 +2303,27 @@ fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void
         g_font_size = new_font_size;
         preloadCharacters(new_face);
         // glyph_face is set inside preloadCharacters
+
+        // Rebuild titlebar font at 14pt with the new family
+        if (g_titlebar_face) |old_tb| old_tb.deinit();
+        g_titlebar_face = null;
+        g_titlebar_cache.deinit(allocator);
+        g_titlebar_cache = .empty;
+        if (g_titlebar_atlas) |*a| {
+            a.deinit(allocator);
+            g_titlebar_atlas = null;
+        }
+        if (g_titlebar_atlas_texture != 0) {
+            gl.DeleteTextures.?(1, &g_titlebar_atlas_texture);
+            g_titlebar_atlas_texture = 0;
+            g_titlebar_atlas_modified = 0;
+        }
+        if (loadFontFromConfig(allocator, new_family, new_weight, 10, ft_lib)) |tb_face| {
+            g_titlebar_face = tb_face;
+            const sm = tb_face.handle.*.size.*.metrics;
+            g_titlebar_cell_height = @round(@as(f32, @floatFromInt(sm.height)) / 64.0);
+            g_titlebar_baseline = @round(-@as(f32, @floatFromInt(sm.descender)) / 64.0);
+        }
 
         // --- Window size ---
         // If window size is configured, apply it; then resize window to match new cell dims
@@ -2488,6 +2555,7 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
             // Sync atlas before rendering
             if (g_atlas != null) syncAtlasTexture(&g_atlas, &g_atlas_texture, &g_atlas_modified);
             if (g_icon_atlas != null) syncAtlasTexture(&g_icon_atlas, &g_icon_atlas_texture, &g_icon_atlas_modified);
+            if (g_titlebar_atlas != null) syncAtlasTexture(&g_titlebar_atlas, &g_titlebar_atlas_texture, &g_titlebar_atlas_modified);
 
             if (activeSurface()) |surface| {
                 surface.render_state.mutex.lock();
@@ -3422,6 +3490,39 @@ pub fn main() !void {
     initBuffers();
     preloadCharacters(face);
 
+    // Initialize titlebar font — same family at fixed 14pt for crisp tab titles
+    {
+        const titlebar_pt: u32 = 10;
+        const tb_face = loadFontFromConfig(allocator, requested_font, requested_weight, titlebar_pt, ft_lib);
+        if (tb_face) |tf| {
+            g_titlebar_face = tf;
+
+            // Calculate titlebar cell metrics from the 14pt face
+            const sm = tf.handle.*.size.*.metrics;
+            // Simple approach: use FreeType metrics directly
+            const tb_ascent = @as(f32, @floatFromInt(sm.ascender)) / 64.0;
+            const tb_descent = @as(f32, @floatFromInt(sm.descender)) / 64.0;
+            const tb_height = @as(f32, @floatFromInt(sm.height)) / 64.0;
+            g_titlebar_cell_height = @round(tb_height);
+            g_titlebar_baseline = @round(-tb_descent);
+            // Measure max advance across ASCII
+            var max_adv: f32 = 0;
+            for (32..127) |cp| {
+                if (loadTitlebarGlyph(@intCast(cp))) |g| {
+                    const adv = @as(f32, @floatFromInt(g.advance >> 6));
+                    max_adv = @max(max_adv, adv);
+                }
+            }
+            if (max_adv > 0) g_titlebar_cell_width = max_adv;
+
+            std.debug.print("Titlebar font: {d:.0}x{d:.0} (ascent={d:.1}, descent={d:.1}, baseline={d:.0})\n", .{
+                g_titlebar_cell_width, g_titlebar_cell_height, tb_ascent, tb_descent, g_titlebar_baseline,
+            });
+        } else {
+            std.debug.print("Titlebar font init failed, will fall back to scaled terminal font\n", .{});
+        }
+    }
+
     // Load Segoe MDL2 Assets for caption button icons (Windows system font)
     // Size is DPI-dependent: 10px at 96 DPI, scales proportionally
     if (ft_lib.initFace("C:\\Windows\\Fonts\\segmdl2.ttf", 0)) |iface| {
@@ -3459,6 +3560,18 @@ pub fn main() !void {
         if (g_icon_atlas_texture != 0) {
             gl.DeleteTextures.?(1, &g_icon_atlas_texture);
             g_icon_atlas_texture = 0;
+        }
+        // Clean up titlebar font
+        if (g_titlebar_face) |f| f.deinit();
+        g_titlebar_face = null;
+        g_titlebar_cache.deinit(allocator);
+        if (g_titlebar_atlas) |*a| {
+            a.deinit(allocator);
+            g_titlebar_atlas = null;
+        }
+        if (g_titlebar_atlas_texture != 0) {
+            gl.DeleteTextures.?(1, &g_titlebar_atlas_texture);
+            g_titlebar_atlas_texture = 0;
         }
     }
     initSolidTexture();
@@ -3591,6 +3704,7 @@ pub fn main() !void {
             // Sync atlas textures to GPU if modified
             if (g_atlas != null) syncAtlasTexture(&g_atlas, &g_atlas_texture, &g_atlas_modified);
             if (g_icon_atlas != null) syncAtlasTexture(&g_icon_atlas, &g_icon_atlas_texture, &g_icon_atlas_modified);
+            if (g_titlebar_atlas != null) syncAtlasTexture(&g_titlebar_atlas, &g_titlebar_atlas_texture, &g_titlebar_atlas_modified);
 
             if (g_post_enabled) {
                 if (activeSurface()) |surface| {
@@ -3629,6 +3743,7 @@ pub fn main() !void {
             // Sync atlas textures to GPU if modified
             if (g_atlas != null) syncAtlasTexture(&g_atlas, &g_atlas_texture, &g_atlas_modified);
             if (g_icon_atlas != null) syncAtlasTexture(&g_icon_atlas, &g_icon_atlas_texture, &g_icon_atlas_modified);
+            if (g_titlebar_atlas != null) syncAtlasTexture(&g_titlebar_atlas, &g_titlebar_atlas_texture, &g_titlebar_atlas_modified);
 
             if (g_post_enabled) {
                 if (activeSurface()) |surface| {
