@@ -3019,6 +3019,13 @@ fn resetCursorBlink() void {
 // ============================================================================
 
 // Convert mouse position to terminal cell coordinates
+/// Get the viewport's absolute row offset into the scrollback.
+/// Row 0 on screen corresponds to absolute row `viewportOffset()`.
+fn viewportOffset() usize {
+    const surface = activeSurface() orelse return 0;
+    return surface.terminal.screens.active.pages.scrollbar().offset;
+}
+
 fn mouseToCell(xpos: f64, ypos: f64) struct { col: usize, row: usize } {
     const padding_d: f64 = 10;
     const tb_d: f64 = @floatFromInt(win32_backend.TITLEBAR_HEIGHT);
@@ -3031,9 +3038,15 @@ fn mouseToCell(xpos: f64, ypos: f64) struct { col: usize, row: usize } {
     return .{ .col = col, .row = row };
 }
 
-// Check if a cell is within the current selection
+// Check if a cell is within the current selection.
+// `col` and `row` are screen-relative (viewport) coordinates.
+// Selection rows are stored as absolute scrollback positions.
 fn isCellSelected(col: usize, row: usize) bool {
     if (!activeSelection().active) return false;
+
+    // Convert screen row to absolute
+    const vp_off = viewportOffset();
+    const abs_row = vp_off + row;
 
     var start_row = activeSelection().start_row;
     var start_col = activeSelection().start_col;
@@ -3046,12 +3059,12 @@ fn isCellSelected(col: usize, row: usize) bool {
         std.mem.swap(usize, &start_col, &end_col);
     }
 
-    if (row < start_row or row > end_row) return false;
-    if (row == start_row and row == end_row) {
+    if (abs_row < start_row or abs_row > end_row) return false;
+    if (abs_row == start_row and abs_row == end_row) {
         return col >= start_col and col <= end_col;
     }
-    if (row == start_row) return col >= start_col;
-    if (row == end_row) return col <= end_col;
+    if (abs_row == start_row) return col >= start_col;
+    if (abs_row == end_row) return col <= end_col;
     return true;
 }
 
@@ -3324,10 +3337,11 @@ const win32_input = struct {
                 }
 
                 const cell_pos = mouseToCell(xpos, ypos);
+                const abs_row = viewportOffset() + cell_pos.row;
                 activeSelection().start_col = cell_pos.col;
-                activeSelection().start_row = cell_pos.row;
+                activeSelection().start_row = abs_row;
                 activeSelection().end_col = cell_pos.col;
-                activeSelection().end_row = cell_pos.row;
+                activeSelection().end_row = abs_row;
                 activeSelection().active = false;
                 g_selecting = true;
                 g_click_x = xpos;
@@ -3463,15 +3477,16 @@ const win32_input = struct {
         if (!g_selecting) return;
 
         const cell_pos = mouseToCell(xpos, ypos);
+        const abs_row = viewportOffset() + cell_pos.row;
         activeSelection().end_col = cell_pos.col;
-        activeSelection().end_row = cell_pos.row;
+        activeSelection().end_row = abs_row;
 
         const threshold = cell_width * 0.6;
         const padding_d: f64 = 10;
         const click_cell_x = g_click_x - padding_d - @as(f64, @floatFromInt(activeSelection().start_col)) * @as(f64, cell_width);
         const drag_cell_x = xpos - padding_d - @as(f64, @floatFromInt(cell_pos.col)) * @as(f64, cell_width);
 
-        const same_cell = (activeSelection().start_col == cell_pos.col and activeSelection().start_row == cell_pos.row);
+        const same_cell = (activeSelection().start_col == cell_pos.col and activeSelection().start_row == abs_row);
         if (same_cell) {
             const moved_right = drag_cell_x >= threshold and click_cell_x < threshold;
             const moved_left = drag_cell_x < threshold and click_cell_x >= threshold;
@@ -3518,8 +3533,13 @@ const win32_input = struct {
         // Lock while reading terminal cells
         surface.render_state.mutex.lock();
         const screen = surface.terminal.screens.active;
+        const vp_off = surface.terminal.screens.active.pages.scrollbar().offset;
         var row: usize = start_row;
         while (row <= end_row) : (row += 1) {
+            // Convert absolute row to viewport-relative for getCell
+            const vp_row = if (row >= vp_off) row - vp_off else continue;
+            if (vp_row >= term_rows) continue;
+
             const row_start_col = if (row == start_row) start_col else 0;
             const row_end_col = if (row == end_row) end_col else term_cols - 1;
 
@@ -3527,7 +3547,7 @@ const win32_input = struct {
             while (col <= row_end_col) : (col += 1) {
                 const cell_data = screen.pages.getCell(.{ .viewport = .{
                     .x = @intCast(col),
-                    .y = @intCast(row),
+                    .y = @intCast(vp_row),
                 } }) orelse continue;
 
                 const cp = cell_data.cell.codepoint();

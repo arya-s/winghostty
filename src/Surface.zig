@@ -32,6 +32,8 @@ extern "kernel32" fn CancelIoEx(
 // ============================================================================
 
 /// Selection state for text selection.
+/// Rows are stored as absolute scrollback positions (viewport offset + screen row)
+/// so the selection stays anchored to the text when scrolling.
 pub const Selection = struct {
     start_col: usize = 0,
     start_row: usize = 0,
