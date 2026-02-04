@@ -2560,13 +2560,12 @@ fn scrollbarGeometry(window_height: f32, top_padding: f32) ?struct {
     const sb = surface.terminal.screens.active.pages.scrollbar();
     if (sb.total <= sb.len) return null; // No scrollback, no scrollbar
 
-    const padding: f32 = 10;
     const track_x = window_height; // We'll compute from window width — passed separately
     _ = track_x;
 
-    // Track spans the terminal content area (below titlebar, above bottom padding)
+    // Track spans the terminal content area (below titlebar, all the way to bottom)
     const track_top = window_height - top_padding; // top of terminal area in GL coords
-    const track_bottom = padding; // bottom padding
+    const track_bottom: f32 = 0; // extend to bottom edge
     const track_h = track_top - track_bottom;
     if (track_h <= 0) return null;
 
@@ -2631,7 +2630,7 @@ fn renderScrollbar(window_width: f32, window_height: f32, top_padding: f32) void
 
     const geo = scrollbarGeometry(window_height, top_padding) orelse return;
 
-    const bar_x = window_width - SCROLLBAR_WIDTH - SCROLLBAR_MARGIN;
+    const bar_x = window_width - SCROLLBAR_WIDTH;
     const bar_w = SCROLLBAR_WIDTH;
 
     // Use the shader_program for quad rendering
@@ -2644,18 +2643,17 @@ fn renderScrollbar(window_width: f32, window_height: f32, top_padding: f32) void
     const track_alpha = fade * 0.08;
     renderQuadAlpha(bar_x, geo.track_y, bar_w, geo.track_h, .{ 0, 0, 0 }, track_alpha);
 
-    // Thumb: black at 24% opacity
-    const thumb_alpha = fade * 0.24;
+    // Thumb: black at 45% opacity
+    const thumb_alpha = fade * 0.45;
     renderQuadAlpha(bar_x, geo.thumb_y, bar_w, geo.thumb_h, .{ 0, 0, 0 }, thumb_alpha);
 }
 
 /// Check if a point (in client pixel coords, origin top-left) is over the scrollbar.
 fn scrollbarHitTest(xpos: f64, ypos: f64, window_width: f32, window_height: f32, top_padding: f32) bool {
     const bar_right = window_width;
-    const bar_left = window_width - SCROLLBAR_HOVER_WIDTH - SCROLLBAR_MARGIN;
-    const padding: f32 = 10;
+    const bar_left = window_width - SCROLLBAR_HOVER_WIDTH;
     const track_top_px = top_padding; // in pixel coords (top-left origin)
-    const track_bottom_px = window_height - padding;
+    const track_bottom_px = window_height;
 
     return @as(f32, @floatCast(xpos)) >= bar_left and
         @as(f32, @floatCast(xpos)) <= bar_right and
