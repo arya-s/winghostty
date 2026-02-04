@@ -34,6 +34,14 @@ const SECURITY_ATTRIBUTES = extern struct {
     bInheritHandle: BOOL,
 };
 
+const HANDLE_FLAG_INHERIT: DWORD = 0x00000001;
+
+extern "kernel32" fn SetHandleInformation(
+    hObject: HANDLE,
+    dwMask: DWORD,
+    dwFlags: DWORD,
+) callconv(.winapi) BOOL;
+
 // For checking if data is available without blocking
 extern "kernel32" fn PeekNamedPipe(
     hNamedPipe: HANDLE,
@@ -111,6 +119,7 @@ pub const Pty = struct {
     pipe_out_write: HANDLE, // We write to this (PTY input)
     process_info: windows.PROCESS_INFORMATION,
     attr_list: ?*anyopaque,
+    attr_list_size: usize,
     cols: u16,
     rows: u16,
 
@@ -146,6 +155,12 @@ pub const Pty = struct {
             windows.CloseHandle(self.pipe_out_write);
         }
 
+        // Prevent pipe handles from being inherited by child processes
+        _ = SetHandleInformation(self.pipe_in_read, HANDLE_FLAG_INHERIT, 0);
+        _ = SetHandleInformation(self.pipe_in_write, HANDLE_FLAG_INHERIT, 0);
+        _ = SetHandleInformation(self.pipe_out_read, HANDLE_FLAG_INHERIT, 0);
+        _ = SetHandleInformation(self.pipe_out_write, HANDLE_FLAG_INHERIT, 0);
+
         // Create the pseudo console
         const size = COORD{ .X = @intCast(cols), .Y = @intCast(rows) };
         const hr = CreatePseudoConsole(size, self.pipe_out_read, self.pipe_in_write, 0, &self.hpc);
@@ -161,6 +176,7 @@ pub const Pty = struct {
         const attr_list = std.heap.page_allocator.alloc(u8, attr_size) catch return error.OutOfMemory;
         errdefer std.heap.page_allocator.free(attr_list);
         self.attr_list = attr_list.ptr;
+        self.attr_list_size = attr_size;
 
         if (InitializeProcThreadAttributeList(self.attr_list, 1, 0, &attr_size) == 0) {
             return error.InitializeAttributeListFailed;
@@ -225,8 +241,7 @@ pub const Pty = struct {
         if (self.attr_list) |attr| {
             DeleteProcThreadAttributeList(attr);
             const slice_ptr: [*]u8 = @ptrCast(attr);
-            // We don't know the exact size, but page_allocator can handle it
-            std.heap.page_allocator.free(slice_ptr[0..4096]); // Approximate
+            std.heap.page_allocator.free(slice_ptr[0..self.attr_list_size]);
         }
 
         // Close pipes (pipe_in_read may already be closed by closeReadPipe)
