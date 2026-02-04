@@ -1,5 +1,4 @@
 const std = @import("std");
-const build_options = @import("build_options");
 const ghostty_vt = @import("ghostty-vt");
 const freetype = @import("freetype");
 const Pty = @import("pty.zig").Pty;
@@ -8,13 +7,10 @@ const directwrite = @import("directwrite.zig");
 const Config = @import("config.zig");
 const Surface = @import("Surface.zig");
 const renderer = @import("renderer.zig");
-const win32_backend = if (build_options.use_win32) @import("win32.zig") else struct {};
+const win32_backend = @import("win32.zig");
 
 const c = @cImport({
     @cInclude("glad/gl.h");
-    if (!build_options.use_win32) {
-        @cInclude("GLFW/glfw3.h");
-    }
 });
 
 // Type aliases from config module
@@ -97,7 +93,7 @@ fn testFontDiscovery(allocator: std.mem.Allocator) !void {
 }
 
 // Global pointers for callbacks
-var g_window: if (build_options.use_win32) ?*win32_backend.Window else ?*c.GLFWwindow = null;
+var g_window: ?*win32_backend.Window = null;
 var g_allocator: ?std.mem.Allocator = null;
 
 // Selection is defined in Surface.zig
@@ -1489,7 +1485,6 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
         if (!is_active) {
             // Check hover
             const tab_hovered = blk: {
-                if (!build_options.use_win32) break :blk false;
                 const win = g_window orelse break :blk false;
                 if (win.mouse_y < 0 or win.mouse_y >= @as(i32, @intFromFloat(titlebar_h))) break :blk false;
                 const fx: f32 = @floatFromInt(win.mouse_x);
@@ -1624,7 +1619,6 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
     if (show_plus) {
         // Check if mouse is hovering the + button
         const plus_hovered = blk: {
-            if (!build_options.use_win32) break :blk false;
             const win = g_window orelse break :blk false;
             const mouse_x = win.mouse_x;
             const mouse_y = win.mouse_y;
@@ -1659,21 +1653,16 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
             renderQuad(plus_cx - t / 2, plus_cy - arm, t, arm * 2, plus_icon_color);
         }
         // Sync plus button position for double-click suppression in WndProc
-        if (build_options.use_win32) {
-            if (g_window) |w| {
-                w.plus_btn_x_start = @intFromFloat(cursor_x);
-                w.plus_btn_x_end = @intFromFloat(cursor_x + plus_btn_w);
-            }
+        if (g_window) |w| {
+            w.plus_btn_x_start = @intFromFloat(cursor_x);
+            w.plus_btn_x_end = @intFromFloat(cursor_x + plus_btn_w);
         }
         cursor_x += plus_btn_w;
     }
 
     // --- Caption buttons (minimize, maximize, close) ---
     const btn_h: f32 = titlebar_h;
-    const hovered: win32_backend.CaptionButton = if (build_options.use_win32)
-        (if (g_window) |w| w.hovered_button else .none)
-    else
-        .none;
+    const hovered: win32_backend.CaptionButton = if (g_window) |w| w.hovered_button else .none;
 
     const caption_start = window_width - caption_area_w;
     renderCaptionButton(caption_start, tb_top, caption_btn_w, btn_h, .minimize, hovered == .minimize);
@@ -1681,7 +1670,7 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
     renderCaptionButton(caption_start + caption_btn_w * 2, tb_top, caption_btn_w, btn_h, .close, hovered == .close);
 
     // --- Focus border: 1px accent border when window is focused (matches Explorer/DWM) ---
-    if (build_options.use_win32) {
+    {
         const is_focused = if (g_window) |w| w.focused else false;
         const is_maximized = if (g_window) |w| win32_backend.IsZoomed(w.hwnd) != 0 else false;
         if (is_focused and !is_maximized) {
@@ -1718,14 +1707,8 @@ fn renderCaptionButton(x: f32, y: f32, w: f32, h: f32, btn_type: CaptionButtonTy
         // Close button is at the window edge — inset by 1px on top/right
         // to respect the focus border (matches Explorer behavior)
         if (btn_type == .close) {
-            const is_focused = if (build_options.use_win32)
-                (if (g_window) |win| win.focused else false)
-            else
-                false;
-            const is_maximized = if (build_options.use_win32)
-                (if (g_window) |win| win32_backend.IsZoomed(win.hwnd) != 0 else false)
-            else
-                false;
+            const is_focused = if (g_window) |win| win.focused else false;
+            const is_maximized = if (g_window) |win| win32_backend.IsZoomed(win.hwnd) != 0 else false;
             const b: f32 = if (is_focused and !is_maximized) 1 else 0;
             renderQuad(x, y + b, w - b, h - b, hover_bg);
         } else {
@@ -1737,14 +1720,8 @@ fn renderCaptionButton(x: f32, y: f32, w: f32, h: f32, btn_type: CaptionButtonTy
     const icon_color: [3]f32 = if (hovered) .{ 1.0, 1.0, 1.0 } else .{ 0.75, 0.75, 0.75 };
 
     // Check if window is maximized or fullscreen (for restore icon)
-    const is_maximized = if (build_options.use_win32)
-        (if (g_window) |win| win32_backend.IsZoomed(win.hwnd) != 0 else false)
-    else
-        false;
-    const is_fullscreen = if (build_options.use_win32)
-        (if (g_window) |win| win.is_fullscreen else false)
-    else
-        false;
+    const is_maximized = if (g_window) |win| win32_backend.IsZoomed(win.hwnd) != 0 else false;
+    const is_fullscreen = if (g_window) |win| win.is_fullscreen else false;
 
     // Segoe MDL2 Assets glyph codepoints (same as Windows Terminal)
     const icon_codepoint: u32 = switch (btn_type) {
@@ -2660,16 +2637,12 @@ fn loadFontFromConfig(
 /// Resize the window to fit the current terminal grid and cell dimensions.
 fn resizeWindowToGrid() void {
     const padding: f32 = 10;
-    const tb: f32 = if (build_options.use_win32) @floatFromInt(win32_backend.TITLEBAR_HEIGHT) else 0;
+    const tb: f32 = @floatFromInt(win32_backend.TITLEBAR_HEIGHT);
     const content_w: f32 = cell_width * @as(f32, @floatFromInt(term_cols));
     const content_h: f32 = cell_height * @as(f32, @floatFromInt(term_rows));
     const win_w: i32 = @intFromFloat(content_w + padding * 2);
     const win_h: i32 = @intFromFloat(content_h + padding + (padding + tb));
-    if (build_options.use_win32) {
-        if (g_window) |w| w.setSize(win_w, win_h);
-    } else {
-        c.glfwSetWindowSize(g_window, win_w, win_h);
-    }
+    if (g_window) |w| w.setSize(win_w, win_h);
 }
 
 /// Check if the config file has changed (via ReadDirectoryChangesW) and reload if so.
@@ -2781,7 +2754,7 @@ fn resetCursorBlink() void {
 // Convert mouse position to terminal cell coordinates
 fn mouseToCell(xpos: f64, ypos: f64) struct { col: usize, row: usize } {
     const padding_d: f64 = 10;
-    const tb_d: f64 = if (build_options.use_win32) @floatFromInt(win32_backend.TITLEBAR_HEIGHT) else 0;
+    const tb_d: f64 = @floatFromInt(win32_backend.TITLEBAR_HEIGHT);
     const col_f = (xpos - padding_d) / @as(f64, cell_width);
     const row_f = (ypos - padding_d - tb_d) / @as(f64, cell_height);
 
@@ -2815,329 +2788,12 @@ fn isCellSelected(col: usize, row: usize) bool {
     return true;
 }
 
-// ============================================================================
-// GLFW-specific callbacks (only compiled for GLFW backend)
-// ============================================================================
-
-const glfw_callbacks = if (!build_options.use_win32) struct {
-    pub fn charCallback(_: ?*c.GLFWwindow, codepoint: c_uint) callconv(.c) void {
-        if (activeSurface()) |surface| {
-            resetCursorBlink();
-            {
-                surface.render_state.mutex.lock();
-                defer surface.render_state.mutex.unlock();
-                surface.terminal.scrollViewport(.bottom) catch {};
-            }
-            var buf: [4]u8 = undefined;
-            const len = std.unicode.utf8Encode(@intCast(codepoint), &buf) catch return;
-            _ = surface.pty.write(buf[0..len]) catch {};
-        }
-    }
-
-    pub fn mouseButtonCallback(window: ?*c.GLFWwindow, button: c_int, action: c_int, _: c_int) callconv(.c) void {
-        if (button == c.GLFW_MOUSE_BUTTON_LEFT) {
-            var xpos: f64 = 0;
-            var ypos: f64 = 0;
-            c.glfwGetCursorPos(window, &xpos, &ypos);
-            const cell = mouseToCell(xpos, ypos);
-
-            if (action == c.GLFW_PRESS) {
-                activeSelection().start_col = cell.col;
-                activeSelection().start_row = cell.row;
-                activeSelection().end_col = cell.col;
-                activeSelection().end_row = cell.row;
-                activeSelection().active = false;
-                g_selecting = true;
-                g_click_x = xpos;
-                g_click_y = ypos;
-            } else if (action == c.GLFW_RELEASE) {
-                g_selecting = false;
-            }
-        }
-    }
-
-    pub fn cursorPosCallback(_: ?*c.GLFWwindow, xpos: f64, ypos: f64) callconv(.c) void {
-        if (g_selecting) {
-            const cell = mouseToCell(xpos, ypos);
-            activeSelection().end_col = cell.col;
-            activeSelection().end_row = cell.row;
-
-            const threshold = cell_width * 0.6;
-            const padding_d: f64 = 10;
-            const click_cell_x = g_click_x - padding_d - @as(f64, @floatFromInt(activeSelection().start_col)) * @as(f64, cell_width);
-            const drag_cell_x = xpos - padding_d - @as(f64, @floatFromInt(cell.col)) * @as(f64, cell_width);
-
-            const same_cell = (activeSelection().start_col == cell.col and activeSelection().start_row == cell.row);
-            if (same_cell) {
-                const moved_right = drag_cell_x >= threshold and click_cell_x < threshold;
-                const moved_left = drag_cell_x < threshold and click_cell_x >= threshold;
-                activeSelection().active = moved_right or moved_left;
-            } else {
-                activeSelection().active = true;
-            }
-        }
-    }
-
-    pub fn copySelectionToClipboard() void {
-        const surface = activeSurface() orelse return;
-        const window = g_window orelse return;
-        const allocator = g_allocator orelse return;
-
-        if (!activeSelection().active) return;
-
-        var start_row = activeSelection().start_row;
-        var start_col = activeSelection().start_col;
-        var end_row = activeSelection().end_row;
-        var end_col = activeSelection().end_col;
-
-        if (start_row > end_row or (start_row == end_row and start_col > end_col)) {
-            std.mem.swap(usize, &start_row, &end_row);
-            std.mem.swap(usize, &start_col, &end_col);
-        }
-
-        var text: std.ArrayListUnmanaged(u8) = .empty;
-        defer text.deinit(allocator);
-
-        // Lock while reading terminal cells
-        surface.render_state.mutex.lock();
-        const screen = surface.terminal.screens.active;
-        var row: usize = start_row;
-        while (row <= end_row) : (row += 1) {
-            const row_start_col = if (row == start_row) start_col else 0;
-            const row_end_col = if (row == end_row) end_col else term_cols - 1;
-
-            var col: usize = row_start_col;
-            while (col <= row_end_col) : (col += 1) {
-                const cell_data = screen.pages.getCell(.{ .viewport = .{
-                    .x = @intCast(col),
-                    .y = @intCast(row),
-                } }) orelse continue;
-
-                const cp = cell_data.cell.codepoint();
-                if (cp == 0 or cp == ' ') {
-                    text.append(allocator, ' ') catch continue;
-                } else {
-                    var buf: [4]u8 = undefined;
-                    const len = std.unicode.utf8Encode(@intCast(cp), &buf) catch continue;
-                    text.appendSlice(allocator, buf[0..len]) catch continue;
-                }
-            }
-            if (row < end_row) {
-                text.append(allocator, '\n') catch {};
-            }
-        }
-        surface.render_state.mutex.unlock();
-
-        if (text.items.len > 0) {
-            text.append(allocator, 0) catch return;
-            const str: [*:0]const u8 = @ptrCast(text.items.ptr);
-            c.glfwSetClipboardString(window, str);
-            std.debug.print("Copied {} bytes to clipboard\n", .{text.items.len - 1});
-        }
-    }
-
-    pub fn pasteFromClipboard() void {
-        const surface = activeSurface() orelse return;
-        const window = g_window orelse return;
-
-        const clipboard = c.glfwGetClipboardString(window);
-        if (clipboard) |str| {
-            var len: usize = 0;
-            while (str[len] != 0) : (len += 1) {}
-            std.debug.print("Pasting {} bytes from clipboard\n", .{len});
-            if (len > 0) {
-                _ = surface.pty.write(str[0..len]) catch {};
-            }
-        } else {
-            std.debug.print("Clipboard is empty or unavailable\n", .{});
-        }
-    }
-
-    pub fn windowFocusCallback(_: ?*c.GLFWwindow, focused: c_int) callconv(.c) void {
-        window_focused = focused != 0;
-        g_force_rebuild = true;
-    }
-
-    pub fn framebufferSizeCallback(window: ?*c.GLFWwindow, width: c_int, height: c_int) callconv(.c) void {
-        const padding_f: f32 = 10;
-        const content_width = @as(f32, @floatFromInt(width)) - padding_f * 2;
-        const content_height = @as(f32, @floatFromInt(height)) - padding_f * 2;
-
-        const new_cols: u16 = @intFromFloat(@max(1, content_width / cell_width));
-        const new_rows: u16 = @intFromFloat(@max(1, content_height / cell_height));
-
-        if (new_cols != term_cols or new_rows != term_rows) {
-            g_pending_resize = true;
-            g_pending_cols = new_cols;
-            g_pending_rows = new_rows;
-            g_last_resize_time = std.time.milliTimestamp();
-        }
-
-        if (!g_resize_in_progress) {
-            // Sync atlas before rendering
-            if (g_atlas != null) syncAtlasTexture(&g_atlas, &g_atlas_texture, &g_atlas_modified);
-            if (g_icon_atlas != null) syncAtlasTexture(&g_icon_atlas, &g_icon_atlas_texture, &g_icon_atlas_modified);
-            if (g_titlebar_atlas != null) syncAtlasTexture(&g_titlebar_atlas, &g_titlebar_atlas_texture, &g_titlebar_atlas_modified);
-
-            if (activeSurface()) |surface| {
-                // Like Ghostty: hold the terminal mutex only for the
-                // snapshot (reading terminal state). All GPU cell building
-                // and GL work happens outside the lock.
-                var needs_rebuild: bool = false;
-                {
-                    surface.render_state.mutex.lock();
-                    defer surface.render_state.mutex.unlock();
-                    updateCursorBlink();
-                    needs_rebuild = updateTerminalCells(&surface.terminal);
-                }
-
-                // Build GPU cell buffers from snapshot — outside the lock.
-                // IO thread can continue parsing while we build + draw.
-                if (needs_rebuild) rebuildCells();
-                if (g_post_enabled) {
-                    renderFrameWithPostFromCells(width, height, padding_f);
-                } else {
-                    gl.Viewport.?(0, 0, width, height);
-                    setProjection(@floatFromInt(width), @floatFromInt(height));
-                    gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
-                    gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
-                    drawCells(@floatFromInt(height), padding_f, padding_f);
-                }
-            } else {
-                gl.Viewport.?(0, 0, width, height);
-                gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
-                gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
-            }
-        }
-
-        c.glfwSwapBuffers(window);
-    }
-
-    pub fn scrollCallback(_: ?*c.GLFWwindow, _: f64, yoffset: f64) callconv(.c) void {
-        if (activeSurface()) |surface| {
-            surface.render_state.mutex.lock();
-            defer surface.render_state.mutex.unlock();
-            const delta: isize = @intFromFloat(-yoffset * 3);
-            surface.terminal.scrollViewport(.{ .delta = delta }) catch {};
-        }
-    }
-
-    pub fn toggleFullscreen() void {
-        const window = g_window orelse return;
-
-        if (g_is_fullscreen) {
-            c.glfwSetWindowMonitor(window, null, g_windowed_x, g_windowed_y, g_windowed_width, g_windowed_height, c.GLFW_DONT_CARE);
-            g_is_fullscreen = false;
-            std.debug.print("Exited fullscreen (restored {}x{} at {},{})\n", .{ g_windowed_width, g_windowed_height, g_windowed_x, g_windowed_y });
-        } else {
-            c.glfwGetWindowPos(window, &g_windowed_x, &g_windowed_y);
-            c.glfwGetWindowSize(window, &g_windowed_width, &g_windowed_height);
-            const monitor = c.glfwGetPrimaryMonitor() orelse return;
-            const mode = c.glfwGetVideoMode(monitor) orelse return;
-            c.glfwSetWindowMonitor(window, monitor, 0, 0, mode.*.width, mode.*.height, mode.*.refreshRate);
-            g_is_fullscreen = true;
-            std.debug.print("Entered fullscreen ({}x{} @{}Hz)\n", .{ mode.*.width, mode.*.height, mode.*.refreshRate });
-        }
-    }
-
-    pub fn keyCallback(_: ?*c.GLFWwindow, key: c_int, _: c_int, action: c_int, mods: c_int) callconv(.c) void {
-        if (action != c.GLFW_PRESS and action != c.GLFW_REPEAT) return;
-
-        const ctrl = (mods & c.GLFW_MOD_CONTROL) != 0;
-        const shift = (mods & c.GLFW_MOD_SHIFT) != 0;
-
-        if (ctrl and shift and key == c.GLFW_KEY_C) { copySelectionToClipboard(); return; }
-        if (ctrl and shift and key == c.GLFW_KEY_V) { pasteFromClipboard(); return; }
-        if (ctrl and shift and key == c.GLFW_KEY_T) { _ = spawnTab(g_allocator orelse return); return; }
-        if (ctrl and key == c.GLFW_KEY_W) {
-            if (g_tab_count <= 1) {
-                g_should_close = true;
-            } else {
-                closeTab(g_active_tab);
-            }
-            return;
-        }
-        if (ctrl and key == c.GLFW_KEY_TAB) {
-            if (shift) {
-                if (g_active_tab > 0) switchTab(g_active_tab - 1) else switchTab(g_tab_count - 1);
-            } else {
-                switchTab((g_active_tab + 1) % g_tab_count);
-            }
-            return;
-        }
-        if (ctrl and key == c.GLFW_KEY_COMMA) {
-            std.debug.print("[keybind] Ctrl+, pressed\n", .{});
-            if (g_allocator) |alloc| Config.openConfigInEditor(alloc);
-            return;
-        }
-
-        const alt = (mods & c.GLFW_MOD_ALT) != 0;
-        if (alt and key == c.GLFW_KEY_ENTER) { toggleFullscreen(); return; }
-
-        if (activeSurface()) |surface| {
-            const is_scroll_key = shift and (key == c.GLFW_KEY_PAGE_UP or key == c.GLFW_KEY_PAGE_DOWN);
-            const is_modifier = key == c.GLFW_KEY_LEFT_SHIFT or key == c.GLFW_KEY_RIGHT_SHIFT or
-                key == c.GLFW_KEY_LEFT_CONTROL or key == c.GLFW_KEY_RIGHT_CONTROL or
-                key == c.GLFW_KEY_LEFT_ALT or key == c.GLFW_KEY_RIGHT_ALT or
-                key == c.GLFW_KEY_LEFT_SUPER or key == c.GLFW_KEY_RIGHT_SUPER;
-            if (!is_scroll_key and !is_modifier) {
-                resetCursorBlink();
-                surface.render_state.mutex.lock();
-                surface.terminal.scrollViewport(.bottom) catch {};
-                surface.render_state.mutex.unlock();
-            }
-
-            const pty = &surface.pty;
-            const seq: ?[]const u8 = switch (key) {
-                c.GLFW_KEY_ENTER => "\r",
-                c.GLFW_KEY_BACKSPACE => "\x7f",
-                c.GLFW_KEY_TAB => "\t",
-                c.GLFW_KEY_ESCAPE => "\x1b",
-                c.GLFW_KEY_UP => "\x1b[A",
-                c.GLFW_KEY_DOWN => "\x1b[B",
-                c.GLFW_KEY_RIGHT => "\x1b[C",
-                c.GLFW_KEY_LEFT => "\x1b[D",
-                c.GLFW_KEY_HOME => "\x1b[H",
-                c.GLFW_KEY_END => "\x1b[F",
-                c.GLFW_KEY_PAGE_UP => blk: {
-                    if (shift) {
-                        surface.render_state.mutex.lock();
-                        surface.terminal.scrollViewport(.{ .delta = -@as(isize, term_rows / 2) }) catch {};
-                        surface.render_state.mutex.unlock();
-                        break :blk null;
-                    }
-                    break :blk "\x1b[5~";
-                },
-                c.GLFW_KEY_PAGE_DOWN => blk: {
-                    if (shift) {
-                        surface.render_state.mutex.lock();
-                        surface.terminal.scrollViewport(.{ .delta = @as(isize, term_rows / 2) }) catch {};
-                        surface.render_state.mutex.unlock();
-                        break :blk null;
-                    }
-                    break :blk "\x1b[6~";
-                },
-                c.GLFW_KEY_INSERT => "\x1b[2~",
-                c.GLFW_KEY_DELETE => "\x1b[3~",
-                else => blk: {
-                    if (ctrl and key >= c.GLFW_KEY_A and key <= c.GLFW_KEY_Z) {
-                        const ctrl_char: u8 = @intCast(key - c.GLFW_KEY_A + 1);
-                        _ = pty.write(&[_]u8{ctrl_char}) catch {};
-                    }
-                    break :blk null;
-                },
-            };
-
-            if (seq) |s| _ = pty.write(s) catch {};
-        }
-    }
-} else struct {};
 
 // ============================================================================
 // Win32-specific input processing (only compiled for Win32 backend)
 // ============================================================================
 
-const win32_input = if (build_options.use_win32) struct {
+const win32_input = struct {
 
     /// Process all queued Win32 input events. Called once per frame from the main loop.
     pub fn processEvents(win: *win32_backend.Window) void {
@@ -3657,7 +3313,7 @@ const win32_input = if (build_options.use_win32) struct {
             std.debug.print("Entered fullscreen\n", .{});
         }
     }
-} else struct {};
+};
 
 fn setProjection(width: f32, height: f32) void {
     const projection = [16]f32{
@@ -3791,75 +3447,27 @@ pub fn main() !void {
     // stays alive for the rest of main().
     // ================================================================
 
-    // --- Win32 backend state (only used when use_win32=true) ---
-    var win32_window: if (build_options.use_win32) win32_backend.Window else void = undefined;
-    if (build_options.use_win32) {
-        const title = std.unicode.utf8ToUtf16LeStringLiteral("Phantty [win32]");
-        win32_window = win32_backend.Window.init(800, 600, title) catch |err| {
-            std.debug.print("Failed to create Win32 window: {}\n", .{err});
-            return err;
-        };
-        win32_backend.setGlobalWindow(&win32_window);
-        g_window = &win32_window;
-    }
-    defer if (build_options.use_win32) {
-        win32_window.deinit();
+    // --- Win32 window ---
+    var win32_window = win32_backend.Window.init(
+        800,
+        600,
+        std.unicode.utf8ToUtf16LeStringLiteral("Phantty"),
+    ) catch |err| {
+        std.debug.print("Failed to create Win32 window: {}\n", .{err});
+        return err;
     };
-
-    // --- GLFW backend state (only used when use_win32=false) ---
-    if (!build_options.use_win32) {
-        if (c.glfwInit() == 0) {
-            std.debug.print("Failed to initialize GLFW\n", .{});
-            return error.GLFWInitFailed;
-        }
-    }
-    defer if (!build_options.use_win32) {
-        c.glfwTerminate();
-    };
-
-    // GLFW window handle — needs to be at function scope so the defer works
-    var glfw_window: if (build_options.use_win32) void else ?*c.GLFWwindow = if (build_options.use_win32) {} else null;
-    if (!build_options.use_win32) {
-        c.glfwWindowHint(c.GLFW_CONTEXT_VERSION_MAJOR, 3);
-        c.glfwWindowHint(c.GLFW_CONTEXT_VERSION_MINOR, 3);
-        c.glfwWindowHint(c.GLFW_OPENGL_PROFILE, c.GLFW_OPENGL_CORE_PROFILE);
-
-        glfw_window = c.glfwCreateWindow(800, 600, "Phantty [glfw]", null, null);
-        if (glfw_window == null) {
-            std.debug.print("Failed to create GLFW window\n", .{});
-            return error.WindowCreationFailed;
-        }
-
-        c.glfwMakeContextCurrent(glfw_window);
-
-        // Set up input callbacks
-        _ = c.glfwSetCharCallback(glfw_window, glfw_callbacks.charCallback);
-        _ = c.glfwSetKeyCallback(glfw_window, glfw_callbacks.keyCallback);
-        _ = c.glfwSetScrollCallback(glfw_window, glfw_callbacks.scrollCallback);
-        _ = c.glfwSetMouseButtonCallback(glfw_window, glfw_callbacks.mouseButtonCallback);
-        _ = c.glfwSetCursorPosCallback(glfw_window, glfw_callbacks.cursorPosCallback);
-        _ = c.glfwSetFramebufferSizeCallback(glfw_window, glfw_callbacks.framebufferSizeCallback);
-        _ = c.glfwSetWindowFocusCallback(glfw_window, glfw_callbacks.windowFocusCallback);
-
-        g_window = glfw_window;
-    }
-    defer if (!build_options.use_win32) {
-        if (glfw_window) |w| c.glfwDestroyWindow(w);
-    };
+    defer win32_window.deinit();
+    win32_backend.setGlobalWindow(&win32_window);
+    g_window = &win32_window;
 
     // --- Load OpenGL via GLAD ---
     {
-        const version = if (build_options.use_win32)
-            c.gladLoadGLContext(&gl, @ptrCast(&win32_backend.glGetProcAddress))
-        else
-            c.gladLoadGLContext(&gl, @ptrCast(&c.glfwGetProcAddress));
-
+        const version = c.gladLoadGLContext(&gl, @ptrCast(&win32_backend.glGetProcAddress));
         if (version == 0) {
             std.debug.print("Failed to initialize GLAD\n", .{});
             return error.GLADInitFailed;
         }
-        const backend_tag = if (build_options.use_win32) " (Win32 backend)" else "";
-        std.debug.print("OpenGL {}.{}{s}\n", .{ c.GLAD_VERSION_MAJOR(version), c.GLAD_VERSION_MINOR(version), backend_tag });
+        std.debug.print("OpenGL {}.{}\n", .{ c.GLAD_VERSION_MAJOR(version), c.GLAD_VERSION_MINOR(version) });
     }
 
     // Initialize FreeType
@@ -3980,10 +3588,7 @@ pub fn main() !void {
     // Load Segoe MDL2 Assets for caption button icons (Windows system font)
     // Size is DPI-dependent: 10px at 96 DPI, scales proportionally
     if (ft_lib.initFace("C:\\Windows\\Fonts\\segmdl2.ttf", 0)) |iface| {
-        const dpi: u32 = if (build_options.use_win32)
-            (if (g_window) |w| win32_backend.GetDpiForWindow(w.hwnd) else 96)
-        else
-            96;
+        const dpi: u32 = if (g_window) |w| win32_backend.GetDpiForWindow(w.hwnd) else 96;
         // 10px at 96 DPI = 10pt at 72 DPI. Scale for actual DPI.
         const icon_size_26_6: i32 = @intCast(10 * 64 * dpi / 96);
         iface.setCharSize(0, icon_size_26_6, 72, 72) catch {};
@@ -4062,18 +3667,14 @@ pub fn main() !void {
     // Calculate window size based on cell dimensions (small padding for aesthetics)
     const padding: f32 = 10;
     // Extra top offset for custom title bar (Win32 backend only)
-    const titlebar_offset: f32 = if (build_options.use_win32) @floatFromInt(win32_backend.TITLEBAR_HEIGHT) else 0;
+    const titlebar_offset: f32 = @floatFromInt(win32_backend.TITLEBAR_HEIGHT);
     const top_padding: f32 = padding + titlebar_offset;
 
     const content_width: f32 = cell_width * @as(f32, @floatFromInt(term_cols));
     const content_height: f32 = cell_height * @as(f32, @floatFromInt(term_rows));
     const window_width: i32 = @intFromFloat(content_width + padding * 2);
     const window_height: i32 = @intFromFloat(content_height + padding + top_padding);
-    if (build_options.use_win32) {
-        if (g_window) |w| w.setSize(window_width, window_height);
-    } else {
-        c.glfwSetWindowSize(glfw_window, window_width, window_height);
-    }
+    if (g_window) |w| w.setSize(window_width, window_height);
 
     gl.Enable.?(c.GL_BLEND);
     gl.BlendFunc.?(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
@@ -4142,113 +3743,68 @@ pub fn main() !void {
         // new data arrives.
 
         // Get framebuffer size and render
-        if (build_options.use_win32) {
-            const win = g_window orelse break;
+        const win = g_window orelse break;
 
-            // Poll Win32 messages (fills event queues + checks WM_QUIT)
-            running = win.pollEvents() and !g_should_close;
+        // Poll Win32 messages (fills event queues + checks WM_QUIT)
+        running = win.pollEvents() and !g_should_close;
 
-            // Sync tab count to win32 for hit-testing
-            win.tab_count = g_tab_count;
+        // Sync tab count to win32 for hit-testing
+        win.tab_count = g_tab_count;
 
-            // Process all queued input events (keyboard, mouse, resize)
-            win32_input.processEvents(win);
+        // Process all queued input events (keyboard, mouse, resize)
+        win32_input.processEvents(win);
 
-            // Update focus state
-            if (window_focused != win.focused) g_force_rebuild = true;
-            window_focused = win.focused;
+        // Update focus state
+        if (window_focused != win.focused) g_force_rebuild = true;
+        window_focused = win.focused;
 
-            const fb = win.getFramebufferSize();
-            const fb_width: c_int = fb.width;
-            const fb_height: c_int = fb.height;
+        const fb = win.getFramebufferSize();
+        const fb_width: c_int = fb.width;
+        const fb_height: c_int = fb.height;
 
-            g_draw_call_count = 0;
-            updateFps();
+        g_draw_call_count = 0;
+        updateFps();
 
-            // Sync atlas textures to GPU if modified
-            if (g_atlas != null) syncAtlasTexture(&g_atlas, &g_atlas_texture, &g_atlas_modified);
-            if (g_icon_atlas != null) syncAtlasTexture(&g_icon_atlas, &g_icon_atlas_texture, &g_icon_atlas_modified);
-            if (g_titlebar_atlas != null) syncAtlasTexture(&g_titlebar_atlas, &g_titlebar_atlas_texture, &g_titlebar_atlas_modified);
+        // Sync atlas textures to GPU if modified
+        if (g_atlas != null) syncAtlasTexture(&g_atlas, &g_atlas_texture, &g_atlas_modified);
+        if (g_icon_atlas != null) syncAtlasTexture(&g_icon_atlas, &g_icon_atlas_texture, &g_icon_atlas_modified);
+        if (g_titlebar_atlas != null) syncAtlasTexture(&g_titlebar_atlas, &g_titlebar_atlas_texture, &g_titlebar_atlas_modified);
 
-            if (activeSurface()) |surface| {
-                // Hold terminal mutex only for snapshot
-                var needs_rebuild2: bool = false;
-                {
-                    surface.render_state.mutex.lock();
-                    defer surface.render_state.mutex.unlock();
-                    updateCursorBlink();
-                    needs_rebuild2 = updateTerminalCells(&surface.terminal);
-                }
-                if (needs_rebuild2) rebuildCells();
-
-                // GL rendering outside the lock
-                if (g_post_enabled) {
-                    renderFrameWithPostFromCells(fb_width, fb_height, padding);
-                } else {
-                    gl.Viewport.?(0, 0, fb_width, fb_height);
-                    setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
-                    gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
-                    gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
-
-                    renderTitlebar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
-
-                    drawCells(@floatFromInt(fb_height), padding, top_padding);
-                }
-            } else if (!g_post_enabled) {
-                gl.Viewport.?(0, 0, fb_width, fb_height);
-                setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
-                gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
-                gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
-                renderTitlebar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
+        if (activeSurface()) |surface| {
+            // Hold terminal mutex only for snapshot
+            var needs_rebuild: bool = false;
+            {
+                surface.render_state.mutex.lock();
+                defer surface.render_state.mutex.unlock();
+                updateCursorBlink();
+                needs_rebuild = updateTerminalCells(&surface.terminal);
             }
+            if (needs_rebuild) rebuildCells();
 
-            renderDebugOverlay(@floatFromInt(fb_width));
-
-            win.swapBuffers();
-        } else {
-            var fb_width: c_int = 0;
-            var fb_height: c_int = 0;
-            c.glfwGetFramebufferSize(glfw_window, &fb_width, &fb_height);
-
-            g_draw_call_count = 0;
-            updateFps();
-
-            // Sync atlas textures to GPU if modified
-            if (g_atlas != null) syncAtlasTexture(&g_atlas, &g_atlas_texture, &g_atlas_modified);
-            if (g_icon_atlas != null) syncAtlasTexture(&g_icon_atlas, &g_icon_atlas_texture, &g_icon_atlas_modified);
-            if (g_titlebar_atlas != null) syncAtlasTexture(&g_titlebar_atlas, &g_titlebar_atlas_texture, &g_titlebar_atlas_modified);
-
-            if (activeSurface()) |surface| {
-                var needs_rebuild3: bool = false;
-                {
-                    surface.render_state.mutex.lock();
-                    defer surface.render_state.mutex.unlock();
-                    updateCursorBlink();
-                    needs_rebuild3 = updateTerminalCells(&surface.terminal);
-                }
-                if (needs_rebuild3) rebuildCells();
-                if (g_post_enabled) {
-                    renderFrameWithPostFromCells(fb_width, fb_height, padding);
-                } else {
-                    gl.Viewport.?(0, 0, fb_width, fb_height);
-                    setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
-                    gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
-                    gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
-                    drawCells(@floatFromInt(fb_height), padding, padding);
-                }
+            // GL rendering outside the lock
+            if (g_post_enabled) {
+                renderFrameWithPostFromCells(fb_width, fb_height, padding);
             } else {
                 gl.Viewport.?(0, 0, fb_width, fb_height);
                 setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
                 gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
                 gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
+
+                renderTitlebar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
+
+                drawCells(@floatFromInt(fb_height), padding, top_padding);
             }
-
-            renderDebugOverlay(@floatFromInt(fb_width));
-
-            c.glfwSwapBuffers(glfw_window);
-            c.glfwPollEvents();
-            running = c.glfwWindowShouldClose(glfw_window) == 0 and !g_should_close;
+        } else if (!g_post_enabled) {
+            gl.Viewport.?(0, 0, fb_width, fb_height);
+            setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
+            gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
+            gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
+            renderTitlebar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
         }
+
+        renderDebugOverlay(@floatFromInt(fb_width));
+
+        win.swapBuffers();
     }
 
     // Clean up all tabs

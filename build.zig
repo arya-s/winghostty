@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    // Default to Windows cross-compilation
+    // Windows cross-compilation (x86_64-windows-gnu)
     const target = b.standardTargetOptions(.{
         .default_target = .{
             .cpu_arch = .x86_64,
@@ -11,27 +11,12 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{});
 
-    const use_win32 = b.option(bool, "use_win32", "Use Win32 backend (default: true)") orelse true;
-    buildBackend(b, target, optimize, use_win32);
-}
-
-fn buildBackend(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    use_win32: bool,
-) void {
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-
-    // Build options passed to source code
-    const build_options = b.addOptions();
-    build_options.addOption(bool, "use_win32", use_win32);
-    exe_mod.addOptions("build_options", build_options);
 
     // Add ghostty-vt dependency with SIMD disabled for cross-compilation
     if (b.lazyDependency("ghostty", .{
@@ -42,22 +27,10 @@ fn buildBackend(
         exe_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
     }
 
-    // Add GLFW dependency (only for glfw backend)
-    if (!use_win32) {
-        if (b.lazyDependency("glfw", .{
-            .target = target,
-            .optimize = optimize,
-        })) |dep| {
-            exe_mod.linkLibrary(dep.artifact("glfw3"));
-        }
-    }
-
-    // Win32 backend: link native Windows libraries
-    if (use_win32) {
-        exe_mod.linkSystemLibrary("user32", .{});
-        exe_mod.linkSystemLibrary("gdi32", .{});
-        exe_mod.linkSystemLibrary("dwmapi", .{});
-    }
+    // Win32: link native Windows libraries
+    exe_mod.linkSystemLibrary("user32", .{});
+    exe_mod.linkSystemLibrary("gdi32", .{});
+    exe_mod.linkSystemLibrary("dwmapi", .{});
 
     // Add FreeType dependency
     if (b.lazyDependency("freetype", .{
@@ -86,10 +59,8 @@ fn buildBackend(
     // Link OpenGL on Windows
     exe_mod.linkSystemLibrary("opengl32", .{});
 
-    const name = "phantty";
-
     const exe = b.addExecutable(.{
-        .name = name,
+        .name = "phantty",
         .root_module = exe_mod,
     });
 
