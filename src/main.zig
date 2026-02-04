@@ -352,6 +352,18 @@ var fg_cells: [MAX_CELLS]CellFg = undefined;
 var bg_cell_count: usize = 0;
 var fg_cell_count: usize = 0;
 
+// Snapshot buffer: resolved cell data copied under the lock so that
+// rebuildCells can run outside the lock (like Ghostty's RenderState).
+const SnapCell = struct {
+    codepoint: u21,
+    fg: [3]f32,
+    bg: ?[3]f32,
+};
+const MAX_SNAP = MAX_CELLS;
+var g_snap: [MAX_SNAP]SnapCell = undefined;
+var g_snap_rows: usize = 0;
+var g_snap_cols: usize = 0;
+
 // Dirty tracking — skip rebuildCells when nothing changed
 var g_cells_valid: bool = false; // true if bg_cells/fg_cells have valid data from a previous rebuild
 var g_force_rebuild: bool = true; // set on resize, scroll, selection, theme change
@@ -360,9 +372,13 @@ var g_last_cursor_blink_visible: bool = true; // track cursor blink transitions
 var g_cached_cursor_x: usize = 0;
 var g_cached_cursor_y: usize = 0;
 var g_cached_cursor_style: CursorStyle = .block;
+var g_cached_cursor_effective: ?CursorStyle = .block;
 var g_cached_viewport_at_bottom: bool = true;
 
 var g_last_viewport_active: bool = true; // track viewport position changes (scroll)
+// Viewport pin tracking — detects scroll position changes (like Ghostty's RenderState.viewport_pin)
+var g_last_viewport_node: ?*anyopaque = null;
+var g_last_viewport_y: usize = 0;
 var g_last_cols: usize = 0; // detect resize
 var g_last_rows: usize = 0; // detect resize
 var g_last_selection_active: bool = false; // detect selection changes
@@ -1883,28 +1899,17 @@ fn renderPlaceholderTab(window_width: f32, window_height: f32, top_pad: f32) voi
 /// Uses the efficient rowIterator to walk viewport rows via direct page
 /// pointers (like Ghostty), instead of getCell() which does an O(pages)
 /// pin lookup per cell.
-fn rebuildCells(terminal: *ghostty_vt.Terminal) void {
-
+/// Snapshot terminal cell data under the lock. Resolves colors and codepoints
+/// into a flat buffer so rebuildCells can run outside the lock.
+/// Modeled after Ghostty's RenderState.update() which copies row data via
+/// fastmem.copy under the lock, then releases it for the renderer.
+fn snapshotCells(terminal: *ghostty_vt.Terminal) void {
     const screen = terminal.screens.active;
-    const cursor_x = screen.cursor.x;
-    const cursor_y = screen.cursor.y;
-    const viewport_at_bottom = screen.pages.viewport == .active;
-
-    const terminal_cursor_style: TerminalCursorStyle = switch (screen.cursor.cursor_style) {
-        .bar => .bar,
-        .block => .block,
-        .underline => .underline,
-        .block_hollow => .block_hollow,
-    };
-    const terminal_cursor_blink = terminal.modes.get(.cursor_blinking);
-
     const render_cols = terminal.cols;
-    const atlas_size = if (g_atlas) |a| @as(f32, @floatFromInt(a.size)) else 512.0;
 
-    bg_cell_count = 0;
-    fg_cell_count = 0;
+    g_snap_rows = terminal.rows;
+    g_snap_cols = render_cols;
 
-    // Walk viewport rows via rowIterator — O(1) per row instead of O(pages) per getCell()
     var row_it = screen.pages.rowIterator(
         .right_down,
         .{ .viewport = .{} },
@@ -1912,23 +1917,19 @@ fn rebuildCells(terminal: *ghostty_vt.Terminal) void {
     );
     var row_idx: usize = 0;
     while (row_it.next()) |row_pin| {
-        const row_f: f32 = @floatFromInt(row_idx);
         const p = &row_pin.node.data;
         const rac = row_pin.rowAndCell();
         const page_cells = p.getCells(rac.row);
         const num_cols = @min(page_cells.len, render_cols);
+        const row_base = row_idx * render_cols;
 
         for (0..num_cols) |col_idx| {
             const cell = &page_cells[col_idx];
-            const is_cursor = viewport_at_bottom and (col_idx == cursor_x and row_idx == cursor_y);
-
             var fg_color: [3]f32 = g_theme.foreground;
             var bg_color: ?[3]f32 = null;
 
             switch (cell.content_tag) {
-                .bg_color_palette => {
-                    bg_color = indexToRgb(cell.content.color_palette);
-                },
+                .bg_color_palette => bg_color = indexToRgb(cell.content.color_palette),
                 .bg_color_rgb => {
                     const rgb = cell.content.color_rgb;
                     bg_color = .{
@@ -1962,12 +1963,45 @@ fn rebuildCells(terminal: *ghostty_vt.Terminal) void {
                 }
             }
 
-            // Selection / cursor background
+            if (row_base + col_idx < MAX_SNAP) {
+                g_snap[row_base + col_idx] = .{
+                    .codepoint = cell.codepoint(),
+                    .fg = fg_color,
+                    .bg = bg_color,
+                };
+            }
+        }
+        row_idx += 1;
+    }
+}
+
+/// Build GPU cell buffers from the snapshot. Does NOT require the terminal
+/// mutex — reads from g_snap which was filled by snapshotCells.
+fn rebuildCells() void {
+    const render_rows = g_snap_rows;
+    const render_cols = g_snap_cols;
+    const atlas_size = if (g_atlas) |a| @as(f32, @floatFromInt(a.size)) else 512.0;
+
+    bg_cell_count = 0;
+    fg_cell_count = 0;
+
+    for (0..render_rows) |row_idx| {
+        const row_f: f32 = @floatFromInt(row_idx);
+        const row_base = row_idx * render_cols;
+
+        for (0..render_cols) |col_idx| {
+            const snap_idx = row_base + col_idx;
+            if (snap_idx >= MAX_SNAP) break;
+            const sc = g_snap[snap_idx];
+
+            const is_cursor = g_cached_viewport_at_bottom and (col_idx == g_cached_cursor_x and row_idx == g_cached_cursor_y);
             const is_selected = isCellSelected(col_idx, row_idx);
             const col_f: f32 = @floatFromInt(col_idx);
 
+            var fg_color = sc.fg;
+
             if (is_cursor) {
-                if (cursorEffectiveStyle(terminal_cursor_style, terminal_cursor_blink)) |effective_style| {
+                if (g_cached_cursor_effective) |effective_style| {
                     switch (effective_style) {
                         .block => {
                             if (bg_cell_count < MAX_CELLS) {
@@ -1977,7 +2011,7 @@ fn rebuildCells(terminal: *ghostty_vt.Terminal) void {
                             fg_color = g_theme.cursor_text orelse g_theme.background;
                         },
                         else => {
-                            if (bg_color) |bg| {
+                            if (sc.bg) |bg| {
                                 if (bg_cell_count < MAX_CELLS) {
                                     bg_cells[bg_cell_count] = .{ .grid_col = col_f, .grid_row = row_f, .r = bg[0], .g = bg[1], .b = bg[2] };
                                     bg_cell_count += 1;
@@ -1992,15 +2026,14 @@ fn rebuildCells(terminal: *ghostty_vt.Terminal) void {
                     bg_cell_count += 1;
                 }
                 fg_color = g_theme.selection_foreground orelse g_theme.foreground;
-            } else if (bg_color) |bg| {
+            } else if (sc.bg) |bg| {
                 if (bg_cell_count < MAX_CELLS) {
                     bg_cells[bg_cell_count] = .{ .grid_col = col_f, .grid_row = row_f, .r = bg[0], .g = bg[1], .b = bg[2] };
                     bg_cell_count += 1;
                 }
             }
 
-            // Foreground glyph
-            const char = cell.codepoint();
+            const char = sc.codepoint;
             if (char != 0 and char != ' ') {
                 if (loadGlyph(char)) |ch| {
                     if (ch.region.width > 0 and ch.region.height > 0) {
@@ -2031,7 +2064,6 @@ fn rebuildCells(terminal: *ghostty_vt.Terminal) void {
                 }
             }
         }
-        row_idx += 1;
     }
 }
 
@@ -2053,10 +2085,15 @@ fn cursorEffectiveStyle(terminal_style: TerminalCursorStyle, terminal_blink: boo
 /// the terminal mutex held. This is the only part that reads terminal state.
 /// Modeled after Ghostty's critical section: lock → update state → unlock,
 /// then draw outside the lock.
-fn updateTerminalCells(terminal: *ghostty_vt.Terminal) void {
+/// Read terminal state under the lock: dirty check, snapshot cells, cache cursor.
+/// Returns true if cells need rebuilding (caller should call rebuildCells()
+/// after releasing the lock). Modeled after Ghostty's split:
+///   lock → RenderState.update() (snapshot) → unlock → rebuildCells()
+fn updateTerminalCells(terminal: *ghostty_vt.Terminal) bool {
     const screen = terminal.screens.active;
     const viewport_active = screen.pages.viewport == .active;
     const selection_active = activeSelection().active;
+    const viewport_pin = screen.pages.getTopLeft(.viewport);
 
     const needs_rebuild = blk: {
         if (g_force_rebuild) {
@@ -2069,8 +2106,10 @@ fn updateTerminalCells(terminal: *ghostty_vt.Terminal) void {
         if (terminal.rows != g_last_rows or terminal.cols != g_last_cols) break :blk true;
         if (selection_active != g_last_selection_active) break :blk true;
         if (g_selecting) break :blk true;
+        // Viewport pin changed — scroll happened (matches Ghostty's RenderState viewport_pin comparison)
+        if (@as(?*anyopaque, viewport_pin.node) != g_last_viewport_node or
+            viewport_pin.y != g_last_viewport_y) break :blk true;
         // Terminal-level dirty flags (eraseDisplay, fullReset, palette change, etc.)
-        // Matches Ghostty's RenderState.update() redraw detection.
         {
             const DirtyInt = @typeInfo(@TypeOf(terminal.flags.dirty)).@"struct".backing_integer.?;
             if (@as(DirtyInt, @bitCast(terminal.flags.dirty)) > 0) break :blk true;
@@ -2089,25 +2128,7 @@ fn updateTerminalCells(terminal: *ghostty_vt.Terminal) void {
         break :blk false;
     };
 
-    if (needs_rebuild) {
-        rebuildCells(terminal);
-        g_cells_valid = true;
-        g_last_cursor_blink_visible = g_cursor_blink_visible;
-        g_last_viewport_active = viewport_active;
-        g_last_rows = terminal.rows;
-        g_last_cols = terminal.cols;
-        g_last_selection_active = selection_active;
-
-        // Clear dirty flags after rebuild
-        terminal.flags.dirty = .{};
-        screen.dirty = .{};
-        var clear_it = screen.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
-        while (clear_it.next()) |row_pin| {
-            row_pin.rowAndCell().row.dirty = false;
-        }
-    }
-
-    // Cache cursor state for drawing outside the lock
+    // Always cache cursor state for drawing outside the lock
     g_cached_cursor_x = screen.cursor.x;
     g_cached_cursor_y = screen.cursor.y;
     g_cached_viewport_at_bottom = screen.pages.viewport == .active;
@@ -2117,9 +2138,35 @@ fn updateTerminalCells(terminal: *ghostty_vt.Terminal) void {
         .underline => .underline,
         .block_hollow => .block_hollow,
     };
-    if (cursorEffectiveStyle(tcs, terminal.modes.get(.cursor_blinking))) |eff| {
+    g_cached_cursor_effective = cursorEffectiveStyle(tcs, terminal.modes.get(.cursor_blinking));
+    if (g_cached_cursor_effective) |eff| {
         g_cached_cursor_style = eff;
     }
+
+    if (needs_rebuild) {
+        // Snapshot cell data under the lock — fast memcpy of resolved colors
+        // and codepoints. Like Ghostty's RenderState.update() fastmem.copy.
+        snapshotCells(terminal);
+
+        g_cells_valid = true;
+        g_last_cursor_blink_visible = g_cursor_blink_visible;
+        g_last_viewport_active = viewport_active;
+        g_last_viewport_node = viewport_pin.node;
+        g_last_viewport_y = viewport_pin.y;
+        g_last_rows = terminal.rows;
+        g_last_cols = terminal.cols;
+        g_last_selection_active = selection_active;
+
+        // Clear dirty flags after snapshot
+        terminal.flags.dirty = .{};
+        screen.dirty = .{};
+        var clear_it = screen.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
+        while (clear_it.next()) |row_pin| {
+            row_pin.rowAndCell().row.dirty = false;
+        }
+    }
+
+    return needs_rebuild;
 }
 
 /// Draw terminal grid from CPU cell buffers. Does NOT require the terminal
@@ -2934,17 +2981,19 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
 
             if (activeSurface()) |surface| {
                 // Like Ghostty: hold the terminal mutex only for the
-                // cell rebuild (reading terminal state). All GL work
-                // (buffer upload, draw calls) happens outside the lock.
+                // snapshot (reading terminal state). All GPU cell building
+                // and GL work happens outside the lock.
+                var needs_rebuild: bool = false;
                 {
                     surface.render_state.mutex.lock();
                     defer surface.render_state.mutex.unlock();
                     updateCursorBlink();
-                    updateTerminalCells(&surface.terminal);
+                    needs_rebuild = updateTerminalCells(&surface.terminal);
                 }
 
-                // GL rendering happens outside the lock — IO thread
-                // can continue parsing while we draw.
+                // Build GPU cell buffers from snapshot — outside the lock.
+                // IO thread can continue parsing while we build + draw.
+                if (needs_rebuild) rebuildCells();
                 if (g_post_enabled) {
                     renderFrameWithPostFromCells(width, height, padding_f);
                 } else {
@@ -4122,13 +4171,15 @@ pub fn main() !void {
             if (g_titlebar_atlas != null) syncAtlasTexture(&g_titlebar_atlas, &g_titlebar_atlas_texture, &g_titlebar_atlas_modified);
 
             if (activeSurface()) |surface| {
-                // Hold terminal mutex only for cell rebuild
+                // Hold terminal mutex only for snapshot
+                var needs_rebuild2: bool = false;
                 {
                     surface.render_state.mutex.lock();
                     defer surface.render_state.mutex.unlock();
                     updateCursorBlink();
-                    updateTerminalCells(&surface.terminal);
+                    needs_rebuild2 = updateTerminalCells(&surface.terminal);
                 }
+                if (needs_rebuild2) rebuildCells();
 
                 // GL rendering outside the lock
                 if (g_post_enabled) {
@@ -4168,12 +4219,14 @@ pub fn main() !void {
             if (g_titlebar_atlas != null) syncAtlasTexture(&g_titlebar_atlas, &g_titlebar_atlas_texture, &g_titlebar_atlas_modified);
 
             if (activeSurface()) |surface| {
+                var needs_rebuild3: bool = false;
                 {
                     surface.render_state.mutex.lock();
                     defer surface.render_state.mutex.unlock();
                     updateCursorBlink();
-                    updateTerminalCells(&surface.terminal);
+                    needs_rebuild3 = updateTerminalCells(&surface.terminal);
                 }
+                if (needs_rebuild3) rebuildCells();
                 if (g_post_enabled) {
                     renderFrameWithPostFromCells(fb_width, fb_height, padding);
                 } else {
