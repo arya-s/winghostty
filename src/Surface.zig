@@ -59,6 +59,8 @@ dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 /// Set when the PTY process has exited.
 exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+
+
 /// IO thread handle (null until Phase 2).
 io_thread: ?std.Thread = null,
 

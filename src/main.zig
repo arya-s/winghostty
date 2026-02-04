@@ -195,6 +195,8 @@ fn spawnTab(allocator: std.mem.Allocator) bool {
 
     // Clear selection state when switching to new tab
     g_selecting = false;
+    g_force_rebuild = true;
+    g_cells_valid = false;
 
     std.debug.print("New tab spawned (count={}), active: {}\n", .{ g_tab_count, g_active_tab });
     return true;
@@ -231,6 +233,8 @@ fn closeTab(idx: usize) void {
 
     // Clear selection state when tab changes
     g_selecting = false;
+    g_force_rebuild = true;
+    g_cells_valid = false;
 }
 
 fn switchTab(idx: usize) void {
@@ -238,6 +242,8 @@ fn switchTab(idx: usize) void {
         g_active_tab = idx;
         // Clear selection state when switching tabs
         g_selecting = false;
+        g_force_rebuild = true;
+        g_cells_valid = false;
     }
 }
 
@@ -345,6 +351,21 @@ var bg_cells: [MAX_CELLS]CellBg = undefined;
 var fg_cells: [MAX_CELLS]CellFg = undefined;
 var bg_cell_count: usize = 0;
 var fg_cell_count: usize = 0;
+
+// Dirty tracking — skip rebuildCells when nothing changed
+var g_cells_valid: bool = false; // true if bg_cells/fg_cells have valid data from a previous rebuild
+var g_force_rebuild: bool = true; // set on resize, scroll, selection, theme change
+var g_last_cursor_blink_visible: bool = true; // track cursor blink transitions
+// Cached cursor state for lock-free rendering (used when tryLock fails)
+var g_cached_cursor_x: usize = 0;
+var g_cached_cursor_y: usize = 0;
+var g_cached_cursor_style: CursorStyle = .block;
+var g_cached_viewport_at_bottom: bool = true;
+
+var g_last_viewport_active: bool = true; // track viewport position changes (scroll)
+var g_last_cols: usize = 0; // detect resize
+var g_last_rows: usize = 0; // detect resize
+var g_last_selection_active: bool = false; // detect selection changes
 
 // GL objects for instanced rendering
 var bg_shader: c.GLuint = 0;
@@ -1859,8 +1880,11 @@ fn renderPlaceholderTab(window_width: f32, window_height: f32, top_pad: f32) voi
 }
 
 /// Build CPU cell buffers from terminal state.
-/// This iterates the grid once and fills bg_cells / fg_cells arrays.
+/// Uses the efficient rowIterator to walk viewport rows via direct page
+/// pointers (like Ghostty), instead of getCell() which does an O(pages)
+/// pin lookup per cell.
 fn rebuildCells(terminal: *ghostty_vt.Terminal) void {
+
     const screen = terminal.screens.active;
     const cursor_x = screen.cursor.x;
     const cursor_y = screen.cursor.y;
@@ -1874,76 +1898,75 @@ fn rebuildCells(terminal: *ghostty_vt.Terminal) void {
     };
     const terminal_cursor_blink = terminal.modes.get(.cursor_blinking);
 
-    const render_rows = terminal.rows;
     const render_cols = terminal.cols;
     const atlas_size = if (g_atlas) |a| @as(f32, @floatFromInt(a.size)) else 512.0;
 
     bg_cell_count = 0;
     fg_cell_count = 0;
 
-    for (0..render_rows) |row_idx| {
-        for (0..render_cols) |col_idx| {
-            const is_cursor = viewport_at_bottom and (col_idx == cursor_x and row_idx == cursor_y);
+    // Walk viewport rows via rowIterator — O(1) per row instead of O(pages) per getCell()
+    var row_it = screen.pages.rowIterator(
+        .right_down,
+        .{ .viewport = .{} },
+        null,
+    );
+    var row_idx: usize = 0;
+    while (row_it.next()) |row_pin| {
+        const row_f: f32 = @floatFromInt(row_idx);
+        const p = &row_pin.node.data;
+        const rac = row_pin.rowAndCell();
+        const page_cells = p.getCells(rac.row);
+        const num_cols = @min(page_cells.len, render_cols);
 
-            const cell_data = screen.pages.getCell(.{ .viewport = .{
-                .x = @intCast(col_idx),
-                .y = @intCast(row_idx),
-            } });
+        for (0..num_cols) |col_idx| {
+            const cell = &page_cells[col_idx];
+            const is_cursor = viewport_at_bottom and (col_idx == cursor_x and row_idx == cursor_y);
 
             var fg_color: [3]f32 = g_theme.foreground;
             var bg_color: ?[3]f32 = null;
 
-            if (cell_data) |cd| {
-                const cell = cd.cell;
+            switch (cell.content_tag) {
+                .bg_color_palette => {
+                    bg_color = indexToRgb(cell.content.color_palette);
+                },
+                .bg_color_rgb => {
+                    const rgb = cell.content.color_rgb;
+                    bg_color = .{
+                        @as(f32, @floatFromInt(rgb.r)) / 255.0,
+                        @as(f32, @floatFromInt(rgb.g)) / 255.0,
+                        @as(f32, @floatFromInt(rgb.b)) / 255.0,
+                    };
+                },
+                else => {},
+            }
 
-                switch (cell.content_tag) {
-                    .bg_color_palette => {
-                        bg_color = indexToRgb(cell.content.color_palette);
+            if (cell.hasStyling()) {
+                const style = p.styles.get(p.memory, cell.style_id);
+                switch (style.fg_color) {
+                    .none => {},
+                    .palette => |idx| fg_color = indexToRgb(idx),
+                    .rgb => |rgb| fg_color = .{
+                        @as(f32, @floatFromInt(rgb.r)) / 255.0,
+                        @as(f32, @floatFromInt(rgb.g)) / 255.0,
+                        @as(f32, @floatFromInt(rgb.b)) / 255.0,
                     },
-                    .bg_color_rgb => {
-                        const rgb = cell.content.color_rgb;
-                        bg_color = .{
-                            @as(f32, @floatFromInt(rgb.r)) / 255.0,
-                            @as(f32, @floatFromInt(rgb.g)) / 255.0,
-                            @as(f32, @floatFromInt(rgb.b)) / 255.0,
-                        };
-                    },
-                    else => {},
                 }
-
-                if (cell.hasStyling()) {
-                    const style = cd.node.data.styles.get(
-                        cd.node.data.memory,
-                        cell.style_id,
-                    );
-                    switch (style.fg_color) {
-                        .none => {},
-                        .palette => |idx| fg_color = indexToRgb(idx),
-                        .rgb => |rgb| fg_color = .{
-                            @as(f32, @floatFromInt(rgb.r)) / 255.0,
-                            @as(f32, @floatFromInt(rgb.g)) / 255.0,
-                            @as(f32, @floatFromInt(rgb.b)) / 255.0,
-                        },
-                    }
-                    switch (style.bg_color) {
-                        .none => {},
-                        .palette => |idx| bg_color = indexToRgb(idx),
-                        .rgb => |rgb| bg_color = .{
-                            @as(f32, @floatFromInt(rgb.r)) / 255.0,
-                            @as(f32, @floatFromInt(rgb.g)) / 255.0,
-                            @as(f32, @floatFromInt(rgb.b)) / 255.0,
-                        },
-                    }
+                switch (style.bg_color) {
+                    .none => {},
+                    .palette => |idx| bg_color = indexToRgb(idx),
+                    .rgb => |rgb| bg_color = .{
+                        @as(f32, @floatFromInt(rgb.r)) / 255.0,
+                        @as(f32, @floatFromInt(rgb.g)) / 255.0,
+                        @as(f32, @floatFromInt(rgb.b)) / 255.0,
+                    },
                 }
             }
 
             // Selection / cursor background
             const is_selected = isCellSelected(col_idx, row_idx);
             const col_f: f32 = @floatFromInt(col_idx);
-            const row_f: f32 = @floatFromInt(row_idx);
 
             if (is_cursor) {
-                // Cursor gets added as BG cells for block, handled separately for bar/underline/hollow
                 if (cursorEffectiveStyle(terminal_cursor_style, terminal_cursor_blink)) |effective_style| {
                     switch (effective_style) {
                         .block => {
@@ -1954,7 +1977,6 @@ fn rebuildCells(terminal: *ghostty_vt.Terminal) void {
                             fg_color = g_theme.cursor_text orelse g_theme.background;
                         },
                         else => {
-                            // Bar, underline, hollow — draw normal bg, cursor drawn as overlay after
                             if (bg_color) |bg| {
                                 if (bg_cell_count < MAX_CELLS) {
                                     bg_cells[bg_cell_count] = .{ .grid_col = col_f, .grid_row = row_f, .r = bg[0], .g = bg[1], .b = bg[2] };
@@ -1978,39 +2000,38 @@ fn rebuildCells(terminal: *ghostty_vt.Terminal) void {
             }
 
             // Foreground glyph
-            if (cell_data) |cd| {
-                const char = cd.cell.codepoint();
-                if (char != 0 and char != ' ') {
-                    if (loadGlyph(char)) |ch| {
-                        if (ch.region.width > 0 and ch.region.height > 0) {
-                            const uv = glyphUV(ch.region, atlas_size);
-                            const gx = @as(f32, @floatFromInt(ch.bearing_x));
-                            const gy = cell_baseline - @as(f32, @floatFromInt(@as(i32, @intCast(ch.size_y)) - ch.bearing_y));
-                            const gw = @as(f32, @floatFromInt(ch.size_x));
-                            const gh = @as(f32, @floatFromInt(ch.size_y));
-                            if (fg_cell_count < MAX_CELLS) {
-                                fg_cells[fg_cell_count] = .{
-                                    .grid_col = col_f,
-                                    .grid_row = row_f,
-                                    .glyph_x = gx,
-                                    .glyph_y = gy,
-                                    .glyph_w = gw,
-                                    .glyph_h = gh,
-                                    .uv_left = uv.u0,
-                                    .uv_top = uv.v0,
-                                    .uv_right = uv.u1,
-                                    .uv_bottom = uv.v1,
-                                    .r = fg_color[0],
-                                    .g = fg_color[1],
-                                    .b = fg_color[2],
-                                };
-                                fg_cell_count += 1;
-                            }
+            const char = cell.codepoint();
+            if (char != 0 and char != ' ') {
+                if (loadGlyph(char)) |ch| {
+                    if (ch.region.width > 0 and ch.region.height > 0) {
+                        const uv = glyphUV(ch.region, atlas_size);
+                        const gx = @as(f32, @floatFromInt(ch.bearing_x));
+                        const gy = cell_baseline - @as(f32, @floatFromInt(@as(i32, @intCast(ch.size_y)) - ch.bearing_y));
+                        const gw = @as(f32, @floatFromInt(ch.size_x));
+                        const gh = @as(f32, @floatFromInt(ch.size_y));
+                        if (fg_cell_count < MAX_CELLS) {
+                            fg_cells[fg_cell_count] = .{
+                                .grid_col = col_f,
+                                .grid_row = row_f,
+                                .glyph_x = gx,
+                                .glyph_y = gy,
+                                .glyph_w = gw,
+                                .glyph_h = gh,
+                                .uv_left = uv.u0,
+                                .uv_top = uv.v0,
+                                .uv_right = uv.u1,
+                                .uv_bottom = uv.v1,
+                                .r = fg_color[0],
+                                .g = fg_color[1],
+                                .b = fg_color[2],
+                            };
+                            fg_cell_count += 1;
                         }
                     }
                 }
             }
         }
+        row_idx += 1;
     }
 }
 
@@ -2028,14 +2049,82 @@ fn cursorEffectiveStyle(terminal_style: TerminalCursorStyle, terminal_blink: boo
     };
 }
 
-/// Render the terminal grid using instanced draw calls.
-/// 1. rebuildCells fills CPU buffers
-/// 2. Upload + draw BG instances
-/// 3. Upload + draw FG instances
-/// 4. Draw cursor overlay (bar/underline/hollow) using old renderQuad path
-fn renderTerminal(terminal: *ghostty_vt.Terminal, window_height: f32, offset_x: f32, offset_y: f32) void {
-    rebuildCells(terminal);
+/// Update terminal cell buffers from terminal state. Must be called with
+/// the terminal mutex held. This is the only part that reads terminal state.
+/// Modeled after Ghostty's critical section: lock → update state → unlock,
+/// then draw outside the lock.
+fn updateTerminalCells(terminal: *ghostty_vt.Terminal) void {
+    const screen = terminal.screens.active;
+    const viewport_active = screen.pages.viewport == .active;
+    const selection_active = activeSelection().active;
 
+    const needs_rebuild = blk: {
+        if (g_force_rebuild) {
+            g_force_rebuild = false;
+            break :blk true;
+        }
+        if (!g_cells_valid) break :blk true;
+        if (g_cursor_blink_visible != g_last_cursor_blink_visible) break :blk true;
+        if (viewport_active != g_last_viewport_active) break :blk true;
+        if (terminal.rows != g_last_rows or terminal.cols != g_last_cols) break :blk true;
+        if (selection_active != g_last_selection_active) break :blk true;
+        if (g_selecting) break :blk true;
+        // Terminal-level dirty flags (eraseDisplay, fullReset, palette change, etc.)
+        // Matches Ghostty's RenderState.update() redraw detection.
+        {
+            const DirtyInt = @typeInfo(@TypeOf(terminal.flags.dirty)).@"struct".backing_integer.?;
+            if (@as(DirtyInt, @bitCast(terminal.flags.dirty)) > 0) break :blk true;
+        }
+        // Screen-level dirty flags (selection, hyperlink hover)
+        {
+            const ScreenDirtyInt = @typeInfo(@TypeOf(screen.dirty)).@"struct".backing_integer.?;
+            if (@as(ScreenDirtyInt, @bitCast(screen.dirty)) > 0) break :blk true;
+        }
+        // Per-row/page dirty flags (set by VT parser on cell changes)
+        var dirty_it = screen.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
+        while (dirty_it.next()) |row_pin| {
+            const rac = row_pin.rowAndCell();
+            if (rac.row.dirty or row_pin.node.data.dirty) break :blk true;
+        }
+        break :blk false;
+    };
+
+    if (needs_rebuild) {
+        rebuildCells(terminal);
+        g_cells_valid = true;
+        g_last_cursor_blink_visible = g_cursor_blink_visible;
+        g_last_viewport_active = viewport_active;
+        g_last_rows = terminal.rows;
+        g_last_cols = terminal.cols;
+        g_last_selection_active = selection_active;
+
+        // Clear dirty flags after rebuild
+        terminal.flags.dirty = .{};
+        screen.dirty = .{};
+        var clear_it = screen.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
+        while (clear_it.next()) |row_pin| {
+            row_pin.rowAndCell().row.dirty = false;
+        }
+    }
+
+    // Cache cursor state for drawing outside the lock
+    g_cached_cursor_x = screen.cursor.x;
+    g_cached_cursor_y = screen.cursor.y;
+    g_cached_viewport_at_bottom = screen.pages.viewport == .active;
+    const tcs: TerminalCursorStyle = switch (screen.cursor.cursor_style) {
+        .bar => .bar,
+        .block => .block,
+        .underline => .underline,
+        .block_hollow => .block_hollow,
+    };
+    if (cursorEffectiveStyle(tcs, terminal.modes.get(.cursor_blinking))) |eff| {
+        g_cached_cursor_style = eff;
+    }
+}
+
+/// Draw terminal grid from CPU cell buffers. Does NOT require the terminal
+/// mutex — all terminal state was already read by updateTerminalCells().
+fn drawCells(window_height: f32, offset_x: f32, offset_y: f32) void {
     // --- Draw BG cells ---
     if (bg_cell_count > 0 and bg_shader != 0) {
         gl.UseProgram.?(bg_shader);
@@ -2068,47 +2157,39 @@ fn renderTerminal(terminal: *ghostty_vt.Terminal, window_height: f32, offset_x: 
         gl.DrawArraysInstanced.?(c.GL_TRIANGLE_STRIP, 0, 4, @intCast(fg_cell_count)); g_draw_call_count += 1;
     }
 
-    // --- Cursor overlay (bar, underline, hollow box) ---
-    // Block cursor is already in BG cells; bar/underline/hollow need separate quads
-    {
-        const screen = terminal.screens.active;
-        const viewport_at_bottom = screen.pages.viewport == .active;
-        if (viewport_at_bottom) {
-            const cx = screen.cursor.x;
-            const cy = screen.cursor.y;
-            const terminal_cursor_style: TerminalCursorStyle = switch (screen.cursor.cursor_style) {
-                .bar => .bar,
-                .block => .block,
-                .underline => .underline,
-                .block_hollow => .block_hollow,
-            };
-            const terminal_cursor_blink = terminal.modes.get(.cursor_blinking);
-            if (cursorEffectiveStyle(terminal_cursor_style, terminal_cursor_blink)) |effective| {
-                const px = offset_x + @as(f32, @floatFromInt(cx)) * cell_width;
-                const py = window_height - offset_y - ((@as(f32, @floatFromInt(cy)) + 1) * cell_height);
+    // --- Cursor overlay from cached state ---
+    if (g_cached_viewport_at_bottom) {
+        const effective = if (!window_focused)
+            CursorStyle.block_hollow
+        else if (g_cursor_blink and !g_cursor_blink_visible)
+            null
+        else
+            g_cached_cursor_style;
 
-                // Switch to the old per-glyph shader for cursor overlay quads
-                gl.UseProgram.?(shader_program);
-                gl.BindVertexArray.?(vao);
+        if (effective) |style| {
+            const px = offset_x + @as(f32, @floatFromInt(g_cached_cursor_x)) * cell_width;
+            const py = window_height - offset_y - ((@as(f32, @floatFromInt(g_cached_cursor_y)) + 1) * cell_height);
 
-                const cursor_color = g_theme.cursor_color;
-                const cursor_thickness: f32 = 1.0;
+            gl.UseProgram.?(shader_program);
+            gl.BindVertexArray.?(vao);
 
-                switch (effective) {
-                    .bar => renderQuad(px, py, cursor_thickness, cell_height, cursor_color),
-                    .underline => renderQuad(px, py, cell_width, cursor_thickness, cursor_color),
-                    .block_hollow => {
-                        renderQuad(px, py, cell_width, cell_height, cursor_color);
-                        renderQuad(
-                            px + cursor_thickness,
-                            py + cursor_thickness,
-                            cell_width - cursor_thickness * 2,
-                            cell_height - cursor_thickness * 2,
-                            g_theme.background,
-                        );
-                    },
-                    .block => {},
-                }
+            const cursor_color = g_theme.cursor_color;
+            const cursor_thickness: f32 = 1.0;
+
+            switch (style) {
+                .bar => renderQuad(px, py, cursor_thickness, cell_height, cursor_color),
+                .underline => renderQuad(px, py, cell_width, cursor_thickness, cursor_color),
+                .block_hollow => {
+                    renderQuad(px, py, cell_width, cell_height, cursor_color);
+                    renderQuad(
+                        px + cursor_thickness,
+                        py + cursor_thickness,
+                        cell_width - cursor_thickness * 2,
+                        cell_height - cursor_thickness * 2,
+                        g_theme.background,
+                    );
+                },
+                .block => {},
             }
         }
     }
@@ -2348,7 +2429,9 @@ fn renderPostProcess(width: c_int, height: c_int) void {
 }
 
 /// Helper: render a frame to FBO, then apply post-processing to screen
-fn renderFrameWithPost(width: c_int, height: c_int, terminal: *ghostty_vt.Terminal, padding: f32) void {
+/// Render with post-processing. Called after updateTerminalCells() has
+/// already been called under the lock — this only does GL work.
+fn renderFrameWithPostFromCells(width: c_int, height: c_int, padding: f32) void {
     ensurePostFBO(width, height);
 
     // 1. Render terminal to FBO
@@ -2357,8 +2440,7 @@ fn renderFrameWithPost(width: c_int, height: c_int, terminal: *ghostty_vt.Termin
     setProjection(@floatFromInt(width), @floatFromInt(height));
     gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
     gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
-    updateCursorBlink();
-    renderTerminal(terminal, @floatFromInt(height), padding, padding);
+    drawCells(@floatFromInt(height), padding, padding);
 
     // 2. Apply post-processing shader to screen
     renderPostProcess(width, height);
@@ -2419,6 +2501,7 @@ fn renderDebugOverlay(window_width: f32) void {
             var buf: [32]u8 = undefined;
             break :blk std.fmt.bufPrint(&buf, "{d} draws", .{g_draw_call_count}) catch break :blk "";
         }, .{ 1.0, 1.0, 0.0 });
+
     }
 }
 
@@ -2559,6 +2642,7 @@ fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void
 
     // --- Theme, cursor, debug ---
     g_theme = cfg.resolved_theme;
+    g_force_rebuild = true;
     g_cursor_style = cfg.@"cursor-style";
     g_cursor_blink = cfg.@"cursor-style-blink";
     g_debug_fps = cfg.@"phantty-debug-fps";
@@ -2824,6 +2908,7 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
 
     pub fn windowFocusCallback(_: ?*c.GLFWwindow, focused: c_int) callconv(.c) void {
         window_focused = focused != 0;
+        g_force_rebuild = true;
     }
 
     pub fn framebufferSizeCallback(window: ?*c.GLFWwindow, width: c_int, height: c_int) callconv(.c) void {
@@ -2848,17 +2933,26 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
             if (g_titlebar_atlas != null) syncAtlasTexture(&g_titlebar_atlas, &g_titlebar_atlas_texture, &g_titlebar_atlas_modified);
 
             if (activeSurface()) |surface| {
-                surface.render_state.mutex.lock();
-                defer surface.render_state.mutex.unlock();
+                // Like Ghostty: hold the terminal mutex only for the
+                // cell rebuild (reading terminal state). All GL work
+                // (buffer upload, draw calls) happens outside the lock.
+                {
+                    surface.render_state.mutex.lock();
+                    defer surface.render_state.mutex.unlock();
+                    updateCursorBlink();
+                    updateTerminalCells(&surface.terminal);
+                }
+
+                // GL rendering happens outside the lock — IO thread
+                // can continue parsing while we draw.
                 if (g_post_enabled) {
-                    renderFrameWithPost(width, height, &surface.terminal, padding_f);
+                    renderFrameWithPostFromCells(width, height, padding_f);
                 } else {
                     gl.Viewport.?(0, 0, width, height);
                     setProjection(@floatFromInt(width), @floatFromInt(height));
                     gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
                     gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
-                    updateCursorBlink();
-                    renderTerminal(&surface.terminal, @floatFromInt(height), padding_f, padding_f);
+                    drawCells(@floatFromInt(height), padding_f, padding_f);
                 }
             } else {
                 gl.Viewport.?(0, 0, width, height);
@@ -3581,6 +3675,7 @@ pub fn main() !void {
 
     // Apply config to globals
     g_theme = cfg.resolved_theme;
+    g_force_rebuild = true;
     g_cursor_style = cfg.@"cursor-style";
     g_cursor_blink = cfg.@"cursor-style-blink";
     g_debug_fps = cfg.@"phantty-debug-fps";
@@ -4011,6 +4106,7 @@ pub fn main() !void {
             win32_input.processEvents(win);
 
             // Update focus state
+            if (window_focused != win.focused) g_force_rebuild = true;
             window_focused = win.focused;
 
             const fb = win.getFramebufferSize();
@@ -4025,28 +4121,34 @@ pub fn main() !void {
             if (g_icon_atlas != null) syncAtlasTexture(&g_icon_atlas, &g_icon_atlas_texture, &g_icon_atlas_modified);
             if (g_titlebar_atlas != null) syncAtlasTexture(&g_titlebar_atlas, &g_titlebar_atlas_texture, &g_titlebar_atlas_modified);
 
-            if (g_post_enabled) {
-                if (activeSurface()) |surface| {
+            if (activeSurface()) |surface| {
+                // Hold terminal mutex only for cell rebuild
+                {
                     surface.render_state.mutex.lock();
                     defer surface.render_state.mutex.unlock();
-                    renderFrameWithPost(fb_width, fb_height, &surface.terminal, padding);
+                    updateCursorBlink();
+                    updateTerminalCells(&surface.terminal);
                 }
-            } else {
+
+                // GL rendering outside the lock
+                if (g_post_enabled) {
+                    renderFrameWithPostFromCells(fb_width, fb_height, padding);
+                } else {
+                    gl.Viewport.?(0, 0, fb_width, fb_height);
+                    setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
+                    gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
+                    gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
+
+                    renderTitlebar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
+
+                    drawCells(@floatFromInt(fb_height), padding, top_padding);
+                }
+            } else if (!g_post_enabled) {
                 gl.Viewport.?(0, 0, fb_width, fb_height);
                 setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
                 gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
                 gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
-
-                // Draw titlebar (tab titles read without lock — acceptable
-                // race, worst case is a stale title for one frame)
                 renderTitlebar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
-
-                if (activeSurface()) |surface| {
-                    surface.render_state.mutex.lock();
-                    defer surface.render_state.mutex.unlock();
-                    updateCursorBlink();
-                    renderTerminal(&surface.terminal, @floatFromInt(fb_height), padding, top_padding);
-                }
             }
 
             renderDebugOverlay(@floatFromInt(fb_width));
@@ -4065,23 +4167,27 @@ pub fn main() !void {
             if (g_icon_atlas != null) syncAtlasTexture(&g_icon_atlas, &g_icon_atlas_texture, &g_icon_atlas_modified);
             if (g_titlebar_atlas != null) syncAtlasTexture(&g_titlebar_atlas, &g_titlebar_atlas_texture, &g_titlebar_atlas_modified);
 
-            if (g_post_enabled) {
-                if (activeSurface()) |surface| {
+            if (activeSurface()) |surface| {
+                {
                     surface.render_state.mutex.lock();
                     defer surface.render_state.mutex.unlock();
-                    renderFrameWithPost(fb_width, fb_height, &surface.terminal, padding);
+                    updateCursorBlink();
+                    updateTerminalCells(&surface.terminal);
+                }
+                if (g_post_enabled) {
+                    renderFrameWithPostFromCells(fb_width, fb_height, padding);
+                } else {
+                    gl.Viewport.?(0, 0, fb_width, fb_height);
+                    setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
+                    gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
+                    gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
+                    drawCells(@floatFromInt(fb_height), padding, padding);
                 }
             } else {
                 gl.Viewport.?(0, 0, fb_width, fb_height);
                 setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
                 gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
                 gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
-                if (activeSurface()) |surface| {
-                    surface.render_state.mutex.lock();
-                    defer surface.render_state.mutex.unlock();
-                    updateCursorBlink();
-                    renderTerminal(&surface.terminal, @floatFromInt(fb_height), padding, padding);
-                }
             }
 
             renderDebugOverlay(@floatFromInt(fb_width));

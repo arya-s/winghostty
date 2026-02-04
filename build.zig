@@ -11,7 +11,8 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{});
 
-    buildBackend(b, target, optimize, true);
+    const use_win32 = b.option(bool, "use_win32", "Use Win32 backend (default: true)") orelse true;
+    buildBackend(b, target, optimize, use_win32);
 }
 
 fn buildBackend(
