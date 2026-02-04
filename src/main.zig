@@ -2067,6 +2067,12 @@ fn cursorEffectiveStyle(terminal_style: TerminalCursorStyle, terminal_blink: boo
 /// after releasing the lock). Modeled after Ghostty's split:
 ///   lock → RenderState.update() (snapshot) → unlock → rebuildCells()
 fn updateTerminalCells(terminal: *ghostty_vt.Terminal) bool {
+    // If the application has enabled synchronized output (Mode 2026),
+    // skip rendering entirely until the batch ends. This prevents
+    // mid-update artifacts (e.g. fzf drawing its UI). Matches Ghostty's
+    // renderer/generic.zig which returns early when synchronized_output is set.
+    if (terminal.modes.get(.synchronized_output)) return false;
+
     const screen = terminal.screens.active;
     const viewport_active = screen.pages.viewport == .active;
     const selection_active = activeSelection().active;
