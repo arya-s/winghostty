@@ -536,6 +536,81 @@ var g_windowed_y: c_int = 0;
 var g_windowed_width: c_int = 800;
 var g_windowed_height: c_int = 600;
 
+// ============================================================================
+// Window state persistence — save/restore position across sessions
+// ============================================================================
+
+const WindowState = struct {
+    x: i32,
+    y: i32,
+};
+
+/// Return the state file path: %APPDATA%\phantty\state
+fn stateFilePath(allocator: std.mem.Allocator) ?[]const u8 {
+    if (std.process.getEnvVarOwned(allocator, "APPDATA")) |appdata| {
+        defer allocator.free(appdata);
+        return std.fs.path.join(allocator, &.{ appdata, "phantty", "state" }) catch null;
+    } else |_| {}
+    if (std.process.getEnvVarOwned(allocator, "XDG_CONFIG_HOME")) |xdg| {
+        defer allocator.free(xdg);
+        return std.fs.path.join(allocator, &.{ xdg, "phantty", "state" }) catch null;
+    } else |_| {}
+    if (std.process.getEnvVarOwned(allocator, "HOME")) |home| {
+        defer allocator.free(home);
+        return std.fs.path.join(allocator, &.{ home, ".config", "phantty", "state" }) catch null;
+    } else |_| {}
+    return null;
+}
+
+/// Load window state from the state file.
+fn loadWindowState(allocator: std.mem.Allocator) ?WindowState {
+    const path = stateFilePath(allocator) orelse return null;
+    defer allocator.free(path);
+
+    const data = std.fs.cwd().readFileAlloc(allocator, path, 4096) catch return null;
+    defer allocator.free(data);
+
+    var state = WindowState{ .x = 0, .y = 0 };
+    var has_x = false;
+    var has_y = false;
+
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, &[_]u8{ ' ', '\t', '\r' });
+        if (trimmed.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq| {
+            const key = std.mem.trim(u8, trimmed[0..eq], &[_]u8{ ' ', '\t' });
+            const val = std.mem.trim(u8, trimmed[eq + 1 ..], &[_]u8{ ' ', '\t' });
+            if (std.mem.eql(u8, key, "window-x")) {
+                state.x = std.fmt.parseInt(i32, val, 10) catch continue;
+                has_x = true;
+            } else if (std.mem.eql(u8, key, "window-y")) {
+                state.y = std.fmt.parseInt(i32, val, 10) catch continue;
+                has_y = true;
+            }
+        }
+    }
+
+    if (!has_x or !has_y) return null;
+    return state;
+}
+
+/// Save window state to the state file.
+fn saveWindowState(allocator: std.mem.Allocator, state: WindowState) void {
+    const path = stateFilePath(allocator) orelse return;
+    defer allocator.free(path);
+
+    var buf: [128]u8 = undefined;
+    const content = std.fmt.bufPrint(&buf, "window-x = {d}\nwindow-y = {d}\n", .{
+        state.x, state.y,
+    }) catch return;
+
+    if (std.fs.cwd().createFile(path, .{})) |file| {
+        defer file.close();
+        file.writeAll(content) catch {};
+    } else |_| {}
+}
+
 // Post-processing custom shader (Ghostty-compatible)
 var g_post_fbo: c.GLuint = 0; // Framebuffer object for off-screen render
 var g_post_texture: c.GLuint = 0; // Color attachment texture
@@ -4460,11 +4535,14 @@ pub fn main() !void {
     // stays alive for the rest of main().
     // ================================================================
 
-    // --- Win32 window ---
+    // --- Win32 window (restore position from last session) ---
+    const saved_state = loadWindowState(allocator);
     var win32_window = win32_backend.Window.init(
         800,
         600,
         std.unicode.utf8ToUtf16LeStringLiteral("Phantty"),
+        if (saved_state) |s| s.x else null,
+        if (saved_state) |s| s.y else null,
     ) catch |err| {
         std.debug.print("Failed to create Win32 window: {}\n", .{err});
         return err;
@@ -4831,6 +4909,20 @@ pub fn main() !void {
         renderDebugOverlay(@floatFromInt(fb_width));
 
         win.swapBuffers();
+    }
+
+    // Save window position for next session
+    if (g_window) |w| {
+        var rect: win32_backend.RECT = undefined;
+        if (win32_backend.GetWindowRect(w.hwnd, &rect) != 0) {
+            const is_maximized = win32_backend.IsZoomed(w.hwnd) != 0;
+            if (!is_maximized and !w.is_fullscreen) {
+                saveWindowState(allocator, .{ .x = rect.left, .y = rect.top });
+            } else {
+                // Save the last known windowed position before maximize/fullscreen
+                saveWindowState(allocator, .{ .x = g_windowed_x, .y = g_windowed_y });
+            }
+        }
     }
 
     // Clean up all tabs

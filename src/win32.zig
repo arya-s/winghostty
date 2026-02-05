@@ -496,7 +496,7 @@ pub const Window = struct {
     /// 2. Load wglCreateContextAttribsARB from the legacy context
     /// 3. Create the real window + OpenGL 3.3 core profile context
     /// 4. Destroy the dummy window
-    pub fn init(width: i32, height: i32, title: [*:0]const WCHAR) !Window {
+    pub fn init(width: i32, height: i32, title: [*:0]const WCHAR, x: ?i32, y: ?i32) !Window {
         const hInstance = GetModuleHandleW(null);
 
         // --- Step 1: Register window classes ---
@@ -594,8 +594,8 @@ pub const Window = struct {
             real_class,
             title,
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            if (x) |xv| xv else CW_USEDEFAULT,
+            if (y) |yv| yv else CW_USEDEFAULT,
             width,
             height,
             null, null, hInstance, null,
@@ -1054,7 +1054,7 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             if (pressed == w.hovered_button) {
                 switch (pressed) {
                     .close => {
-                        _ = DestroyWindow(hwnd);
+                        w.should_close = true;
                         return 0;
                     },
                     .maximize => {
