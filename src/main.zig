@@ -1922,16 +1922,34 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
             }
         }
 
-        // Tab content: title always centered on full tab, shortcut + close overlay on right.
-        // On hover the close button fades in and the shortcut slides left to make room.
+        // Tab title text — rendered at native 14pt via titlebar font (no scaling)
+        // Shortcut label (^1 through ^0) rendered right-aligned, only for tabs 1–10 in multi-tab
         const title = if (g_tabs[tab_idx]) |t| t.getTitle() else "New Tab";
         if (title.len > 0) {
             const text_color = if (is_active) text_active else text_inactive;
             const shortcut_color = [3]f32{ 0.45, 0.45, 0.45 };
-            const tab_pad: f32 = 12;
+            const tab_pad: f32 = 18;
+
+            // Shortcut label: "^1" through "^9", "^0" for tab 10
+            const has_shortcut = num_tabs > 1 and tab_idx < 10;
+            const shortcut_digit: u8 = if (has_shortcut)
+                (if (tab_idx == 9) '0' else @as(u8, @intCast('1' + tab_idx)))
+            else
+                0;
+
+            // Measure shortcut width
+            var shortcut_w: f32 = 0;
+            if (has_shortcut) {
+                shortcut_w += titlebarGlyphAdvance('^');
+                shortcut_w += titlebarGlyphAdvance(@intCast(shortcut_digit));
+            }
+
+            const shortcut_gap: f32 = if (has_shortcut) 6 else 0;
+            const shortcut_reserved = if (has_shortcut) shortcut_w + shortcut_gap else 0;
 
             const center_region = if (num_tabs == 1) window_width else tab_w;
             const center_offset = if (num_tabs == 1) @as(f32, 0) else cursor_x;
+            const avail_w = center_region - tab_pad * 2 - shortcut_reserved;
 
             // Decode title into codepoints for proper UTF-8 handling
             var codepoints: [256]u32 = undefined;
@@ -1950,10 +1968,10 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
 
             const text_y = tb_top + (titlebar_h - g_titlebar_cell_height) / 2;
 
-            // Title: always centered on the full tab width
-            const avail_w = center_region - tab_pad * 2;
             if (text_width <= avail_w) {
-                var text_x = center_offset + (center_region - text_width) / 2;
+                // Fits — center it
+                const text_area = center_region - shortcut_reserved;
+                var text_x = center_offset + (text_area - text_width) / 2;
                 for (codepoints[0..cp_count]) |cp| {
                     renderTitlebarChar(cp, text_x, text_y, text_color);
                     text_x += titlebarGlyphAdvance(cp);
@@ -1965,6 +1983,7 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
                 const text_budget = avail_w - ellipsis_w;
                 const half_budget = text_budget / 2;
 
+                // Measure codepoints from start
                 var start_w: f32 = 0;
                 var start_end: usize = 0;
                 for (codepoints[0..cp_count], 0..) |cp, idx| {
@@ -1974,6 +1993,7 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
                     start_end = idx + 1;
                 }
 
+                // Measure codepoints from end
                 var end_w: f32 = 0;
                 var end_start: usize = cp_count;
                 var j: usize = cp_count;
@@ -2002,22 +2022,9 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
             // close_opacity (0→1) drives the animation:
             //   0 = shortcut visible, close hidden
             //   1 = shortcut slid down + faded out, close faded in
-            const has_shortcut = num_tabs > 1 and tab_idx < 10;
             const close_opacity = g_tab_close_opacity[tab_idx];
             const shortcut_opacity = 1.0 - close_opacity;
 
-            // Measure shortcut width (needed for centering both elements)
-            const shortcut_digit: u8 = if (has_shortcut)
-                (if (tab_idx == 9) '0' else @as(u8, @intCast('1' + tab_idx)))
-            else
-                0;
-            var shortcut_w: f32 = 0;
-            if (has_shortcut) {
-                shortcut_w += titlebarGlyphAdvance('^');
-                shortcut_w += titlebarGlyphAdvance(@intCast(shortcut_digit));
-            }
-
-            // Both elements are right-aligned with their right edge at the same position
             const right_edge = center_offset + center_region - tab_pad;
 
             // Shortcut label — fades out and slides down on hover
