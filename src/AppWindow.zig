@@ -13,6 +13,7 @@ const sprite = @import("font/sprite.zig");
 const directwrite = @import("directwrite.zig");
 const Config = @import("config.zig");
 const Surface = @import("Surface.zig");
+const SplitTree = @import("split_tree.zig");
 const renderer = @import("renderer.zig");
 const win32_backend = @import("win32.zig");
 const App = @import("App.zig");
@@ -51,6 +52,13 @@ pub fn init(allocator: std.mem.Allocator, app: *App) !AppWindow {
     g_cursor_blink = app.cursor_blink;
     g_debug_fps = app.debug_fps;
     g_debug_draw_calls = app.debug_draw_calls;
+
+    // Split config
+    g_unfocused_split_opacity = app.unfocused_split_opacity;
+    g_focus_follows_mouse = app.focus_follows_mouse;
+    if (app.split_divider_color) |color| {
+        g_split_divider_color = color;
+    }
 
     // Apply window size from config
     term_cols = app.initial_cols;
@@ -342,7 +350,9 @@ fn commitTabRename() void {
                 !std.mem.eql(u8, g_tab_rename_buf[0..g_tab_rename_len], g_tab_rename_orig_buf[0..g_tab_rename_orig_len]);
             if (changed) {
                 // Empty name clears the override (reverts to automatic title)
-                tab.surface.setTitleOverride(g_tab_rename_buf[0..g_tab_rename_len]);
+                if (tab.focusedSurface()) |surface| {
+                    surface.setTitleOverride(g_tab_rename_buf[0..g_tab_rename_len]);
+                }
             }
         }
     }
@@ -514,21 +524,134 @@ threadlocal var g_last_frame_time_ms: i64 = 0; // for delta-time computation
 // ============================================================================
 
 const TabState = struct {
-    surface: *Surface,
+    tree: SplitTree,
+    focused: SplitTree.Node.Handle = .root,
 
-    /// Get the display title for this tab (delegates to Surface, unless forced)
+    /// Get the focused surface in this tab, or null if tree is empty
+    fn focusedSurface(self: *const TabState) ?*Surface {
+        if (self.tree.isEmpty()) return null;
+        return switch (self.tree.nodes[self.focused.idx()]) {
+            .leaf => |surface| surface,
+            .split => null, // focused should always be a leaf
+        };
+    }
+
+    /// Get the display title for this tab (delegates to focused Surface, unless forced)
     fn getTitle(self: *const TabState) []const u8 {
         // If a forced title is set via config, always use that
         if (g_forced_title) |forced| {
             return forced;
         }
-        return self.surface.getTitle();
+        const surface = self.focusedSurface() orelse return "phantty";
+        return surface.getTitle();
     }
 
     fn deinit(self: *TabState, allocator: std.mem.Allocator) void {
-        self.surface.deinit(allocator);
+        _ = allocator; // Tree uses its internal arena's child allocator
+        self.tree.deinit();
     }
 };
+
+// ============================================================================
+// Split layout — computed pixel rects for each surface in a split tree
+// ============================================================================
+
+/// Pixel rectangle for a split surface, including computed terminal dimensions
+pub const SplitRect = struct {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    cols: u16,
+    rows: u16,
+    surface: *Surface,
+    handle: SplitTree.Node.Handle,
+};
+
+/// Maximum number of split surfaces per tab
+const MAX_SPLITS_PER_TAB = 16;
+
+/// Computed split rects for the active tab (updated each frame)
+threadlocal var g_split_rects: [MAX_SPLITS_PER_TAB]SplitRect = undefined;
+threadlocal var g_split_rect_count: usize = 0;
+
+/// Divider width in pixels between split panes
+const SPLIT_DIVIDER_WIDTH: i32 = 2;
+
+/// Compute split layout for a tab, returning pixel rects for each surface.
+/// Returns the number of surfaces (0 if tree is empty).
+fn computeSplitLayout(
+    tab: *const TabState,
+    content_x: i32,
+    content_y: i32,
+    content_w: i32,
+    content_h: i32,
+    cw: f32, // cell_width
+    ch: f32, // cell_height
+) usize {
+    if (tab.tree.isEmpty()) return 0;
+
+    // Get spatial representation (normalized 0-1 coordinates)
+    const allocator = g_allocator orelse return 0;
+    var spatial = tab.tree.spatial(allocator) catch return 0;
+    defer spatial.deinit(allocator);
+
+    var count: usize = 0;
+    var it = tab.tree.iterator();
+    while (it.next()) |entry| {
+        if (count >= MAX_SPLITS_PER_TAB) break;
+
+        const slot = spatial.slots[entry.handle.idx()];
+
+        // Convert normalized coords to pixels
+        const x_f: f32 = @as(f32, @floatCast(slot.x)) * @as(f32, @floatFromInt(content_w));
+        const y_f: f32 = @as(f32, @floatCast(slot.y)) * @as(f32, @floatFromInt(content_h));
+        const w_f: f32 = @as(f32, @floatCast(slot.width)) * @as(f32, @floatFromInt(content_w));
+        const h_f: f32 = @as(f32, @floatCast(slot.height)) * @as(f32, @floatFromInt(content_h));
+
+        // Apply divider insets (half-divider on each side adjacent to other splits)
+        var px: i32 = content_x + @as(i32, @intFromFloat(x_f));
+        var py: i32 = content_y + @as(i32, @intFromFloat(y_f));
+        var pw: i32 = @as(i32, @intFromFloat(w_f));
+        var ph: i32 = @as(i32, @intFromFloat(h_f));
+
+        // Inset for dividers (only if not at edge)
+        const half_div = @divTrunc(SPLIT_DIVIDER_WIDTH, 2);
+        if (slot.x > 0.001) {
+            px += half_div;
+            pw -= half_div;
+        }
+        if (slot.x + slot.width < 0.999) {
+            pw -= half_div;
+        }
+        if (slot.y > 0.001) {
+            py += half_div;
+            ph -= half_div;
+        }
+        if (slot.y + slot.height < 0.999) {
+            ph -= half_div;
+        }
+
+        // Compute terminal dimensions from pixel size
+        const cols: u16 = if (pw > 0 and cw > 0) @intFromFloat(@max(1, @as(f32, @floatFromInt(pw)) / cw)) else 1;
+        const rows: u16 = if (ph > 0 and ch > 0) @intFromFloat(@max(1, @as(f32, @floatFromInt(ph)) / ch)) else 1;
+
+        g_split_rects[count] = .{
+            .x = px,
+            .y = py,
+            .width = pw,
+            .height = ph,
+            .cols = cols,
+            .rows = rows,
+            .surface = entry.surface,
+            .handle = entry.handle,
+        };
+        count += 1;
+    }
+
+    g_split_rect_count = count;
+    return count;
+}
 
 const MAX_TABS = 16;
 threadlocal var g_tabs: [MAX_TABS]?*TabState = .{null} ** MAX_TABS;
@@ -544,11 +667,13 @@ fn getShellCmd() [:0]const u16 {
     return g_shell_cmd_buf[0..g_shell_cmd_len :0];
 }
 
-/// Get the active tab's selection
+/// Get the active tab's focused surface's selection
 fn activeSelection() *Selection {
     if (g_tab_count > 0) {
         if (g_tabs[g_active_tab]) |tab| {
-            return &tab.surface.selection;
+            if (tab.focusedSurface()) |surface| {
+                return &surface.selection;
+            }
         }
     }
     // Fallback — should never happen in practice
@@ -562,7 +687,7 @@ fn activeSelection() *Selection {
 fn activeSurface() ?*Surface {
     if (g_tab_count == 0) return null;
     const tab = g_tabs[g_active_tab] orelse return null;
-    return tab.surface;
+    return tab.focusedSurface();
 }
 
 // OSC scanning and title management moved to Surface.zig
@@ -588,13 +713,24 @@ fn spawnTabWithCwd(allocator: std.mem.Allocator, cwd: ?[*:0]const u16) bool {
         return false;
     };
 
-    // Allocate TabState on the heap so pointers stay stable when tabs shift
-    const tab = allocator.create(TabState) catch {
-        std.debug.print("Failed to allocate TabState\n", .{});
+    // Initialize split tree with the single surface.
+    // The tree takes ownership via ref(), so we unref our initial ownership.
+    const tree = SplitTree.init(allocator, surface) catch {
+        std.debug.print("Failed to create SplitTree for new tab\n", .{});
         surface.deinit(allocator);
         return false;
     };
-    tab.surface = surface;
+    surface.unref(allocator); // Transfer ownership to tree
+
+    // Allocate TabState on the heap so pointers stay stable when tabs shift
+    const tab = allocator.create(TabState) catch {
+        std.debug.print("Failed to allocate TabState\n", .{});
+        var tree_mut = tree;
+        tree_mut.deinit();
+        return false;
+    };
+    tab.tree = tree;
+    tab.focused = .root;
 
     g_tabs[g_tab_count] = tab;
     g_active_tab = g_tab_count;
@@ -667,7 +803,11 @@ fn switchTab(idx: usize) void {
         g_active_tab = idx;
         // Clear bell indicator when switching to this tab (like Ghostty)
         if (g_tabs[idx]) |tab| {
-            tab.surface.bell_indicator = false;
+            // Clear bell on all surfaces in the tab's split tree
+            var it = tab.tree.iterator();
+            while (it.next()) |entry| {
+                entry.surface.bell_indicator = false;
+            }
         }
         // Clear selection state when switching tabs
         g_selecting = false;
@@ -685,6 +825,180 @@ fn isActiveTabTerminal() bool {
 fn activeTab() ?*TabState {
     if (g_tab_count == 0) return null;
     return g_tabs[g_active_tab];
+}
+
+// ============================================================================
+// Split operations
+// ============================================================================
+
+/// Split the focused surface in the given direction, creating a new surface.
+fn splitFocused(direction: SplitTree.Split.Direction) void {
+    const allocator = g_allocator orelse return;
+    const tab = activeTab() orelse return;
+
+    // Get CWD from focused surface for working directory inheritance
+    var cwd_buf: [260]u16 = undefined;
+    var cwd: ?[*:0]const u16 = null;
+    if (tab.focusedSurface()) |surface| {
+        if (surface.getCwd()) |unix_path| {
+            if (unixPathToWindows(unix_path, &cwd_buf)) |len| {
+                cwd_buf[len] = 0;
+                cwd = @ptrCast(&cwd_buf);
+            }
+        }
+    }
+
+    // Create new surface for the split
+    const new_surface = Surface.init(
+        allocator,
+        term_cols,
+        term_rows,
+        getShellCmd(),
+        g_scrollback_limit,
+        g_cursor_style,
+        g_cursor_blink,
+        cwd,
+    ) catch {
+        std.debug.print("Failed to create Surface for split\n", .{});
+        return;
+    };
+
+    // Create a single-leaf tree for the new surface.
+    // The tree takes ownership via ref(), so we unref our initial ownership.
+    var insert_tree = SplitTree.init(allocator, new_surface) catch {
+        std.debug.print("Failed to create SplitTree for split\n", .{});
+        new_surface.deinit(allocator);
+        return;
+    };
+    new_surface.unref(allocator); // Transfer ownership to tree
+    defer insert_tree.deinit();
+
+    // Split the current tree at the focused node
+    const new_tree = tab.tree.split(
+        allocator,
+        tab.focused,
+        direction,
+        0.5, // 50/50 split
+        &insert_tree,
+    ) catch {
+        std.debug.print("Failed to split tree\n", .{});
+        return;
+    };
+
+    // The new surface's handle is at the first index after the old tree's nodes
+    // (since split() copies old nodes first, then insert nodes, then creates split node)
+    const new_handle: SplitTree.Node.Handle = @enumFromInt(tab.tree.nodes.len);
+
+    // Replace old tree with new tree
+    var old_tree = tab.tree;
+    tab.tree = new_tree;
+    old_tree.deinit();
+
+    // Focus the new surface
+    tab.focused = new_handle;
+
+    // Trigger resize for all surfaces in the tree to recalculate dimensions
+    g_force_rebuild = true;
+    g_cells_valid = false;
+
+    std.debug.print("Split created, new focused handle: {}, tree nodes: {}\n", .{ @intFromEnum(new_handle), tab.tree.nodes.len });
+}
+
+/// Close the focused split. If it's the last surface in the tab, close the tab instead.
+fn closeFocusedSplit() void {
+    const allocator = g_allocator orelse return;
+    const tab = activeTab() orelse return;
+
+    // If only one surface (no splits), close the tab instead
+    if (!tab.tree.isSplit()) {
+        if (g_tab_count <= 1) {
+            g_should_close = true;
+        } else {
+            closeTab(g_active_tab);
+        }
+        return;
+    }
+
+    // Find the next surface to focus before removing
+    const next_focus = tab.tree.goto(allocator, tab.focused, .next_wrapped) catch null;
+
+    // Remove the focused surface from the tree
+    const new_tree = tab.tree.remove(allocator, tab.focused) catch {
+        std.debug.print("Failed to remove split from tree\n", .{});
+        return;
+    };
+
+    // Replace old tree with new tree
+    var old_tree = tab.tree;
+    tab.tree = new_tree;
+    old_tree.deinit();
+
+    // Update focus - need to find the handle in the new tree
+    // After removal, handles may have shifted, so we need to find a valid leaf
+    if (tab.tree.isEmpty()) {
+        // Tree is empty, close the tab
+        if (g_tab_count <= 1) {
+            g_should_close = true;
+        } else {
+            closeTab(g_active_tab);
+        }
+        return;
+    }
+
+    // Find the first leaf in the new tree as a fallback
+    var it = tab.tree.iterator();
+    if (it.next()) |entry| {
+        // Try to use next_focus if it's still valid in the new tree
+        if (next_focus) |nf| {
+            if (nf != tab.focused and @intFromEnum(nf) < tab.tree.nodes.len) {
+                tab.focused = nf;
+            } else {
+                tab.focused = entry.handle;
+            }
+        } else {
+            tab.focused = entry.handle;
+        }
+    } else {
+        tab.focused = .root;
+    }
+
+    g_force_rebuild = true;
+    g_cells_valid = false;
+
+    std.debug.print("Split closed, new focused handle: {}, tree nodes: {}\n", .{ @intFromEnum(tab.focused), tab.tree.nodes.len });
+}
+
+/// Navigate to a split in the given direction
+fn gotoSplit(direction: SplitTree.Goto) void {
+    const allocator = g_allocator orelse return;
+    const tab = activeTab() orelse return;
+
+    const new_focus = tab.tree.goto(allocator, tab.focused, direction) catch return;
+    if (new_focus) |handle| {
+        tab.focused = handle;
+        g_force_rebuild = true;
+        g_cells_valid = false;
+    }
+}
+
+/// Update focus from mouse position (for focus-follows-mouse)
+fn updateFocusFromMouse(mouse_x: i32, mouse_y: i32) void {
+    const tab = activeTab() orelse return;
+
+    // Check which split rect contains the mouse
+    for (0..g_split_rect_count) |i| {
+        const rect = g_split_rects[i];
+        if (mouse_x >= rect.x and mouse_x < rect.x + rect.width and
+            mouse_y >= rect.y and mouse_y < rect.y + rect.height)
+        {
+            if (rect.handle != tab.focused) {
+                tab.focused = rect.handle;
+                g_force_rebuild = true;
+                g_cells_valid = false;
+            }
+            return;
+        }
+    }
 }
 
 // Embed the font
@@ -942,6 +1256,17 @@ const simple_color_fragment_source: [*c]const u8 =
     \\}
 ;
 threadlocal var simple_color_shader: c.GLuint = 0;
+
+// Solid color overlay shader - outputs a solid color with alpha for true blending.
+const overlay_fragment_source: [*c]const u8 =
+    \\#version 330 core
+    \\out vec4 color;
+    \\uniform vec4 overlayColor;
+    \\void main() {
+    \\    color = overlayColor;
+    \\}
+;
+threadlocal var overlay_shader: c.GLuint = 0;
 threadlocal var cell_width: f32 = 10;
 threadlocal var cell_height: f32 = 20;
 threadlocal var cell_baseline: f32 = 4; // Distance from bottom of cell to baseline
@@ -1318,6 +1643,10 @@ fn initInstancedBuffers() void {
     // Simple color shader for titlebar emoji (uses same vertex layout as text shader)
     simple_color_shader = linkProgram(vertex_shader_source, simple_color_fragment_source);
     if (simple_color_shader == 0) std.debug.print("Simple color shader failed\n", .{});
+
+    // Overlay shader for unfocused split dimming (solid color with alpha)
+    overlay_shader = linkProgram(vertex_shader_source, overlay_fragment_source);
+    if (overlay_shader == 0) std.debug.print("Overlay shader failed\n", .{});
 }
 
 /// Load a single glyph into the cache
@@ -2607,23 +2936,24 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
             g_tab_close_opacity[tab_idx] = 0;
         }
 
-        // Animate bell indicator opacity
+        // Animate bell indicator opacity (for focused surface in tab)
         if (g_tabs[tab_idx]) |tab| {
-            const surface = tab.surface;
-            if (surface.bell_indicator) {
-                // Fade in
-                surface.bell_opacity = @min(1.0, surface.bell_opacity + TAB_CLOSE_FADE_SPEED * dt);
+            if (tab.focusedSurface()) |surface| {
+                if (surface.bell_indicator) {
+                    // Fade in
+                    surface.bell_opacity = @min(1.0, surface.bell_opacity + TAB_CLOSE_FADE_SPEED * dt);
 
-                // On active tab: after 1s hold, start fading out and clear indicator
-                if (is_active and surface.bell_opacity >= 1.0) {
-                    const elapsed = now_ms - surface.bell_indicator_time;
-                    if (elapsed >= 1000) {
-                        surface.bell_indicator = false;
+                    // On active tab: after 1s hold, start fading out and clear indicator
+                    if (is_active and surface.bell_opacity >= 1.0) {
+                        const elapsed = now_ms - surface.bell_indicator_time;
+                        if (elapsed >= 1000) {
+                            surface.bell_indicator = false;
+                        }
                     }
+                } else {
+                    // Fade out
+                    surface.bell_opacity = @max(0.0, surface.bell_opacity - TAB_CLOSE_FADE_SPEED * dt);
                 }
-            } else {
-                // Fade out
-                surface.bell_opacity = @max(0.0, surface.bell_opacity - TAB_CLOSE_FADE_SPEED * dt);
             }
         }
 
@@ -2686,7 +3016,7 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
             var text_width: f32 = 0;
 
             // Bell indicator opacity (rendered independently of text layout)
-            const bell_opacity: f32 = if (g_tabs[tab_idx]) |t| t.surface.bell_opacity else 0;
+            const bell_opacity: f32 = if (g_tabs[tab_idx]) |t| (if (t.focusedSurface()) |s| s.bell_opacity else 0) else 0;
             const has_bell = bell_opacity > 0.01;
             const bell_emoji_width: f32 = if (has_bell) blk: {
                 if (loadBellEmoji()) |bell| {
@@ -3486,10 +3816,13 @@ fn rebuildCells() void {
     }
 }
 
-/// Determine effective cursor style (factoring in blink and focus).
+/// Determine effective cursor style (factoring in blink, focus, and split focus).
 /// Returns null during blink-off phase (cursor hidden).
 fn cursorEffectiveStyle(terminal_style: TerminalCursorStyle, terminal_blink: bool) ?CursorStyle {
+    // Unfocused window or tab rename: show hollow block
     if (!window_focused or g_tab_rename_active) return .block_hollow;
+    // Unfocused split: show hollow block (no blinking)
+    if (!g_split_is_focused) return .block_hollow;
     const should_blink = terminal_blink and g_cursor_blink;
     if (should_blink and !g_cursor_blink_visible) return null;
     return switch (terminal_style) {
@@ -3498,6 +3831,16 @@ fn cursorEffectiveStyle(terminal_style: TerminalCursorStyle, terminal_blink: boo
         .underline => .underline,
         .block_hollow => .block_hollow,
     };
+}
+
+/// Flag indicating if the surface being rendered is the focused split
+threadlocal var g_split_is_focused: bool = true;
+
+/// Update terminal cells for a specific surface in a split tree.
+/// is_focused controls cursor appearance (unfocused shows block_hollow).
+fn updateTerminalCellsForSurface(terminal: *ghostty_vt.Terminal, is_focused: bool) bool {
+    g_split_is_focused = is_focused;
+    return updateTerminalCells(terminal);
 }
 
 /// Update terminal cell buffers from terminal state. Must be called with
@@ -3659,14 +4002,9 @@ fn drawCells(window_height: f32, offset_x: f32, offset_y: f32) void {
 
     // --- Cursor overlay from cached state ---
     if (g_cached_viewport_at_bottom and g_cached_cursor_visible) {
-        const effective = if (!window_focused or g_tab_rename_active)
-            CursorStyle.block_hollow
-        else if (g_cursor_blink and !g_cursor_blink_visible)
-            null
-        else
-            g_cached_cursor_style;
-
-        if (effective) |style| {
+        // Use the pre-computed effective cursor style which already factors in
+        // window focus, tab rename, split focus, and blink state.
+        if (g_cached_cursor_effective) |style| {
             const px = offset_x + @as(f32, @floatFromInt(g_cached_cursor_x)) * cell_width;
             const py = window_height - offset_y - ((@as(f32, @floatFromInt(g_cached_cursor_y)) + 1) * cell_height);
 
@@ -3709,6 +4047,129 @@ fn initSolidTexture() void {
     gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_NEAREST);
     gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_NEAREST);
 }
+
+// ============================================================================
+// Split rendering helpers
+// ============================================================================
+
+/// Render a semi-transparent overlay over an unfocused split pane.
+fn renderUnfocusedOverlay(rect: SplitRect, window_height: f32) void {
+    const opacity = 1.0 - g_unfocused_split_opacity;
+    if (opacity < 0.01) return;
+
+    gl.UseProgram.?(shader_program);
+    gl.BindVertexArray.?(vao);
+
+    // Draw semi-transparent background color overlay
+    const px: f32 = @floatFromInt(rect.x);
+    const py: f32 = window_height - @as(f32, @floatFromInt(rect.y + rect.height));
+    const pw: f32 = @floatFromInt(rect.width);
+    const ph: f32 = @floatFromInt(rect.height);
+
+    // Use background color with alpha for the overlay
+    renderQuadAlpha(px, py, pw, ph, g_theme.background, opacity);
+}
+
+/// Render unfocused overlay within current viewport (for split rendering).
+/// Assumes viewport is already set to the split's region.
+/// Uses true alpha blending so it blends with actual rendered content.
+fn renderUnfocusedOverlaySimple(width: f32, height: f32) void {
+    const alpha = 1.0 - g_unfocused_split_opacity;
+    if (alpha < 0.01) return;
+
+    const vertices = [6][4]f32{
+        .{ 0, height, 0.0, 0.0 },
+        .{ 0, 0, 0.0, 1.0 },
+        .{ width, 0, 1.0, 1.0 },
+        .{ 0, height, 0.0, 0.0 },
+        .{ width, 0, 1.0, 1.0 },
+        .{ width, height, 1.0, 0.0 },
+    };
+
+    // Use overlay shader with true alpha blending
+    gl.UseProgram.?(overlay_shader);
+    
+    // Set overlay color (background color with alpha)
+    gl.Uniform4f.?(
+        gl.GetUniformLocation.?(overlay_shader, "overlayColor"),
+        g_theme.background[0],
+        g_theme.background[1],
+        g_theme.background[2],
+        alpha,
+    );
+    
+    // Set projection for current viewport
+    var viewport: [4]c.GLint = undefined;
+    gl.GetIntegerv.?(c.GL_VIEWPORT, &viewport);
+    const vp_width: f32 = @floatFromInt(viewport[2]);
+    const vp_height: f32 = @floatFromInt(viewport[3]);
+    const projection = [16]f32{
+        2.0 / vp_width, 0.0,            0.0,  0.0,
+        0.0,            2.0 / vp_height, 0.0,  0.0,
+        0.0,            0.0,            -1.0, 0.0,
+        -1.0,           -1.0,           0.0,  1.0,
+    };
+    gl.UniformMatrix4fv.?(gl.GetUniformLocation.?(overlay_shader, "projection"), 1, c.GL_FALSE, &projection);
+
+    gl.BindVertexArray.?(vao);
+    gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
+    gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
+    gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
+    gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6);
+    g_draw_call_count += 1;
+}
+
+/// Render split dividers between panes in the active tab.
+fn renderSplitDividers(tab: *const TabState, content_x: i32, content_y: i32, content_w: i32, content_h: i32, window_height: f32) void {
+    if (!tab.tree.isSplit()) return;
+
+    const allocator = g_allocator orelse return;
+
+    // Get spatial representation
+    var spatial = tab.tree.spatial(allocator) catch return;
+    defer spatial.deinit(allocator);
+
+    gl.UseProgram.?(shader_program);
+    gl.BindVertexArray.?(vao);
+
+    // Walk the tree nodes and draw dividers for each split
+    for (tab.tree.nodes, 0..) |node, i| {
+        switch (node) {
+            .leaf => {},
+            .split => |s| {
+                const slot = spatial.slots[i];
+                const slot_x: f32 = @as(f32, @floatCast(slot.x)) * @as(f32, @floatFromInt(content_w)) + @as(f32, @floatFromInt(content_x));
+                const slot_y: f32 = @as(f32, @floatCast(slot.y)) * @as(f32, @floatFromInt(content_h)) + @as(f32, @floatFromInt(content_y));
+                const slot_w: f32 = @as(f32, @floatCast(slot.width)) * @as(f32, @floatFromInt(content_w));
+                const slot_h: f32 = @as(f32, @floatCast(slot.height)) * @as(f32, @floatFromInt(content_h));
+
+                switch (s.layout) {
+                    .horizontal => {
+                        // Vertical divider at ratio position
+                        const div_x = slot_x + slot_w * @as(f32, @floatCast(s.ratio)) - @as(f32, @floatFromInt(@divTrunc(SPLIT_DIVIDER_WIDTH, 2)));
+                        const div_y = window_height - slot_y - slot_h;
+                        renderQuad(div_x, div_y, @floatFromInt(SPLIT_DIVIDER_WIDTH), slot_h, g_split_divider_color);
+                    },
+                    .vertical => {
+                        // Horizontal divider at ratio position
+                        const div_x = slot_x;
+                        const div_y = window_height - slot_y - slot_h * @as(f32, @floatCast(s.ratio)) - @as(f32, @floatFromInt(@divTrunc(SPLIT_DIVIDER_WIDTH, 2)));
+                        renderQuad(div_x, div_y, slot_w, @floatFromInt(SPLIT_DIVIDER_WIDTH), g_split_divider_color);
+                    },
+                }
+            },
+        }
+    }
+}
+
+/// Unfocused split opacity (default 0.7, configurable)
+threadlocal var g_unfocused_split_opacity: f32 = 0.7;
+
+/// Split divider color (default mid-gray)
+threadlocal var g_split_divider_color: [3]f32 = .{ 0.3, 0.3, 0.3 };
+
+/// Focus follows mouse - when true, moving mouse into a split pane focuses it
+threadlocal var g_focus_follows_mouse: bool = false;
 
 // ============================================================================
 // Post-Processing Custom Shader System (Ghostty-compatible)
@@ -3983,6 +4444,134 @@ fn renderQuadAlpha(x: f32, y: f32, w: f32, h: f32, color: [3]f32, alpha: f32) vo
 // Terminal cursor style defined in renderer/cursor.zig
 const TerminalCursorStyle = renderer.cursor.TerminalCursorStyle;
 
+// ============================================================================
+// FBO Management for Per-Surface Rendering
+// ============================================================================
+
+const Renderer = @import("Renderer.zig");
+
+/// Create or resize an FBO for a renderer.
+/// Must be called from main thread with GL context current.
+fn ensureRendererFBO(rend: *Renderer, width: u32, height: u32) void {
+    if (!rend.needsFBOUpdate(width, height)) return;
+
+    // Clean up existing FBO if resizing
+    if (rend.isFBOReady()) {
+        cleanupRendererFBO(rend);
+    }
+
+    // Create framebuffer
+    var fbo: c.GLuint = 0;
+    gl.GenFramebuffers.?(1, &fbo);
+    gl.BindFramebuffer.?(c.GL_FRAMEBUFFER, fbo);
+
+    // Create texture for color attachment
+    var texture: c.GLuint = 0;
+    gl.GenTextures.?(1, &texture);
+    gl.BindTexture.?(c.GL_TEXTURE_2D, texture);
+    gl.TexImage2D.?(
+        c.GL_TEXTURE_2D,
+        0,
+        c.GL_RGBA8,
+        @intCast(width),
+        @intCast(height),
+        0,
+        c.GL_RGBA,
+        c.GL_UNSIGNED_BYTE,
+        null,
+    );
+    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
+    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
+    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
+    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
+
+    // Attach texture to framebuffer
+    gl.FramebufferTexture2D.?(c.GL_FRAMEBUFFER, c.GL_COLOR_ATTACHMENT0, c.GL_TEXTURE_2D, texture, 0);
+
+    // Check framebuffer completeness
+    const status = gl.CheckFramebufferStatus.?(c.GL_FRAMEBUFFER);
+    if (status != c.GL_FRAMEBUFFER_COMPLETE) {
+        std.debug.print("FBO incomplete: 0x{X}\n", .{status});
+    }
+
+    // Unbind
+    gl.BindFramebuffer.?(c.GL_FRAMEBUFFER, 0);
+    gl.BindTexture.?(c.GL_TEXTURE_2D, 0);
+
+    // Store handles in renderer
+    rend.setFBOHandles(fbo, texture, width, height);
+}
+
+/// Clean up FBO resources for a renderer.
+fn cleanupRendererFBO(rend: *Renderer) void {
+    if (!rend.isFBOReady()) return;
+
+    var texture = rend.getTexture();
+    var fbo = rend.getFBO();
+
+    if (texture != 0) {
+        gl.DeleteTextures.?(1, &texture);
+    }
+    if (fbo != 0) {
+        gl.DeleteFramebuffers.?(1, &fbo);
+    }
+
+    rend.clearFBOHandles();
+}
+
+/// Bind a renderer's FBO for drawing.
+fn bindRendererFBO(rend: *Renderer) void {
+    if (!rend.isFBOReady()) return;
+    gl.BindFramebuffer.?(c.GL_FRAMEBUFFER, rend.getFBO());
+    const size = rend.getFBOSize();
+    gl.Viewport.?(0, 0, @intCast(size.width), @intCast(size.height));
+}
+
+/// Unbind FBO (return to default framebuffer).
+fn unbindFBO() void {
+    gl.BindFramebuffer.?(c.GL_FRAMEBUFFER, 0);
+}
+
+/// Draw a renderer's FBO texture as a quad at the given screen position.
+/// This composites the surface onto the main framebuffer.
+fn drawRendererFBOToScreen(rend: *Renderer, x: f32, y: f32, w: f32, h: f32, window_height: f32, window_width: f32) void {
+    if (!rend.isFBOReady()) return;
+
+    // Convert from top-left screen coords to OpenGL bottom-left coords
+    const gl_y = window_height - y - h;
+
+    // Vertices for textured quad (position + texcoord)
+    const vertices = [6][4]f32{
+        .{ x, gl_y + h, 0.0, 1.0 }, // top-left
+        .{ x, gl_y, 0.0, 0.0 }, // bottom-left
+        .{ x + w, gl_y, 1.0, 0.0 }, // bottom-right
+        .{ x, gl_y + h, 0.0, 1.0 }, // top-left
+        .{ x + w, gl_y, 1.0, 0.0 }, // bottom-right
+        .{ x + w, gl_y + h, 1.0, 1.0 }, // top-right
+    };
+
+    // Set up projection matrix for screen space
+    const projection = [16]f32{
+        2.0 / window_width, 0.0,                 0.0,  0.0,
+        0.0,                2.0 / window_height, 0.0,  0.0,
+        0.0,                0.0,                 -1.0, 0.0,
+        -1.0,               -1.0,                0.0,  1.0,
+    };
+
+    // Use the color texture shader (samples RGBA directly)
+    gl.UseProgram.?(simple_color_shader);
+    gl.UniformMatrix4fv.?(gl.GetUniformLocation.?(simple_color_shader, "projection"), 1, c.GL_FALSE, &projection);
+    gl.Uniform1f.?(gl.GetUniformLocation.?(simple_color_shader, "opacity"), 1.0);
+    gl.ActiveTexture.?(c.GL_TEXTURE0);
+    gl.BindTexture.?(c.GL_TEXTURE_2D, rend.getTexture());
+    gl.Uniform1i.?(gl.GetUniformLocation.?(simple_color_shader, "text"), 0);
+    gl.BindVertexArray.?(vao);
+    gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
+    gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
+    gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
+    gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6);
+    g_draw_call_count += 1;
+}
 
 /// Update the FPS counter. Call once per frame.
 fn updateFps() void {
@@ -4346,10 +4935,14 @@ fn onWin32Resize(width: i32, height: i32) void {
 
         for (0..g_tab_count) |ti| {
             if (g_tabs[ti]) |tab| {
-                tab.surface.render_state.mutex.lock();
-                tab.surface.terminal.resize(allocator, term_cols, term_rows) catch {};
-                tab.surface.render_state.mutex.unlock();
-                tab.surface.pty.resize(term_cols, term_rows);
+                // Resize all surfaces in this tab's split tree
+                var it = tab.tree.iterator();
+                while (it.next()) |entry| {
+                    entry.surface.render_state.mutex.lock();
+                    entry.surface.terminal.resize(allocator, term_cols, term_rows) catch {};
+                    entry.surface.render_state.mutex.unlock();
+                    entry.surface.pty.resize(term_cols, term_rows);
+                }
             }
         }
     }
@@ -4428,17 +5021,31 @@ fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void
     g_debug_fps = cfg.@"phantty-debug-fps";
     g_debug_draw_calls = cfg.@"phantty-debug-draw-calls";
 
+    // --- Split config ---
+    g_unfocused_split_opacity = cfg.@"unfocused-split-opacity";
+    g_focus_follows_mouse = cfg.@"focus-follows-mouse";
+    if (cfg.@"split-divider-color") |color| {
+        g_split_divider_color = color;
+    } else {
+        // Default: mid-gray
+        g_split_divider_color = .{ 0.3, 0.3, 0.3 };
+    }
+
     // Sync cursor style to all tabs' terminals (rendering reads from terminal state)
     for (0..g_tab_count) |ti| {
         if (g_tabs[ti]) |tab| {
-            tab.surface.render_state.mutex.lock();
-            tab.surface.terminal.screens.active.cursor.cursor_style = switch (g_cursor_style) {
-                .bar => .bar,
-                .block => .block,
-                .underline => .underline,
-                .block_hollow => .block_hollow,
-            };
-            tab.surface.render_state.mutex.unlock();
+            // Update all surfaces in this tab's split tree
+            var it = tab.tree.iterator();
+            while (it.next()) |entry| {
+                entry.surface.render_state.mutex.lock();
+                entry.surface.terminal.screens.active.cursor.cursor_style = switch (g_cursor_style) {
+                    .bar => .bar,
+                    .block => .block,
+                    .underline => .underline,
+                    .block_hollow => .block_hollow,
+                };
+                entry.surface.render_state.mutex.unlock();
+            }
         }
     }
 
@@ -4491,10 +5098,14 @@ fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void
         // Resize ALL tabs' terminals and PTYs to match
         for (0..g_tab_count) |ti| {
             if (g_tabs[ti]) |tab| {
-                tab.surface.render_state.mutex.lock();
-                tab.surface.terminal.resize(allocator, term_cols, term_rows) catch {};
-                tab.surface.render_state.mutex.unlock();
-                tab.surface.pty.resize(term_cols, term_rows);
+                // Resize all surfaces in this tab's split tree
+                var it = tab.tree.iterator();
+                while (it.next()) |entry| {
+                    entry.surface.render_state.mutex.lock();
+                    entry.surface.terminal.resize(allocator, term_cols, term_rows) catch {};
+                    entry.surface.render_state.mutex.unlock();
+                    entry.surface.pty.resize(term_cols, term_rows);
+                }
             }
         }
     } else {
@@ -4715,6 +5326,18 @@ const win32_input = struct {
             _ = spawnTab(g_allocator orelse return);
             return;
         }
+        // Ctrl+Shift+O = new split right (vertical divider)
+        if (ev.ctrl and ev.shift and ev.vk == 0x4F) { // 'O'
+            if (g_tab_rename_active) commitTabRename();
+            splitFocused(.right);
+            return;
+        }
+        // Ctrl+Shift+E = new split down (horizontal divider)
+        if (ev.ctrl and ev.shift and ev.vk == 0x45) { // 'E'
+            if (g_tab_rename_active) commitTabRename();
+            splitFocused(.down);
+            return;
+        }
         // When tab rename is active, handle special keys
         if (g_tab_rename_active) {
             handleRenameKey(ev);
@@ -4731,13 +5354,33 @@ const win32_input = struct {
             return;
         }
         // Ctrl+Shift+T and Ctrl+Shift+N are handled above (before rename guard)
-        // Ctrl+W = close tab, or close app if only 1 tab
+        // Ctrl+W = close focused split (or tab if no splits, or app if last tab)
         if (ev.ctrl and ev.vk == 0x57) { // 'W'
-            if (g_tab_count <= 1) {
-                g_should_close = true;
-            } else {
-                closeTab(g_active_tab);
+            closeFocusedSplit();
+            return;
+        }
+        // Ctrl+Alt+Arrows = goto split (spatial navigation)
+        if (ev.ctrl and ev.alt and !ev.shift) {
+            const dir: ?SplitTree.Spatial.Direction = switch (ev.vk) {
+                win32_backend.VK_LEFT => .left,
+                win32_backend.VK_RIGHT => .right,
+                win32_backend.VK_UP => .up,
+                win32_backend.VK_DOWN => .down,
+                else => null,
+            };
+            if (dir) |d| {
+                gotoSplit(.{ .spatial = d });
+                return;
             }
+        }
+        // Ctrl+Shift+[ = goto previous split
+        if (ev.ctrl and ev.shift and ev.vk == win32_backend.VK_OEM_4) { // '['
+            gotoSplit(.previous_wrapped);
+            return;
+        }
+        // Ctrl+Shift+] = goto next split
+        if (ev.ctrl and ev.shift and ev.vk == win32_backend.VK_OEM_6) { // ']'
+            gotoSplit(.next_wrapped);
             return;
         }
         // Ctrl+Tab = next tab
@@ -4916,6 +5559,9 @@ const win32_input = struct {
                     handleTabBarPress(xpos);
                     return;
                 }
+
+                // Click in terminal content area: update split focus
+                updateFocusFromMouse(@intFromFloat(xpos), @intFromFloat(ypos));
 
                 // Check if click is on the scrollbar
                 const win = g_window orelse return;
@@ -5113,6 +5759,11 @@ const win32_input = struct {
     fn handleMouseMove(ev: win32_backend.MouseMoveEvent) void {
         const xpos: f64 = @floatFromInt(ev.x);
         const ypos: f64 = @floatFromInt(ev.y);
+
+        // Focus follows mouse: check if mouse is over a different split
+        if (g_focus_follows_mouse) {
+            updateFocusFromMouse(@intFromFloat(xpos), @intFromFloat(ypos));
+        }
 
         // Update scrollbar hover state
         const win = g_window orelse return;
@@ -5688,13 +6339,17 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
                     // Resize ALL tabs' terminals and PTYs (lock each surface)
                     for (0..g_tab_count) |ti| {
                         if (g_tabs[ti]) |tab| {
-                            tab.surface.render_state.mutex.lock();
-                            tab.surface.terminal.resize(allocator, term_cols, term_rows) catch |err| {
-                                std.debug.print("Terminal resize error (tab {}): {}\n", .{ ti, err });
-                            };
-                            tab.surface.render_state.mutex.unlock();
-                            // PTY resize doesn't need the mutex (independent Win32 call)
-                            tab.surface.pty.resize(term_cols, term_rows);
+                            // Resize all surfaces in this tab's split tree
+                            var it = tab.tree.iterator();
+                            while (it.next()) |entry| {
+                                entry.surface.render_state.mutex.lock();
+                                entry.surface.terminal.resize(allocator, term_cols, term_rows) catch |err| {
+                                    std.debug.print("Terminal resize error (tab {}): {}\n", .{ ti, err });
+                                };
+                                entry.surface.render_state.mutex.unlock();
+                                // PTY resize doesn't need the mutex (independent Win32 call)
+                                entry.surface.pty.resize(term_cols, term_rows);
+                            }
                         }
                     }
 
@@ -5744,27 +6399,62 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
         // Check all tabs for pending bell notifications (set by IO thread)
         for (0..g_tab_count) |ti| {
             if (g_tabs[ti]) |tab| {
-                if (tab.surface.bell_pending.swap(false, .acquire)) {
-                    handleBell(tab.surface, win, ti == g_active_tab);
+                // Check all surfaces in this tab's split tree for pending bells
+                var it = tab.tree.iterator();
+                while (it.next()) |entry| {
+                    if (entry.surface.bell_pending.swap(false, .acquire)) {
+                        handleBell(entry.surface, win, ti == g_active_tab);
+                    }
                 }
             }
         }
 
-        if (activeSurface()) |surface| {
-            // Hold terminal mutex only for snapshot
-            var needs_rebuild: bool = false;
-            {
-                surface.render_state.mutex.lock();
-                defer surface.render_state.mutex.unlock();
-                updateCursorBlink();
-                needs_rebuild = updateTerminalCells(&surface.terminal);
-            }
-            if (needs_rebuild) rebuildCells();
+        if (activeTab()) |tab| {
+            // Compute split layout for the active tab
+            const content_x: i32 = @intFromFloat(padding);
+            const content_y: i32 = @intFromFloat(top_padding);
+            const content_w: i32 = @intFromFloat(@as(f32, @floatFromInt(fb_width)) - padding * 2);
+            const content_h: i32 = @intFromFloat(@as(f32, @floatFromInt(fb_height)) - top_padding - padding);
+            const split_count = computeSplitLayout(tab, content_x, content_y, content_w, content_h, cell_width, cell_height);
 
-            // GL rendering outside the lock
+            // Debug: print split count on first few frames
+            // GL rendering
             if (g_post_enabled) {
-                renderFrameWithPostFromCells(fb_width, fb_height, padding);
+                // Post-processing path: only render focused surface for now
+                if (activeSurface()) |surface| {
+                    var needs_rebuild: bool = false;
+                    {
+                        surface.render_state.mutex.lock();
+                        defer surface.render_state.mutex.unlock();
+                        updateCursorBlink();
+                        needs_rebuild = updateTerminalCells(&surface.terminal);
+                    }
+                    if (needs_rebuild) rebuildCells();
+                    renderFrameWithPostFromCells(fb_width, fb_height, padding);
+                }
+            } else if (split_count == 1) {
+                // Single surface (no splits): use original simple rendering path
+                if (activeSurface()) |surface| {
+                    var needs_rebuild: bool = false;
+                    {
+                        surface.render_state.mutex.lock();
+                        defer surface.render_state.mutex.unlock();
+                        updateCursorBlink();
+                        needs_rebuild = updateTerminalCells(&surface.terminal);
+                    }
+                    if (needs_rebuild) rebuildCells();
+
+                    gl.Viewport.?(0, 0, fb_width, fb_height);
+                    setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
+                    gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
+                    gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
+
+                    renderTitlebar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
+                    drawCells(@floatFromInt(fb_height), padding, top_padding);
+                    renderScrollbar(@floatFromInt(fb_width), @floatFromInt(fb_height), top_padding);
+                }
             } else {
+                // Multiple splits: render with scissor/viewport per surface
                 gl.Viewport.?(0, 0, fb_width, fb_height);
                 setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
                 gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
@@ -5772,8 +6462,49 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
 
                 renderTitlebar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
 
-                drawCells(@floatFromInt(fb_height), padding, top_padding);
+                // Render each split surface directly to screen using viewport
+                if (split_count > 0) {
+                    for (0..split_count) |i| {
+                        const rect = g_split_rects[i];
+                        const is_focused = (rect.handle == tab.focused);
 
+                        // Set viewport to this split's region
+                        // OpenGL viewport: (x, y, width, height) where y is from bottom
+                        const viewport_y = fb_height - rect.y - rect.height;
+                        gl.Viewport.?(rect.x, viewport_y, rect.width, rect.height);
+                        
+                        // Set projection for this viewport size
+                        setProjection(@floatFromInt(rect.width), @floatFromInt(rect.height));
+
+                        // Update cells for this surface
+                        {
+                            rect.surface.render_state.mutex.lock();
+                            defer rect.surface.render_state.mutex.unlock();
+                            if (is_focused) updateCursorBlink();
+                            g_force_rebuild = true;
+                            _ = updateTerminalCellsForSurface(&rect.surface.terminal, is_focused);
+                        }
+                        rebuildCells();
+
+                        // Draw cells - viewport handles positioning, so offset is 0
+                        // window_height is the viewport height (rect.height)
+                        drawCells(@floatFromInt(rect.height), 0, 0);
+
+                        // Draw unfocused overlay if not focused
+                        if (!is_focused) {
+                            renderUnfocusedOverlaySimple(@floatFromInt(rect.width), @floatFromInt(rect.height));
+                        }
+                    }
+
+                    // Restore full viewport for dividers
+                    gl.Viewport.?(0, 0, fb_width, fb_height);
+                    setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
+
+                    // Draw split dividers
+                    renderSplitDividers(tab, content_x, content_y, content_w, content_h, @floatFromInt(fb_height));
+                }
+
+                // Render scrollbar for focused surface only
                 renderScrollbar(@floatFromInt(fb_width), @floatFromInt(fb_height), top_padding);
             }
         } else if (!g_post_enabled) {

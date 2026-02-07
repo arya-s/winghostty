@@ -15,6 +15,8 @@ const Pty = @import("pty.zig").Pty;
 const renderer = @import("renderer.zig");
 const termio = @import("termio.zig");
 const Config = @import("config.zig");
+const Renderer = @import("Renderer.zig");
+const RendererThread = @import("RendererThread.zig");
 
 const windows = std.os.windows;
 
@@ -96,6 +98,16 @@ pty: Pty,
 selection: Selection,
 render_state: renderer.State,
 
+// ============================================================================
+// Per-surface renderer (Ghostty architecture)
+// ============================================================================
+
+/// Per-surface renderer with its own cell buffers
+surface_renderer: Renderer,
+
+/// Per-surface renderer thread (processes frames independently)
+renderer_thread: RendererThread,
+
 /// Dirty flag — set by IO thread (Phase 2), read by render loop.
 /// For Phase 1 this is always effectively true (we render every frame).
 dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
@@ -131,7 +143,14 @@ bell_indicator_time: i64 = 0,
 scrollbar_opacity: f32 = 0,
 scrollbar_show_time: i64 = 0,
 
+// ============================================================================
+// Reference counting (for split tree mutations)
+// ============================================================================
 
+/// Reference count for split tree management. When a surface is added to
+/// a split tree, it gets ref'd. When removed, it gets unref'd. When the
+/// ref count reaches 0, the surface is destroyed.
+ref_count: u32 = 1,
 
 /// IO thread handle (null until Phase 2).
 io_thread: ?std.Thread = null,
@@ -225,6 +244,10 @@ pub fn init(
     surface.exited = std.atomic.Value(bool).init(false);
     surface.io_thread = null;
 
+    // Initialize per-surface renderer (Ghostty architecture)
+    surface.surface_renderer = Renderer.init(surface);
+    surface.renderer_thread = RendererThread.init(&surface.surface_renderer, surface);
+
     // Init OSC state
     surface.window_title_len = 0;
     surface.title_override_len = 0;
@@ -247,6 +270,9 @@ pub fn init(
     surface.scrollbar_opacity = 0;
     surface.scrollbar_show_time = 0;
 
+    // Init ref count (for split tree ownership)
+    surface.ref_count = 1;
+
     // Spawn IO thread — must be last, after all state is initialized.
     // The thread starts reading from the PTY immediately.
     surface.io_thread = std.Thread.spawn(.{}, termio.Thread.threadMain, .{surface}) catch |err| {
@@ -256,13 +282,24 @@ pub fn init(
         return err;
     };
 
+    // Start renderer thread (Ghostty architecture - each surface has its own render thread)
+    surface.renderer_thread.start() catch |err| {
+        std.debug.print("Failed to spawn renderer thread: {}\n", .{err});
+        // Non-fatal: rendering will fall back to main thread updates
+        _ = &err;
+    };
+
     return surface;
 }
 
 /// Deinitialize and free a Surface.
 /// Stops the IO thread first, then cleans up PTY and terminal.
 pub fn deinit(self: *Surface, allocator: std.mem.Allocator) void {
-    // 1. Signal the IO thread to stop.
+    // 1. Stop the renderer thread first (it accesses terminal state)
+    self.renderer_thread.stop();
+    self.surface_renderer.deinit();
+
+    // 2. Signal the IO thread to stop.
     self.exited.store(true, .release);
 
     if (self.io_thread) |thread| {
@@ -281,10 +318,27 @@ pub fn deinit(self: *Surface, allocator: std.mem.Allocator) void {
         self.io_thread = null;
     }
 
-    // 2. Now safe to tear down everything — no other thread is accessing.
+    // 3. Now safe to tear down everything — no other thread is accessing.
     self.pty.deinit();
     self.terminal.deinit(allocator);
     allocator.destroy(self);
+}
+
+/// Increase the reference count of this surface.
+/// Used by SplitTree when a surface is added to a new tree.
+pub fn ref(self: *Surface) *Surface {
+    self.ref_count += 1;
+    return self;
+}
+
+/// Decrease the reference count of this surface.
+/// When the count reaches 0, the surface is destroyed.
+/// Used by SplitTree when a surface is removed from a tree.
+pub fn unref(self: *Surface, allocator: std.mem.Allocator) void {
+    self.ref_count -= 1;
+    if (self.ref_count == 0) {
+        self.deinit(allocator);
+    }
 }
 
 // ============================================================================

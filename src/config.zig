@@ -223,6 +223,20 @@ shell: []const u8 = "cmd",
 @"phantty-debug-fps": bool = false,
 @"phantty-debug-draw-calls": bool = false,
 
+// ============================================================================
+// Split pane configuration
+// ============================================================================
+
+/// Opacity of unfocused split panes (0.15 - 1.0). Lower values make
+/// unfocused splits more visible. Matches Ghostty's unfocused-split-opacity.
+@"unfocused-split-opacity": f32 = 0.7,
+
+/// Color of the divider line between split panes (hex #RRGGBB).
+@"split-divider-color": ?Color = null,
+
+/// When true, moving the mouse into a split pane focuses it.
+@"focus-follows-mouse": bool = false,
+
 /// Load an additional config file. Can be repeated. Relative paths are
 /// resolved relative to the file containing the directive. Prefix with
 /// `?` to make optional (missing file is silently ignored).
@@ -492,6 +506,26 @@ fn applyKeyValue(self: *Config, allocator: std.mem.Allocator, key: []const u8, v
             self.@"phantty-debug-draw-calls" = false;
         } else {
             log.warn("invalid phantty-debug-draw-calls: {s}", .{value});
+        }
+    } else if (std.mem.eql(u8, key, "unfocused-split-opacity")) {
+        if (std.fmt.parseFloat(f32, value)) |opacity| {
+            self.@"unfocused-split-opacity" = @max(0.15, @min(1.0, opacity));
+        } else |_| {
+            log.warn("invalid unfocused-split-opacity: {s}", .{value});
+        }
+    } else if (std.mem.eql(u8, key, "split-divider-color")) {
+        if (parseColor(value)) |color| {
+            self.@"split-divider-color" = color;
+        } else {
+            log.warn("invalid split-divider-color: {s}", .{value});
+        }
+    } else if (std.mem.eql(u8, key, "focus-follows-mouse")) {
+        if (std.mem.eql(u8, value, "true")) {
+            self.@"focus-follows-mouse" = true;
+        } else if (std.mem.eql(u8, value, "false")) {
+            self.@"focus-follows-mouse" = false;
+        } else {
+            log.warn("invalid focus-follows-mouse: {s}", .{value});
         }
     } else if (std.mem.eql(u8, key, "config-file")) {
         self.loadConfigFileDirective(allocator, value, base_dir);

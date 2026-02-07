@@ -47,6 +47,11 @@ title: ?[]const u8,
 debug_fps: bool,
 debug_draw_calls: bool,
 
+// Split config
+unfocused_split_opacity: f32,
+split_divider_color: ?Config.Color,
+focus_follows_mouse: bool,
+
 // Window management
 windows: std.ArrayListUnmanaged(*AppWindow),
 mutex: std.Thread.Mutex,
@@ -85,6 +90,9 @@ pub fn init(allocator: std.mem.Allocator, cfg: Config) !App {
         .title = cfg.title,
         .debug_fps = cfg.@"phantty-debug-fps",
         .debug_draw_calls = cfg.@"phantty-debug-draw-calls",
+        .unfocused_split_opacity = cfg.@"unfocused-split-opacity",
+        .split_divider_color = cfg.@"split-divider-color",
+        .focus_follows_mouse = cfg.@"focus-follows-mouse",
         .windows = .empty,
         .mutex = .{},
         .window_threads = .empty,
@@ -160,6 +168,9 @@ pub fn updateConfig(self: *App, cfg: *const Config) void {
     self.initial_rows = cfg.@"window-height";
     self.debug_fps = cfg.@"phantty-debug-fps";
     self.debug_draw_calls = cfg.@"phantty-debug-draw-calls";
+    self.unfocused_split_opacity = cfg.@"unfocused-split-opacity";
+    self.split_divider_color = cfg.@"split-divider-color";
+    self.focus_follows_mouse = cfg.@"focus-follows-mouse";
 }
 
 // ============================================================================
