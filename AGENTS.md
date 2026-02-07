@@ -13,6 +13,13 @@ When working on implementing a plan from the plans directory:
  * never deem something too big and choosing not to do it in the name of pragmatism
  * always ask if you have trouble because something is too big, we will break it down together and work on it step by step
 
+## Planning
+
+When planning, always compare what we are planning to do with https://github.com/ghostty-org/ghostty.
+This is the gold standard, we want to be as close to their implementation as possible.
+
+Use the github cli gh to browse https://github.com/ghostty-org/ghostty and always add descriptions on how ghostty does things. 
+
 ## Build Commands
 
 ```bash
