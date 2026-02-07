@@ -38,6 +38,11 @@ shader_path: ?[]const u8,
 initial_cols: u16,
 initial_rows: u16,
 
+// Window state options
+maximize: bool,
+fullscreen: bool,
+title: ?[]const u8,
+
 // Debug flags
 debug_fps: bool,
 debug_draw_calls: bool,
@@ -75,6 +80,9 @@ pub fn init(allocator: std.mem.Allocator, cfg: Config) !App {
         .shader_path = cfg.@"custom-shader",
         .initial_cols = if (cfg.@"window-width" > 0) cfg.@"window-width" else 80,
         .initial_rows = if (cfg.@"window-height" > 0) cfg.@"window-height" else 24,
+        .maximize = cfg.maximize,
+        .fullscreen = cfg.fullscreen,
+        .title = cfg.title,
         .debug_fps = cfg.@"phantty-debug-fps",
         .debug_draw_calls = cfg.@"phantty-debug-draw-calls",
         .windows = .empty,

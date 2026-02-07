@@ -229,6 +229,51 @@ shell: []const u8 = "cmd",
 @"config-file": ?[]const u8 = null,
 
 // ============================================================================
+// Color Overrides (applied on top of theme)
+// ============================================================================
+
+/// Background color override. Overrides the theme's background color.
+/// Specified as hex (#RRGGBB or RRGGBB).
+background: ?Color = null,
+
+/// Foreground color override. Overrides the theme's foreground color.
+/// Specified as hex (#RRGGBB or RRGGBB).
+foreground: ?Color = null,
+
+/// Cursor color override. Overrides the theme's cursor color.
+/// Specified as hex (#RRGGBB or RRGGBB).
+@"cursor-color": ?Color = null,
+
+/// Cursor text color override. Overrides the theme's cursor text color.
+/// Specified as hex (#RRGGBB or RRGGBB).
+@"cursor-text": ?Color = null,
+
+/// Selection background color override.
+/// Specified as hex (#RRGGBB or RRGGBB).
+@"selection-background": ?Color = null,
+
+/// Selection foreground color override.
+/// Specified as hex (#RRGGBB or RRGGBB).
+@"selection-foreground": ?Color = null,
+
+/// Palette color overrides. Indexed 0-15 for the 16 ANSI colors.
+/// Use syntax: palette = N=#RRGGBB (e.g., palette = 0=#000000)
+palette_overrides: [16]?Color = .{null} ** 16,
+
+// ============================================================================
+// Window Options
+// ============================================================================
+
+/// Force the window title to this value. Programs cannot override it.
+title: ?[]const u8 = null,
+
+/// Start the window maximized.
+maximize: bool = false,
+
+/// Start the window in fullscreen mode.
+fullscreen: bool = false,
+
+// ============================================================================
 // Resolved State (not serialized)
 // ============================================================================
 
@@ -282,6 +327,9 @@ pub fn load(allocator: std.mem.Allocator) !Config {
     if (self.theme) |theme_name| {
         self.resolveTheme(allocator, theme_name);
     }
+
+    // 4. Apply color overrides on top of resolved theme
+    self.applyColorOverrides();
 
     return self;
 }
@@ -447,6 +495,81 @@ fn applyKeyValue(self: *Config, allocator: std.mem.Allocator, key: []const u8, v
         }
     } else if (std.mem.eql(u8, key, "config-file")) {
         self.loadConfigFileDirective(allocator, value, base_dir);
+    } else if (std.mem.eql(u8, key, "background")) {
+        if (parseColor(value)) |color| {
+            self.background = color;
+        } else {
+            log.warn("invalid background color: {s}", .{value});
+        }
+    } else if (std.mem.eql(u8, key, "foreground")) {
+        if (parseColor(value)) |color| {
+            self.foreground = color;
+        } else {
+            log.warn("invalid foreground color: {s}", .{value});
+        }
+    } else if (std.mem.eql(u8, key, "cursor-color")) {
+        if (parseColor(value)) |color| {
+            self.@"cursor-color" = color;
+        } else {
+            log.warn("invalid cursor-color: {s}", .{value});
+        }
+    } else if (std.mem.eql(u8, key, "cursor-text")) {
+        if (parseColor(value)) |color| {
+            self.@"cursor-text" = color;
+        } else {
+            log.warn("invalid cursor-text: {s}", .{value});
+        }
+    } else if (std.mem.eql(u8, key, "selection-background")) {
+        if (parseColor(value)) |color| {
+            self.@"selection-background" = color;
+        } else {
+            log.warn("invalid selection-background: {s}", .{value});
+        }
+    } else if (std.mem.eql(u8, key, "selection-foreground")) {
+        if (parseColor(value)) |color| {
+            self.@"selection-foreground" = color;
+        } else {
+            log.warn("invalid selection-foreground: {s}", .{value});
+        }
+    } else if (std.mem.eql(u8, key, "palette")) {
+        // Syntax: palette = N=COLOR (e.g., palette = 0=#000000)
+        if (std.mem.indexOf(u8, value, "=")) |eq_idx| {
+            const idx_str = value[0..eq_idx];
+            const color_str = value[eq_idx + 1 ..];
+            const idx = std.fmt.parseInt(u8, idx_str, 10) catch {
+                log.warn("invalid palette index: {s}", .{idx_str});
+                return;
+            };
+            if (idx >= 16) {
+                log.warn("palette index out of range (0-15): {}", .{idx});
+                return;
+            }
+            if (parseColor(color_str)) |color| {
+                self.palette_overrides[idx] = color;
+            } else {
+                log.warn("invalid palette color: {s}", .{color_str});
+            }
+        } else {
+            log.warn("invalid palette syntax, expected N=COLOR: {s}", .{value});
+        }
+    } else if (std.mem.eql(u8, key, "title")) {
+        self.title = self.dupeString(allocator, value) orelse return;
+    } else if (std.mem.eql(u8, key, "maximize")) {
+        if (std.mem.eql(u8, value, "true")) {
+            self.maximize = true;
+        } else if (std.mem.eql(u8, value, "false")) {
+            self.maximize = false;
+        } else {
+            log.warn("invalid maximize value: {s}", .{value});
+        }
+    } else if (std.mem.eql(u8, key, "fullscreen")) {
+        if (std.mem.eql(u8, value, "true")) {
+            self.fullscreen = true;
+        } else if (std.mem.eql(u8, value, "false")) {
+            self.fullscreen = false;
+        } else {
+            log.warn("invalid fullscreen value: {s}", .{value});
+        }
     } else {
         // Silently ignore unknown keys (theme files reuse the same format
         // and may contain keys we don't handle, like palette).
@@ -586,6 +709,35 @@ fn resolveTheme(self: *Config, allocator: std.mem.Allocator, theme_name: []const
     log.warn("theme not found: {s}", .{theme_name});
 }
 
+/// Apply top-level color overrides to the resolved theme.
+/// Called after theme resolution so user overrides take precedence.
+fn applyColorOverrides(self: *Config) void {
+    if (self.background) |color| {
+        self.resolved_theme.background = color;
+    }
+    if (self.foreground) |color| {
+        self.resolved_theme.foreground = color;
+    }
+    if (self.@"cursor-color") |color| {
+        self.resolved_theme.cursor_color = color;
+    }
+    if (self.@"cursor-text") |color| {
+        self.resolved_theme.cursor_text = color;
+    }
+    if (self.@"selection-background") |color| {
+        self.resolved_theme.selection_background = color;
+    }
+    if (self.@"selection-foreground") |color| {
+        self.resolved_theme.selection_foreground = color;
+    }
+    // Apply palette overrides
+    for (self.palette_overrides, 0..) |maybe_color, i| {
+        if (maybe_color) |color| {
+            self.resolved_theme.palette[i] = color;
+        }
+    }
+}
+
 // ============================================================================
 // Help
 // ============================================================================
@@ -622,9 +774,25 @@ pub fn printHelp() void {
         \\  --scrollback-limit <bytes>   Scrollback buffer size (default: 10000000)
         \\  --config-file <path>         Load additional config file (prefix ? for optional)
         \\
+        \\Color Options (override theme):
+        \\  --background <color>         Background color (#RRGGBB or RRGGBB)
+        \\  --foreground <color>         Foreground/text color
+        \\  --cursor-color <color>       Cursor color
+        \\  --cursor-text <color>        Text color under cursor
+        \\  --selection-background <color>  Selection background color
+        \\  --selection-foreground <color>  Selection text color
+        \\  --palette <N=color>          Set ANSI color N (0-15), e.g. --palette 1=#ff0000
+        \\
+        \\Window Options:
+        \\  --title <text>               Force window title (programs cannot override)
+        \\  --maximize <bool>            Start maximized (default: false)
+        \\  --fullscreen <bool>          Start in fullscreen (default: false)
+        \\
+        \\Debug:
         \\  --phantty-debug-fps <bool>   Show FPS overlay (default: false)
         \\  --phantty-debug-draw-calls <bool> Show draw call count overlay (default: false)
         \\
+        \\Commands:
         \\  --show-config-path           Print the config file path and exit
         \\  --list-fonts                 List all available system fonts
         \\  --list-themes                List all available themes
@@ -640,11 +808,15 @@ pub fn printHelp() void {
         \\  font-size = 16
         \\  theme = Catppuccin Mocha
         \\  cursor-style = bar
+        \\  background = #1a1b26
+        \\  foreground = #c0caf5
+        \\  palette = 1=#f7768e
         \\
         \\Examples:
         \\  phantty --font-family "Cascadia Code"
         \\  phantty --font-family "JetBrains Mono" --font-style bold
         \\  phantty --cursor-style bar --cursor-style-blink=false
+        \\  phantty --background "#1a1b26" --foreground "#c0caf5"
         \\  phantty --theme poimandres
         \\  phantty --window-height 40 --window-width 120
         \\
@@ -754,12 +926,25 @@ const default_config_template =
     \\# Theme (name or file path)
     \\# theme =
     \\
+    \\# Color overrides (override theme colors)
+    \\# background = #282c34
+    \\# foreground = #ffffff
+    \\# cursor-color = #ffffff
+    \\# cursor-text = #000000
+    \\# selection-background = #ffffff
+    \\# selection-foreground = #282c34
+    \\# palette = 0=#1d1f21
+    \\# palette = 1=#cc6666
+    \\
     \\# Custom post-processing shader (GLSL)
     \\# custom-shader =
     \\
     \\# Window
     \\# window-height = 28
     \\# window-width = 110
+    \\# title =
+    \\# maximize = false
+    \\# fullscreen = false
     \\
     \\# Shell (cmd, powershell, pwsh, wsl, or a custom path)
     \\# shell = cmd

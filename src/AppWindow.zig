@@ -68,6 +68,9 @@ pub fn init(allocator: std.mem.Allocator, app: *App) !AppWindow {
     g_requested_weight = app.font_weight;
     g_font_size = app.font_size;
     g_shader_path = app.shader_path;
+    g_start_maximize = app.maximize;
+    g_start_fullscreen = app.fullscreen;
+    g_forced_title = app.title;
 
     // Get initial CWD for this window (if any) - copy into thread-local buffer
     g_initial_cwd_len = app.takeInitialCwd(&g_initial_cwd_buf);
@@ -120,6 +123,9 @@ threadlocal var g_initial_cwd_len: usize = 0;
 threadlocal var g_requested_font: []const u8 = "";
 threadlocal var g_requested_weight: directwrite.DWRITE_FONT_WEIGHT = .NORMAL;
 threadlocal var g_shader_path: ?[]const u8 = null;
+threadlocal var g_start_maximize: bool = false;
+threadlocal var g_start_fullscreen: bool = false;
+threadlocal var g_forced_title: ?[]const u8 = null;
 
 // Global theme (set at startup via config)
 threadlocal var g_theme: Theme = Theme.default();
@@ -510,8 +516,12 @@ threadlocal var g_last_frame_time_ms: i64 = 0; // for delta-time computation
 const TabState = struct {
     surface: *Surface,
 
-    /// Get the display title for this tab (delegates to Surface)
+    /// Get the display title for this tab (delegates to Surface, unless forced)
     fn getTitle(self: *const TabState) []const u8 {
+        // If a forced title is set via config, always use that
+        if (g_forced_title) |forced| {
+            return forced;
+        }
         return self.surface.getTitle();
     }
 
@@ -5394,6 +5404,7 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
         std.unicode.utf8ToUtf16LeStringLiteral("Phantty"),
         init_x,
         init_y,
+        g_start_maximize and !g_start_fullscreen, // Don't maximize if going fullscreen
     ) catch |err| {
         std.debug.print("Failed to create Win32 window: {}\n", .{err});
         return err;
@@ -5645,6 +5656,13 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
 
     // Initialize FPS timer
     g_fps_last_time = std.time.milliTimestamp();
+
+    // Apply fullscreen if requested (after all initialization is complete)
+    std.debug.print("g_start_fullscreen = {}\n", .{g_start_fullscreen});
+    if (g_start_fullscreen) {
+        std.debug.print("Entering fullscreen at startup...\n", .{});
+        win32_input.toggleFullscreen();
+    }
 
     // Main loop — shared logic with backend-specific window management
     var running = true;

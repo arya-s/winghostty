@@ -531,7 +531,14 @@ pub const Window = struct {
     /// 2. Load wglCreateContextAttribsARB from the legacy context
     /// 3. Create the real window + OpenGL 3.3 core profile context
     /// 4. Destroy the dummy window
-    pub fn init(width: i32, height: i32, title: [*:0]const WCHAR, x: ?i32, y: ?i32) !Window {
+    pub fn init(
+        width: i32,
+        height: i32,
+        title: [*:0]const WCHAR,
+        x: ?i32,
+        y: ?i32,
+        maximize: bool,
+    ) !Window {
         const hInstance = GetModuleHandleW(null);
 
         // --- Step 1: Register window classes ---
@@ -747,13 +754,26 @@ pub const Window = struct {
             width, height, rect.right - rect.left, rect.bottom - rect.top,
         });
 
-        return Window{
+        var window = Window{
             .hwnd = hwnd,
             .hdc = hdc,
             .hglrc = hglrc,
             .width = rect.right - rect.left,
             .height = rect.bottom - rect.top,
+            .is_fullscreen = false, // Fullscreen is applied later via toggleFullscreen
         };
+
+        // Apply initial window state (maximize)
+        // Note: fullscreen is handled separately via toggleFullscreen after init
+        if (maximize) {
+            _ = ShowWindow(hwnd, SW_MAXIMIZE);
+            // Update size after maximize
+            _ = GetClientRect(hwnd, &rect);
+            window.width = rect.right - rect.left;
+            window.height = rect.bottom - rect.top;
+        }
+
+        return window;
     }
 
     pub fn deinit(self: *Window) void {
