@@ -23,11 +23,12 @@ Use the github cli gh to browse https://github.com/ghostty-org/ghostty and alway
 ## Build Commands
 
 ```bash
-make release   # Default — always use this for builds.
+make debug     # Default — use this for development builds.
+make release   # Optimized ReleaseFast build with Windows GUI subsystem (no console window).
 make clean     # Remove zig-out/ and .zig-cache/
 ```
 
-**Always use `make release`** for all builds. This produces a `ReleaseFast` optimized binary with the Windows GUI subsystem (no background console window).
+**Always use `make debug`** for builds during development. Only use `make release` for final/shipping builds.
 
 ## Project Structure
 
