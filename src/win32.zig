@@ -1207,14 +1207,9 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
                     w.mouse_button_events.push(.{ .button = .left, .action = .double_click, .x = x, .y = y });
                     return 0;
                 } else {
-                    // Multi-tab: suppress on + button, close buttons, and caption area
+                    // Multi-tab: suppress on + button (and gap to its right), close buttons, and caption area
                     if (x >= caption_x) return 0;
-                    if (x >= w.plus_btn_x_start and x < w.plus_btn_x_end) return 0;
-                    if (w.tab_count > 2) {
-                        const tab_shift = @divTrunc(w.plus_btn_x_start, @as(i32, @intCast(w.tab_count)));
-                        const prev_start = w.plus_btn_x_start - tab_shift;
-                        if (x >= prev_start and x < w.plus_btn_x_end) return 0;
-                    }
+                    if (x >= w.plus_btn_x_start) return 0;
                     for (0..@min(w.tab_count, 16)) |i| {
                         if (x >= w.close_btn_x_start[i] and x < w.close_btn_x_end[i]) return 0;
                     }

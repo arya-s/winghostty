@@ -2816,6 +2816,34 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
                     text_x += titlebarGlyphAdvance(cp);
                 }
 
+                // Render rename selection highlight or cursor (same as non-truncated path)
+                if (is_renaming) {
+                    const trunc_width = text_x - text_x_start;
+                    if (g_tab_rename_select_all and trunc_width > 0) {
+                        // Highlight behind the text — use cursor color
+                        renderQuad(text_x_start, text_y, trunc_width, g_titlebar_cell_height, g_theme.cursor_color);
+                        // Re-render text on top in contrasting color
+                        const sel_text_color = g_theme.cursor_text orelse g_theme.background;
+                        var sel_x = text_x_start;
+                        for (codepoints[0..start_end]) |cp| {
+                            renderTitlebarChar(cp, sel_x, text_y, sel_text_color);
+                            sel_x += titlebarGlyphAdvance(cp);
+                        }
+                        renderTitlebarChar(ellipsis_char, sel_x, text_y, sel_text_color);
+                        sel_x += ellipsis_w;
+                        for (codepoints[end_start..cp_count]) |cp| {
+                            renderTitlebarChar(cp, sel_x, text_y, sel_text_color);
+                            sel_x += titlebarGlyphAdvance(cp);
+                        }
+                    } else if (!g_tab_rename_select_all) {
+                        // Blink cursor at end (cursor position tracking in truncated
+                        // text is approximate — place at end for simplicity)
+                        if (g_cursor_blink_visible) {
+                            renderQuad(text_x, text_y, 1.0, g_titlebar_cell_height, text_active);
+                        }
+                    }
+                }
+
                 // Record text bounds for double-click hit testing
                 g_tab_text_x_start[tab_idx] = text_x_start;
                 g_tab_text_x_end[tab_idx] = text_x;
