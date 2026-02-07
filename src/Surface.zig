@@ -93,6 +93,7 @@ got_osc7_this_batch: bool = false,
 // ============================================================================
 
 /// Initialize a new Surface with its own PTY and terminal.
+/// If cwd is provided, the shell will start in that directory.
 pub fn init(
     allocator: std.mem.Allocator,
     cols: u16,
@@ -101,6 +102,7 @@ pub fn init(
     scrollback_limit: u32,
     cursor_style: Config.CursorStyle,
     cursor_blink: bool,
+    cwd: ?[*:0]const u16,
 ) !*Surface {
     const surface = try allocator.create(Surface);
     errdefer allocator.destroy(surface);
@@ -126,7 +128,7 @@ pub fn init(
     surface.terminal.modes.set(.cursor_blinking, cursor_blink);
 
     // Spawn PTY
-    surface.pty = Pty.spawn(cols, rows, shell_cmd) catch |err| {
+    surface.pty = Pty.spawn(cols, rows, shell_cmd, cwd) catch |err| {
         surface.terminal.deinit(allocator);
         return err;
     };

@@ -69,6 +69,9 @@ pub fn init(allocator: std.mem.Allocator, app: *App) !AppWindow {
     g_font_size = app.font_size;
     g_shader_path = app.shader_path;
 
+    // Get initial CWD for this window (if any)
+    g_initial_cwd = app.takeInitialCwd();
+
     return AppWindow{
         .allocator = allocator,
         .app = app,
@@ -108,6 +111,9 @@ pub fn deinit(self: *AppWindow) void {
 
 // App pointer for requestNewWindow
 threadlocal var g_app: ?*App = null;
+
+// Initial CWD for this window (used when spawning the first tab)
+threadlocal var g_initial_cwd: ?[*:0]const u16 = null;
 
 // Stored config values for deferred initialization
 threadlocal var g_requested_font: []const u8 = "";
@@ -217,7 +223,8 @@ fn activeSurface() ?*Surface {
 
 /// Spawn a new tab with its own Surface (PTY + terminal).
 /// Called for both the initial tab and Ctrl+Shift+T.
-fn spawnTab(allocator: std.mem.Allocator) bool {
+/// If cwd is provided, the shell starts in that directory.
+fn spawnTabWithCwd(allocator: std.mem.Allocator, cwd: ?[*:0]const u16) bool {
     if (g_tab_count >= MAX_TABS) return false;
 
     // Create Surface (owns PTY + terminal + OSC state)
@@ -229,6 +236,7 @@ fn spawnTab(allocator: std.mem.Allocator) bool {
         g_scrollback_limit,
         g_cursor_style,
         g_cursor_blink,
+        cwd,
     ) catch {
         std.debug.print("Failed to create Surface for new tab\n", .{});
         return false;
@@ -253,6 +261,11 @@ fn spawnTab(allocator: std.mem.Allocator) bool {
 
     std.debug.print("New tab spawned (count={}), active: {}\n", .{ g_tab_count, g_active_tab });
     return true;
+}
+
+/// Spawn a new tab with default CWD (no inheritance).
+fn spawnTab(allocator: std.mem.Allocator) bool {
+    return spawnTabWithCwd(allocator, null);
 }
 
 fn closeTab(idx: usize) void {
@@ -3901,7 +3914,8 @@ const win32_input = struct {
         if (ev.ctrl and ev.shift and ev.vk == 0x4E) { // 'N'
             if (g_app) |app| {
                 const hwnd = if (g_window) |w| w.hwnd else null;
-                app.requestNewWindow(hwnd);
+                // TODO: pass CWD from active tab for working directory inheritance
+                app.requestNewWindow(hwnd, null);
             }
             return;
         }
@@ -4479,7 +4493,10 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
     const shader_path = g_shader_path;
 
     // Spawn the initial tab (PTY + terminal)
-    if (!spawnTab(allocator)) {
+    // Use the initial CWD if one was set (working directory inheritance)
+    const initial_cwd = g_initial_cwd;
+    g_initial_cwd = null; // Clear after use
+    if (!spawnTabWithCwd(allocator, initial_cwd)) {
         std.debug.print("Failed to spawn initial tab\n", .{});
         return error.SpawnFailed;
     }

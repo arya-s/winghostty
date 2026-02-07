@@ -49,6 +49,10 @@ window_threads: std.ArrayListUnmanaged(std.Thread),
 next_window_x: ?i32 = null,
 next_window_y: ?i32 = null,
 
+// CWD for next spawned window (working directory inheritance)
+next_window_cwd: [260]u16 = undefined,
+next_window_cwd_len: usize = 0,
+
 // ============================================================================
 // Initialization
 // ============================================================================
@@ -113,6 +117,19 @@ pub fn getShellCmd(self: *const App) [:0]const u16 {
     return self.shell_cmd_buf[0..self.shell_cmd_len :0];
 }
 
+/// Take the initial CWD for a new window (clears it after reading).
+/// Returns null if no CWD was set.
+pub fn takeInitialCwd(self: *App) ?[*:0]const u16 {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
+    if (self.next_window_cwd_len == 0) return null;
+
+    const len = self.next_window_cwd_len;
+    self.next_window_cwd_len = 0;
+    return self.next_window_cwd[0..len :0];
+}
+
 // ============================================================================
 // Window Management
 // ============================================================================
@@ -153,17 +170,30 @@ pub fn run(self: *App) !void {
 /// Request a new window to be spawned on a separate thread.
 /// Called from Ctrl+Shift+N in any window.
 /// If parent_hwnd is provided, the new window will cascade from that position.
-pub fn requestNewWindow(self: *App, parent_hwnd: ?win32_backend.HWND) void {
+/// If cwd is provided, the new window's first tab will start in that directory.
+pub fn requestNewWindow(self: *App, parent_hwnd: ?win32_backend.HWND, cwd: ?[]const u16) void {
+    self.mutex.lock();
+
     // Get parent window position for cascading
     if (parent_hwnd) |hwnd| {
         var rect: win32_backend.RECT = undefined;
         if (win32_backend.GetWindowRect(hwnd, &rect) != 0) {
-            self.mutex.lock();
             self.next_window_x = rect.left + 30;
             self.next_window_y = rect.top + 30;
-            self.mutex.unlock();
         }
     }
+
+    // Store CWD for new window
+    if (cwd) |dir| {
+        const len = @min(dir.len, self.next_window_cwd.len - 1);
+        @memcpy(self.next_window_cwd[0..len], dir[0..len]);
+        self.next_window_cwd[len] = 0;
+        self.next_window_cwd_len = len;
+    } else {
+        self.next_window_cwd_len = 0;
+    }
+
+    self.mutex.unlock();
 
     const thread = std.Thread.spawn(.{}, windowThreadMain, .{self}) catch |err| {
         std.debug.print("Failed to spawn window thread: {}\n", .{err});

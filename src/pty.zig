@@ -123,7 +123,7 @@ pub const Pty = struct {
     cols: u16,
     rows: u16,
 
-    pub fn spawn(cols: u16, rows: u16, command: [*:0]const u16) !Pty {
+    pub fn spawn(cols: u16, rows: u16, command: [*:0]const u16, cwd: ?[*:0]const u16) !Pty {
         var self: Pty = undefined;
         self.cols = cols;
         self.rows = rows;
@@ -219,7 +219,7 @@ pub const Pty = struct {
             0, // Don't inherit handles
             EXTENDED_STARTUPINFO_PRESENT,
             null,
-            null,
+            cwd,
             &startup_info,
             &self.process_info,
         ) == 0) {
