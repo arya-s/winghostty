@@ -2663,6 +2663,21 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
             }
         }
 
+        // Sync close button position for double-click suppression in WndProc
+        if (g_window) |w| {
+            if (num_tabs > 1 and tab_idx < 10 and g_titlebar_face != null) {
+                // Close button is centered on shortcut position at right edge of tab
+                const tp: f32 = 12; // tab_pad
+                const digit: u32 = if (tab_idx == 9) '0' else @as(u32, @intCast('1' + tab_idx));
+                const sc_w = titlebarGlyphAdvance('^') + titlebarGlyphAdvance(digit);
+                const re = cursor_x + tab_w - tp;
+                const sc_center = re - sc_w / 2;
+                const cb_x = sc_center - TAB_CLOSE_BTN_W / 2;
+                w.close_btn_x_start[tab_idx] = @intFromFloat(cb_x);
+                w.close_btn_x_end[tab_idx] = @intFromFloat(cb_x + TAB_CLOSE_BTN_W);
+            }
+        }
+
         cursor_x += tab_w;
     }
 

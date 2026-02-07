@@ -503,6 +503,9 @@ pub const Window = struct {
     /// Plus button x range (synced from renderer, used for double-click suppression)
     plus_btn_x_start: i32 = 0,
     plus_btn_x_end: i32 = 0,
+    /// Per-tab close button x ranges (synced from renderer, used for double-click suppression)
+    close_btn_x_start: [16]i32 = .{0} ** 16,
+    close_btn_x_end: [16]i32 = .{0} ** 16,
     /// Current mouse position in client coordinates (for hover tracking)
     mouse_x: i32 = 0,
     mouse_y: i32 = 0,
@@ -1208,7 +1211,7 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
                     }
                     return 0;
                 } else {
-                    // Multi-tab: allow maximize on tabs, but NOT on + button or caption area
+                    // Multi-tab: allow maximize on tabs, but NOT on + button, close buttons, or caption area
                     if (x >= caption_x) return 0;
                     // Check current + button position and where it was before
                     // the first click created a tab (which shifted + to the right)
@@ -1218,6 +1221,10 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
                         const tab_shift = @divTrunc(w.plus_btn_x_start, @as(i32, @intCast(w.tab_count)));
                         const prev_start = w.plus_btn_x_start - tab_shift;
                         if (x >= prev_start and x < w.plus_btn_x_end) return 0;
+                    }
+                    // Check per-tab close button positions
+                    for (0..@min(w.tab_count, 16)) |i| {
+                        if (x >= w.close_btn_x_start[i] and x < w.close_btn_x_end[i]) return 0;
                     }
                     // On a tab — maximize/restore
                     if (IsZoomed(hwnd) != 0) {
