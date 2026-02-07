@@ -3826,6 +3826,11 @@ fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void
     };
     defer cfg.deinit(allocator);
 
+    // Update App's cached config so new windows get the new settings
+    if (g_app) |app| {
+        app.updateConfig(&cfg);
+    }
+
     if (g_window == null) return;
     const ft_lib = g_ft_lib orelse return;
 

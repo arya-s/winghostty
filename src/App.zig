@@ -134,6 +134,26 @@ pub fn takeInitialCwd(self: *App, out_buf: *[260]u16) usize {
     return len;
 }
 
+/// Update cached config values from a reloaded config.
+/// Called by windows when they detect a config change via hot-reload.
+pub fn updateConfig(self: *App, cfg: *const Config) void {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
+    self.scrollback_limit = cfg.@"scrollback-limit";
+    self.font_family = cfg.@"font-family";
+    self.font_weight = cfg.@"font-style".toDwriteWeight();
+    self.font_size = cfg.@"font-size";
+    self.cursor_style = cfg.@"cursor-style";
+    self.cursor_blink = cfg.@"cursor-style-blink";
+    self.theme = cfg.resolved_theme;
+    self.shader_path = cfg.@"custom-shader";
+    self.initial_cols = cfg.@"window-width";
+    self.initial_rows = cfg.@"window-height";
+    self.debug_fps = cfg.@"phantty-debug-fps";
+    self.debug_draw_calls = cfg.@"phantty-debug-draw-calls";
+}
+
 // ============================================================================
 // Window Management
 // ============================================================================
