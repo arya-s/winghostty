@@ -286,7 +286,7 @@ extern "user32" fn CreateWindowExW(
     hInstance: ?HINSTANCE,
     lpParam: ?*anyopaque,
 ) callconv(.winapi) ?HWND;
-extern "user32" fn ShowWindow(hWnd: HWND, nCmdShow: INT) callconv(.winapi) BOOL;
+pub extern "user32" fn ShowWindow(hWnd: HWND, nCmdShow: INT) callconv(.winapi) BOOL;
 extern "user32" fn DestroyWindow(hWnd: HWND) callconv(.winapi) BOOL;
 extern "user32" fn DefWindowProcW(hWnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT;
 extern "user32" fn GetMessageW(lpMsg: *MSG, hWnd: ?HWND, wMsgFilterMin: UINT, wMsgFilterMax: UINT) callconv(.winapi) BOOL;
@@ -434,7 +434,7 @@ pub const CharEvent = struct {
 /// Mouse button events
 pub const MouseButtonEvent = struct {
     button: enum { left, right, middle },
-    action: enum { press, release },
+    action: enum { press, release, double_click },
     x: i32,
     y: i32,
 };
@@ -1194,8 +1194,7 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
         WM_LBUTTONDBLCLK => {
             const x: i32 = @as(i16, @bitCast(@as(u16, @intCast(lParam & 0xFFFF))));
             const y: i32 = @as(i16, @bitCast(@as(u16, @intCast((lParam >> 16) & 0xFFFF))));
-            // Double-click in titlebar: maximize/restore
-            // Only if in the draggable area (not on tabs or + button)
+            // Double-click in titlebar
             if (y < w.titlebar_height) {
                 var client_rect: RECT = undefined;
                 _ = GetClientRect(hwnd, &client_rect);
@@ -1203,35 +1202,24 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
                 const caption_x = window_width - getCaptionButtonWidth();
 
                 if (w.tab_count <= 1) {
-                    // Single tab: entire titlebar is draggable, allow maximize
-                    if (IsZoomed(hwnd) != 0) {
-                        _ = ShowWindow(hwnd, SW_RESTORE);
-                    } else {
-                        _ = ShowWindow(hwnd, SW_MAXIMIZE);
-                    }
+                    // Single tab: double-click on tab area = rename, on empty area = maximize
+                    // Send double_click event; AppWindow decides rename vs maximize
+                    w.mouse_button_events.push(.{ .button = .left, .action = .double_click, .x = x, .y = y });
                     return 0;
                 } else {
-                    // Multi-tab: allow maximize on tabs, but NOT on + button, close buttons, or caption area
+                    // Multi-tab: suppress on + button, close buttons, and caption area
                     if (x >= caption_x) return 0;
-                    // Check current + button position and where it was before
-                    // the first click created a tab (which shifted + to the right)
                     if (x >= w.plus_btn_x_start and x < w.plus_btn_x_end) return 0;
-                    // Also check one tab-width to the left (where + was before new tab)
                     if (w.tab_count > 2) {
                         const tab_shift = @divTrunc(w.plus_btn_x_start, @as(i32, @intCast(w.tab_count)));
                         const prev_start = w.plus_btn_x_start - tab_shift;
                         if (x >= prev_start and x < w.plus_btn_x_end) return 0;
                     }
-                    // Check per-tab close button positions
                     for (0..@min(w.tab_count, 16)) |i| {
                         if (x >= w.close_btn_x_start[i] and x < w.close_btn_x_end[i]) return 0;
                     }
-                    // On a tab — maximize/restore
-                    if (IsZoomed(hwnd) != 0) {
-                        _ = ShowWindow(hwnd, SW_RESTORE);
-                    } else {
-                        _ = ShowWindow(hwnd, SW_MAXIMIZE);
-                    }
+                    // On a tab — send double_click for rename
+                    w.mouse_button_events.push(.{ .button = .left, .action = .double_click, .x = x, .y = y });
                     return 0;
                 }
             }

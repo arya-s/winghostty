@@ -142,6 +142,11 @@ io_thread: ?std.Thread = null,
 
 window_title: [256]u8 = undefined,
 window_title_len: usize = 0,
+
+/// User-set title override. When set, this takes priority over automatic titles.
+/// Set via double-click on tab or keyboard shortcut. Clear by setting len to 0.
+title_override: [256]u8 = undefined,
+title_override_len: usize = 0,
 osc_state: OscParseState = .ground,
 osc_is_title: bool = false,
 osc_num: u8 = 0,
@@ -222,6 +227,7 @@ pub fn init(
 
     // Init OSC state
     surface.window_title_len = 0;
+    surface.title_override_len = 0;
     surface.osc_state = .ground;
     surface.osc_is_title = false;
     surface.osc_num = 0;
@@ -287,11 +293,21 @@ pub fn deinit(self: *Surface, allocator: std.mem.Allocator) void {
 
 /// Get the display title for this surface.
 pub fn getTitle(self: *const Surface) []const u8 {
+    // User override takes highest priority (like Ghostty's title_override)
+    if (self.title_override_len > 0)
+        return self.title_override[0..self.title_override_len];
     if (self.osc7_title_len > 0)
         return self.osc7_title[0..self.osc7_title_len];
     if (self.window_title_len > 0)
         return self.window_title[0..self.window_title_len];
     return "phantty";
+}
+
+/// Set a manual title override. Pass empty slice to clear.
+pub fn setTitleOverride(self: *Surface, title: []const u8) void {
+    const len = @min(title.len, self.title_override.len);
+    @memcpy(self.title_override[0..len], title[0..len]);
+    self.title_override_len = len;
 }
 
 /// Get the current working directory path (from OSC 7), or null if not set.

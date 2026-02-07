@@ -295,6 +295,195 @@ threadlocal var g_scrollbar_dragging: bool = false; // Currently dragging the th
 threadlocal var g_scrollbar_drag_offset: f32 = 0; // Offset within thumb where drag started
 
 // ============================================================================
+// Tab rename — inline editing state
+// ============================================================================
+
+// Per-tab text hit region (synced from renderer for double-click rename)
+threadlocal var g_tab_text_x_start: [MAX_TABS]f32 = .{0} ** MAX_TABS;
+threadlocal var g_tab_text_x_end: [MAX_TABS]f32 = .{0} ** MAX_TABS;
+
+threadlocal var g_tab_rename_active: bool = false;
+threadlocal var g_tab_rename_idx: usize = 0;
+threadlocal var g_tab_rename_buf: [256]u8 = undefined;
+threadlocal var g_tab_rename_len: usize = 0;
+threadlocal var g_tab_rename_cursor: usize = 0; // byte offset cursor position
+threadlocal var g_tab_rename_select_all: bool = false; // entire text is selected
+
+fn startTabRename(tab_idx: usize) void {
+    if (tab_idx >= g_tab_count) return;
+    const tab = g_tabs[tab_idx] orelse return;
+    const title = tab.getTitle();
+    const len = @min(title.len, g_tab_rename_buf.len);
+    @memcpy(g_tab_rename_buf[0..len], title[0..len]);
+    g_tab_rename_len = len;
+    g_tab_rename_cursor = len;
+    g_tab_rename_idx = tab_idx;
+    g_tab_rename_active = true;
+    g_tab_rename_select_all = true;
+}
+
+fn commitTabRename() void {
+    if (!g_tab_rename_active) return;
+    if (g_tab_rename_idx < g_tab_count) {
+        if (g_tabs[g_tab_rename_idx]) |tab| {
+            // Empty name clears the override (reverts to automatic title)
+            tab.surface.setTitleOverride(g_tab_rename_buf[0..g_tab_rename_len]);
+        }
+    }
+    g_tab_rename_active = false;
+}
+
+fn cancelTabRename() void {
+    g_tab_rename_active = false;
+}
+
+fn handleRenameKey(ev: win32_backend.KeyEvent) void {
+    // Reset blink so cursor is visible after any key
+    g_cursor_blink_visible = true;
+    g_last_blink_time = std.time.milliTimestamp();
+
+    if (ev.vk == win32_backend.VK_RETURN) {
+        commitTabRename();
+        return;
+    }
+    if (ev.vk == win32_backend.VK_ESCAPE) {
+        cancelTabRename();
+        return;
+    }
+    if (ev.vk == win32_backend.VK_BACK) {
+        if (g_tab_rename_select_all) {
+            g_tab_rename_len = 0;
+            g_tab_rename_cursor = 0;
+            g_tab_rename_select_all = false;
+            return;
+        }
+        // Delete one UTF-8 codepoint before cursor
+        if (g_tab_rename_cursor > 0) {
+            // Walk back over UTF-8 continuation bytes
+            var i = g_tab_rename_cursor - 1;
+            while (i > 0 and (g_tab_rename_buf[i] & 0xC0) == 0x80) i -= 1;
+            const removed = g_tab_rename_cursor - i;
+            // Shift remaining bytes left
+            const remaining = g_tab_rename_len - g_tab_rename_cursor;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, g_tab_rename_buf[i..], g_tab_rename_buf[g_tab_rename_cursor .. g_tab_rename_cursor + remaining]);
+            }
+            g_tab_rename_len -= removed;
+            g_tab_rename_cursor = i;
+        }
+        return;
+    }
+    if (ev.vk == win32_backend.VK_DELETE) {
+        if (g_tab_rename_select_all) {
+            g_tab_rename_len = 0;
+            g_tab_rename_cursor = 0;
+            g_tab_rename_select_all = false;
+            return;
+        }
+        // Delete one UTF-8 codepoint after cursor
+        if (g_tab_rename_cursor < g_tab_rename_len) {
+            var end = g_tab_rename_cursor + 1;
+            while (end < g_tab_rename_len and (g_tab_rename_buf[end] & 0xC0) == 0x80) end += 1;
+            const removed = end - g_tab_rename_cursor;
+            const remaining = g_tab_rename_len - end;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, g_tab_rename_buf[g_tab_rename_cursor..], g_tab_rename_buf[end .. end + remaining]);
+            }
+            g_tab_rename_len -= removed;
+        }
+        return;
+    }
+    if (ev.vk == win32_backend.VK_LEFT) {
+        g_tab_rename_select_all = false;
+        if (g_tab_rename_cursor > 0) {
+            g_tab_rename_cursor -= 1;
+            while (g_tab_rename_cursor > 0 and (g_tab_rename_buf[g_tab_rename_cursor] & 0xC0) == 0x80)
+                g_tab_rename_cursor -= 1;
+        }
+        return;
+    }
+    if (ev.vk == win32_backend.VK_RIGHT) {
+        g_tab_rename_select_all = false;
+        if (g_tab_rename_cursor < g_tab_rename_len) {
+            g_tab_rename_cursor += 1;
+            while (g_tab_rename_cursor < g_tab_rename_len and (g_tab_rename_buf[g_tab_rename_cursor] & 0xC0) == 0x80)
+                g_tab_rename_cursor += 1;
+        }
+        return;
+    }
+    // Ctrl+A = move to start (like terminal prompt)
+    if (ev.ctrl and ev.vk == 0x41) {
+        g_tab_rename_select_all = false;
+        g_tab_rename_cursor = 0;
+        return;
+    }
+    // Ctrl+E = move to end
+    if (ev.ctrl and ev.vk == 0x45) {
+        g_tab_rename_select_all = false;
+        g_tab_rename_cursor = g_tab_rename_len;
+        return;
+    }
+    // Ctrl+U = delete from cursor to start (forward delete in terminal speak)
+    if (ev.ctrl and ev.vk == 0x55) {
+        if (g_tab_rename_select_all) {
+            g_tab_rename_len = 0;
+            g_tab_rename_cursor = 0;
+            g_tab_rename_select_all = false;
+        } else if (g_tab_rename_cursor > 0) {
+            const remaining = g_tab_rename_len - g_tab_rename_cursor;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, g_tab_rename_buf[0..remaining], g_tab_rename_buf[g_tab_rename_cursor .. g_tab_rename_cursor + remaining]);
+            }
+            g_tab_rename_len = remaining;
+            g_tab_rename_cursor = 0;
+        }
+        return;
+    }
+    // Ctrl+K = delete from cursor to end
+    if (ev.ctrl and ev.vk == 0x4B) {
+        if (g_tab_rename_select_all) {
+            g_tab_rename_len = 0;
+            g_tab_rename_cursor = 0;
+            g_tab_rename_select_all = false;
+        } else {
+            g_tab_rename_len = g_tab_rename_cursor;
+        }
+        return;
+    }
+}
+
+fn handleRenameChar(codepoint: u21) void {
+    // Reset blink so cursor is visible after typing
+    g_cursor_blink_visible = true;
+    g_last_blink_time = std.time.milliTimestamp();
+
+    // Encode codepoint as UTF-8
+    var buf: [4]u8 = undefined;
+    const len = std.unicode.utf8Encode(codepoint, &buf) catch return;
+
+    // If select-all is active, replace entire text
+    if (g_tab_rename_select_all) {
+        if (len > g_tab_rename_buf.len) return;
+        @memcpy(g_tab_rename_buf[0..len], buf[0..len]);
+        g_tab_rename_len = len;
+        g_tab_rename_cursor = len;
+        g_tab_rename_select_all = false;
+        return;
+    }
+
+    if (g_tab_rename_len + len > g_tab_rename_buf.len) return;
+
+    // Make room at cursor
+    if (g_tab_rename_cursor < g_tab_rename_len) {
+        const remaining = g_tab_rename_len - g_tab_rename_cursor;
+        std.mem.copyBackwards(u8, g_tab_rename_buf[g_tab_rename_cursor + len .. g_tab_rename_cursor + len + remaining], g_tab_rename_buf[g_tab_rename_cursor .. g_tab_rename_cursor + remaining]);
+    }
+    @memcpy(g_tab_rename_buf[g_tab_rename_cursor .. g_tab_rename_cursor + len], buf[0..len]);
+    g_tab_rename_len += len;
+    g_tab_rename_cursor += len;
+}
+
+// ============================================================================
 // Tab close button — fade-in on hover per tab
 // ============================================================================
 
@@ -2438,8 +2627,14 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
 
         // Tab title text — rendered at native 14pt via titlebar font (no scaling)
         // Shortcut label (^1 through ^0) rendered right-aligned, only for tabs 1–10 in multi-tab
-        const title = if (g_tabs[tab_idx]) |t| t.getTitle() else "New Tab";
-        if (title.len > 0) {
+        const is_renaming = g_tab_rename_active and tab_idx == g_tab_rename_idx;
+        const title = if (is_renaming)
+            g_tab_rename_buf[0..g_tab_rename_len]
+        else if (g_tabs[tab_idx]) |t|
+            t.getTitle()
+        else
+            "New Tab";
+        if (title.len > 0 or is_renaming) {
             const text_color = if (is_active) text_active else text_inactive;
             const shortcut_color = [3]f32{ 0.45, 0.45, 0.45 };
             const tab_pad: f32 = 12;
@@ -2529,10 +2724,47 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
                     renderBellEmoji(text_x - bell_reserved, text_y, bell_opacity);
                 }
 
+                const text_start_x = text_x;
+
+                // Track byte position to find rename cursor location
+                var rename_cursor_x: f32 = text_x;
+                var byte_pos: usize = 0;
+                var found_cursor = false;
+
                 for (codepoints[0..cp_count]) |cp| {
+                    if (is_renaming and !found_cursor and byte_pos >= g_tab_rename_cursor) {
+                        rename_cursor_x = text_x;
+                        found_cursor = true;
+                    }
                     renderTitlebarChar(cp, text_x, text_y, text_color);
                     text_x += titlebarGlyphAdvance(cp);
+                    byte_pos += std.unicode.utf8CodepointSequenceLength(@truncate(cp)) catch 1;
                 }
+
+                // Render rename selection highlight or cursor
+                if (is_renaming) {
+                    if (g_tab_rename_select_all and text_width > 0) {
+                        // Highlight behind the text — use cursor color
+                        renderQuad(text_start_x, text_y, text_width, g_titlebar_cell_height, g_theme.cursor_color);
+                        // Re-render text on top in contrasting color
+                        const sel_text_color = g_theme.cursor_text orelse g_theme.background;
+                        var sel_x = text_start_x;
+                        for (codepoints[0..cp_count]) |cp| {
+                            renderTitlebarChar(cp, sel_x, text_y, sel_text_color);
+                            sel_x += titlebarGlyphAdvance(cp);
+                        }
+                    } else {
+                        if (!found_cursor) rename_cursor_x = text_x;
+                        // Blink the cursor using the existing blink timer
+                        if (g_cursor_blink_visible) {
+                            renderQuad(rename_cursor_x, text_y, 1.0, g_titlebar_cell_height, text_active);
+                        }
+                    }
+                }
+
+                // Record text bounds for double-click hit testing
+                g_tab_text_x_start[tab_idx] = text_start_x;
+                g_tab_text_x_end[tab_idx] = text_x;
             } else {
                 // Middle truncation
                 const ellipsis_char: u32 = 0x2026;
@@ -2583,6 +2815,10 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
                     renderTitlebarChar(cp, text_x, text_y, text_color);
                     text_x += titlebarGlyphAdvance(cp);
                 }
+
+                // Record text bounds for double-click hit testing
+                g_tab_text_x_start[tab_idx] = text_x_start;
+                g_tab_text_x_end[tab_idx] = text_x;
             }
 
             // Right side: shortcut and close button crossfade in the same position.
@@ -4371,6 +4607,11 @@ const win32_input = struct {
     }
 
     fn handleChar(ev: win32_backend.CharEvent) void {
+        // When tab rename is active, route chars to the rename buffer
+        if (g_tab_rename_active) {
+            handleRenameChar(ev.codepoint);
+            return;
+        }
         if (!isActiveTabTerminal()) return;
         // Skip chars when Alt is held without Ctrl — those are part of Alt+key
         // combos (e.g. Shift+Alt+4) and shouldn't produce text input.
@@ -4391,6 +4632,11 @@ const win32_input = struct {
     }
 
     fn handleKey(ev: win32_backend.KeyEvent) void {
+        // When tab rename is active, handle special keys
+        if (g_tab_rename_active) {
+            handleRenameKey(ev);
+            return;
+        }
         // Ctrl+Shift+C = copy
         if (ev.ctrl and ev.shift and ev.vk == 0x43) { // 'C'
             copySelectionToClipboard();
@@ -4554,6 +4800,41 @@ const win32_input = struct {
     var plus_btn_pressed: bool = false;
 
     fn handleMouseButton(ev: win32_backend.MouseButtonEvent) void {
+        // Double-click on tab text to rename, elsewhere to maximize
+        if (ev.button == .left and ev.action == .double_click) {
+            const xpos: f64 = @floatFromInt(ev.x);
+            const xf: f32 = @floatFromInt(ev.x);
+            const titlebar_h: f64 = if (g_window) |w| @floatFromInt(w.titlebar_height) else 40;
+            const ypos: f64 = @floatFromInt(ev.y);
+            if (ypos < titlebar_h) {
+                if (hitTestTab(xpos)) |tab_idx| {
+                    // Only rename if clicking on the text itself
+                    if (tab_idx < MAX_TABS and xf >= g_tab_text_x_start[tab_idx] and xf <= g_tab_text_x_end[tab_idx]) {
+                        startTabRename(tab_idx);
+                    } else {
+                        // Double-click on tab but not on text — maximize/restore
+                        if (g_window) |w| {
+                            if (win32_backend.IsZoomed(w.hwnd) != 0) {
+                                _ = win32_backend.ShowWindow(w.hwnd, win32_backend.SW_RESTORE);
+                            } else {
+                                _ = win32_backend.ShowWindow(w.hwnd, win32_backend.SW_MAXIMIZE);
+                            }
+                        }
+                    }
+                } else {
+                    // Double-click on empty titlebar area — maximize/restore
+                    if (g_window) |w| {
+                        if (win32_backend.IsZoomed(w.hwnd) != 0) {
+                            _ = win32_backend.ShowWindow(w.hwnd, win32_backend.SW_RESTORE);
+                        } else {
+                            _ = win32_backend.ShowWindow(w.hwnd, win32_backend.SW_MAXIMIZE);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
         // Middle-click on tab to close it
         if (ev.button == .middle and ev.action == .release) {
             const xpos: f64 = @floatFromInt(ev.x);
@@ -4577,6 +4858,9 @@ const win32_input = struct {
             const titlebar_h: f64 = if (g_window) |w| @floatFromInt(w.titlebar_height) else 40;
 
             if (ev.action == .press) {
+                // Commit rename on any click
+                if (g_tab_rename_active) commitTabRename();
+
                 // Check if click is in the titlebar (tab bar area)
                 if (ypos < titlebar_h) {
                     handleTabBarPress(xpos);
@@ -4652,6 +4936,10 @@ const win32_input = struct {
     }
 
     fn handleTabBarPress(xpos: f64) void {
+        // Commit any active rename when clicking in the tab bar
+        if (g_tab_rename_active) {
+            commitTabRename();
+        }
         const win = g_window orelse return;
         const window_width: f64 = blk: {
             var rect: win32_backend.RECT = undefined;
