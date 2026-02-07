@@ -46,6 +46,48 @@ pub const Selection = struct {
 const OscParseState = enum { ground, esc, osc_num, osc_semi, osc_title };
 
 // ============================================================================
+// VT stream handler — wraps ghostty's readonly handler to intercept bell
+// ============================================================================
+
+/// Custom VT stream handler that delegates to the readonly handler but
+/// intercepts the bell action to set a flag on the Surface.
+/// This is necessary because ConPTY consumes BEL characters and the
+/// readonly handler ignores them, so we can't detect bells from raw bytes.
+pub const VtHandler = struct {
+    /// The inner readonly handler type, obtained via Terminal.vtHandler's return type.
+    const InnerHandler = @typeInfo(@TypeOf(ghostty_vt.Terminal.vtHandler)).@"fn".return_type.?;
+
+    inner: InnerHandler,
+    surface: *Surface,
+
+    pub fn init(terminal: *ghostty_vt.Terminal, surface: *Surface) VtHandler {
+        return .{
+            .inner = terminal.vtHandler(),
+            .surface = surface,
+        };
+    }
+
+    pub fn deinit(self: *VtHandler) void {
+        self.inner.deinit();
+    }
+
+    pub fn vt(
+        self: *VtHandler,
+        comptime action: ghostty_vt.StreamAction.Tag,
+        value: ghostty_vt.StreamAction.Value(action),
+    ) !void {
+        if (action == .bell) {
+            self.surface.bell_pending.store(true, .release);
+            return;
+        }
+        try self.inner.vt(action, value);
+    }
+};
+
+/// Our custom stream type using the bell-aware handler.
+pub const VtStream = ghostty_vt.Stream(VtHandler);
+
+// ============================================================================
 // Core state
 // ============================================================================
 
@@ -60,6 +102,27 @@ dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 
 /// Set when the PTY process has exited.
 exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+// ============================================================================
+// Bell state
+// ============================================================================
+
+/// Set by the IO thread when BEL (0x07) is detected in PTY output.
+/// Cleared by the main thread after handling the bell notification.
+bell_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+/// Timestamp of the last bell notification, for rate limiting (100ms like Ghostty).
+last_bell_time: i64 = 0,
+
+/// Bell indicator opacity (0.0 = hidden, 1.0 = fully visible).
+/// Fades in when bell fires, fades out on active tab after hold period.
+bell_opacity: f32 = 0,
+
+/// Whether the bell indicator should be showing (drives the fade target).
+bell_indicator: bool = false,
+
+/// Timestamp (ms) when the bell indicator was activated, for the 1s hold on active tabs.
+bell_indicator_time: i64 = 0,
 
 // ============================================================================
 // Scrollbar state (per-surface, macOS-style overlay with fade)
@@ -91,6 +154,19 @@ got_osc7_this_batch: bool = false,
 // Raw CWD path from OSC 7 (Unix-style, e.g., "/home/user/dir")
 cwd_path: [512]u8 = undefined,
 cwd_path_len: usize = 0,
+
+// ============================================================================
+// VT stream
+// ============================================================================
+
+/// Create a VT stream that processes terminal output and intercepts bell events.
+/// Use this instead of terminal.vtStream() to get bell notifications.
+pub fn vtStream(self: *Surface) VtStream {
+    return VtStream.initAlloc(
+        self.terminal.screens.active.alloc,
+        VtHandler.init(&self.terminal, self),
+    );
+}
 
 // ============================================================================
 // Lifecycle
@@ -153,6 +229,17 @@ pub fn init(
     surface.osc7_title_len = 0;
     surface.got_osc7_this_batch = false;
     surface.cwd_path_len = 0;
+
+    // Init bell state
+    surface.bell_pending = std.atomic.Value(bool).init(false);
+    surface.last_bell_time = 0;
+    surface.bell_opacity = 0;
+    surface.bell_indicator = false;
+    surface.bell_indicator_time = 0;
+
+    // Init scrollbar state
+    surface.scrollbar_opacity = 0;
+    surface.scrollbar_show_time = 0;
 
     // Spawn IO thread — must be last, after all state is initialized.
     // The thread starts reading from the PTY immediately.

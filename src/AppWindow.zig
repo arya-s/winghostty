@@ -456,6 +456,10 @@ fn closeTab(idx: usize) void {
 fn switchTab(idx: usize) void {
     if (idx < g_tab_count) {
         g_active_tab = idx;
+        // Clear bell indicator when switching to this tab (like Ghostty)
+        if (g_tabs[idx]) |tab| {
+            tab.surface.bell_indicator = false;
+        }
         // Clear selection state when switching tabs
         g_selecting = false;
         g_force_rebuild = true;
@@ -712,6 +716,21 @@ const color_fg_fragment_source: [*c]const u8 =
     \\    fragColor = texture(atlas, vTexCoord);
     \\}
 ;
+
+// Simple (non-instanced) color emoji fragment shader for titlebar/overlay use.
+// Uses the same vertex layout as the text shader (vec4: xy=pos, zw=texcoord).
+const simple_color_fragment_source: [*c]const u8 =
+    \\#version 330 core
+    \\in vec2 TexCoords;
+    \\out vec4 color;
+    \\uniform sampler2D text;
+    \\uniform float opacity;
+    \\void main() {
+    \\    vec4 texColor = texture(text, TexCoords);
+    \\    color = texColor * opacity;
+    \\}
+;
+threadlocal var simple_color_shader: c.GLuint = 0;
 threadlocal var cell_width: f32 = 10;
 threadlocal var cell_height: f32 = 20;
 threadlocal var cell_baseline: f32 = 4; // Distance from bottom of cell to baseline
@@ -1084,6 +1103,10 @@ fn initInstancedBuffers() void {
     if (bg_shader == 0) std.debug.print("BG instanced shader failed\n", .{});
     if (fg_shader == 0) std.debug.print("FG instanced shader failed\n", .{});
     if (color_fg_shader == 0) std.debug.print("Color FG instanced shader failed\n", .{});
+
+    // Simple color shader for titlebar emoji (uses same vertex layout as text shader)
+    simple_color_shader = linkProgram(vertex_shader_source, simple_color_fragment_source);
+    if (simple_color_shader == 0) std.debug.print("Simple color shader failed\n", .{});
 }
 
 /// Load a single glyph into the cache
@@ -1968,7 +1991,6 @@ fn loadTitlebarGlyph(codepoint: u32) ?Character {
 
     const glyph = face_to_use.handle.*.glyph;
     const bitmap = glyph.*.bitmap;
-
     const region = packBitmapIntoAtlas(
         &g_titlebar_atlas,
         alloc,
@@ -1993,18 +2015,183 @@ fn loadTitlebarGlyph(codepoint: u32) ?Character {
 }
 
 /// Render a titlebar glyph at 1:1 atlas size (no scaling).
+/// Supports both grayscale (titlebar atlas) and color emoji (color atlas).
 fn renderTitlebarChar(codepoint: u32, x: f32, y: f32, color: [3]f32) void {
     if (codepoint < 32) return;
     const ch: Character = loadTitlebarGlyph(codepoint) orelse return;
     if (ch.region.width == 0 or ch.region.height == 0) return;
 
-    const x0 = x + @as(f32, @floatFromInt(ch.bearing_x));
-    const y0 = y + g_titlebar_baseline - @as(f32, @floatFromInt(ch.size_y - ch.bearing_y));
-    const w = @as(f32, @floatFromInt(ch.size_x));
-    const h = @as(f32, @floatFromInt(ch.size_y));
+    if (ch.is_color) {
+        // Color emoji — scale down to fit titlebar height and render with simple color shader
+        const scale = g_titlebar_cell_height / @as(f32, @floatFromInt(ch.size_y));
+        const w = @as(f32, @floatFromInt(ch.size_x)) * scale;
+        const h = @as(f32, @floatFromInt(ch.size_y)) * scale;
+        const x0 = x;
+        const y0 = y;
 
-    const atlas_size = if (g_titlebar_atlas) |a| @as(f32, @floatFromInt(a.size)) else 512.0;
-    const uv = glyphUV(ch.region, atlas_size);
+        const atlas_size = if (g_color_atlas) |a| @as(f32, @floatFromInt(a.size)) else 512.0;
+        const uv = glyphUV(ch.region, atlas_size);
+
+        const vertices = [6][4]f32{
+            .{ x0, y0 + h, uv.u0, uv.v0 },
+            .{ x0, y0, uv.u0, uv.v1 },
+            .{ x0 + w, y0, uv.u1, uv.v1 },
+            .{ x0, y0 + h, uv.u0, uv.v0 },
+            .{ x0 + w, y0, uv.u1, uv.v1 },
+            .{ x0 + w, y0 + h, uv.u1, uv.v0 },
+        };
+
+        // Use simple color shader (same vertex layout as text shader, but samples RGBA)
+        // Set projection matrix from current viewport (same ortho as text shader)
+        var viewport: [4]c.GLint = undefined;
+        gl.GetIntegerv.?(c.GL_VIEWPORT, &viewport);
+        const vp_w: f32 = @floatFromInt(viewport[2]);
+        const vp_h: f32 = @floatFromInt(viewport[3]);
+        const projection = [16]f32{
+            2.0 / vp_w, 0.0,        0.0,  0.0,
+            0.0,        2.0 / vp_h, 0.0,  0.0,
+            0.0,        0.0,         -1.0, 0.0,
+            -1.0,       -1.0,        0.0,  1.0,
+        };
+        gl.UseProgram.?(simple_color_shader);
+        gl.UniformMatrix4fv.?(gl.GetUniformLocation.?(simple_color_shader, "projection"), 1, c.GL_FALSE, &projection);
+        gl.Uniform1f.?(gl.GetUniformLocation.?(simple_color_shader, "opacity"), 1.0);
+        // Premultiplied alpha blend for color emoji (BGRA bitmaps from FreeType)
+        gl.BlendFunc.?(c.GL_ONE, c.GL_ONE_MINUS_SRC_ALPHA);
+        gl.BindTexture.?(c.GL_TEXTURE_2D, g_color_atlas_texture);
+        gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
+        gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
+        gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
+        gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6); g_draw_call_count += 1;
+        // Restore text shader and standard alpha blend
+        gl.BlendFunc.?(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
+        gl.UseProgram.?(shader_program);
+    } else {
+        // Grayscale glyph — render with text shader from titlebar atlas
+        const x0 = x + @as(f32, @floatFromInt(ch.bearing_x));
+        const y0 = y + g_titlebar_baseline - @as(f32, @floatFromInt(ch.size_y - ch.bearing_y));
+        const w = @as(f32, @floatFromInt(ch.size_x));
+        const h = @as(f32, @floatFromInt(ch.size_y));
+
+        const atlas_size = if (g_titlebar_atlas) |a| @as(f32, @floatFromInt(a.size)) else 512.0;
+        const uv = glyphUV(ch.region, atlas_size);
+
+        const vertices = [6][4]f32{
+            .{ x0, y0 + h, uv.u0, uv.v0 },
+            .{ x0, y0, uv.u0, uv.v1 },
+            .{ x0 + w, y0, uv.u1, uv.v1 },
+            .{ x0, y0 + h, uv.u0, uv.v0 },
+            .{ x0 + w, y0, uv.u1, uv.v1 },
+            .{ x0 + w, y0 + h, uv.u1, uv.v0 },
+        };
+
+        gl.Uniform3f.?(gl.GetUniformLocation.?(shader_program, "textColor"), color[0], color[1], color[2]);
+        gl.BindTexture.?(c.GL_TEXTURE_2D, g_titlebar_atlas_texture);
+        gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
+        gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
+        gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
+        gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6); g_draw_call_count += 1;
+    }
+}
+
+/// Get the advance width of a titlebar glyph.
+fn titlebarGlyphAdvance(codepoint: u32) f32 {
+    if (loadTitlebarGlyph(codepoint)) |g| {
+        const raw_advance = @as(f32, @floatFromInt(g.advance >> 6));
+        if (g.is_color) {
+            // Color emoji: scale advance to match the scaled-down rendering size
+            const scale = g_titlebar_cell_height / @as(f32, @floatFromInt(g.size_y));
+            return raw_advance * scale;
+        }
+        return raw_advance;
+    }
+    return g_titlebar_cell_width;
+}
+
+/// Render the 🔔 bell emoji in the titlebar using the main glyph loader (color emoji path).
+/// This ensures the bell renders as a full-color emoji rather than a small monochrome glyph.
+/// Cached bell emoji glyph (loaded once from color emoji font)
+const BellCache = struct {
+    region: FontAtlas.Region,
+    bmp_w: f32,
+    bmp_h: f32,
+};
+threadlocal var g_bell_cache: ?BellCache = null;
+
+/// Dedicated color emoji face for bell rendering (loaded once)
+threadlocal var g_bell_emoji_face: ?freetype.Face = null;
+
+fn loadBellEmoji() ?BellCache {
+    if (g_bell_cache) |cached| return cached;
+
+    const alloc = g_allocator orelse return null;
+    const ft_lib = g_ft_lib orelse return null;
+    const bell_cp: u32 = 0x1F514;
+
+    // Load a color emoji font face if we haven't yet
+    if (g_bell_emoji_face == null) {
+        const dw = g_font_discovery orelse return null;
+        // Try well-known color emoji fonts
+        const emoji_fonts = [_][]const u8{ "Segoe UI Emoji", "Noto Color Emoji" };
+        for (emoji_fonts) |font_name| {
+            if (dw.findFontFilePath(alloc, font_name, .NORMAL, .NORMAL) catch null) |result| {
+                defer alloc.free(result.path);
+                const emoji_face = ft_lib.initFace(result.path, @intCast(result.face_index)) catch continue;
+                // Set a large size for crisp color emoji bitmaps
+                emoji_face.setCharSize(0, 12 * 64, 96, 96) catch {
+                    emoji_face.deinit();
+                    continue;
+                };
+                if (emoji_face.hasColor()) {
+                    g_bell_emoji_face = emoji_face;
+                    break;
+                }
+                emoji_face.deinit();
+            }
+        }
+    }
+
+    const face = g_bell_emoji_face orelse return null;
+    const glyph_index = face.getCharIndex(bell_cp) orelse return null;
+    if (glyph_index == 0) return null;
+
+    face.loadGlyph(@intCast(glyph_index), .{ .target = .light, .color = true }) catch return null;
+    face.renderGlyph(.light) catch return null;
+
+    const glyph = face.handle.*.glyph;
+    const bitmap = glyph.*.bitmap;
+    if (bitmap.pixel_mode != freetype.c.FT_PIXEL_MODE_BGRA) return null;
+
+    const region = packColorBitmapIntoAtlas(
+        alloc,
+        bitmap.width,
+        bitmap.rows,
+        bitmap.buffer,
+        @intCast(@as(c_uint, @intCast(@abs(bitmap.pitch)))),
+    ) orelse return null;
+
+    g_bell_cache = .{
+        .region = region,
+        .bmp_w = @floatFromInt(bitmap.width),
+        .bmp_h = @floatFromInt(bitmap.rows),
+    };
+    return g_bell_cache;
+}
+
+fn renderBellEmoji(x: f32, y: f32, opacity: f32) void {
+    const bell = loadBellEmoji() orelse {
+        renderTitlebarChar(0x1F514, x, y, .{ 1.0, 0.84, 0.0 });
+        return;
+    };
+
+    const aspect = bell.bmp_w / bell.bmp_h;
+    const h = g_titlebar_cell_height * 0.85;
+    const w = h * aspect;
+    const x0 = x;
+    const y0 = y;
+
+    const atlas_size = if (g_color_atlas) |a| @as(f32, @floatFromInt(a.size)) else 512.0;
+    const uv = glyphUV(bell.region, atlas_size);
 
     const vertices = [6][4]f32{
         .{ x0, y0 + h, uv.u0, uv.v0 },
@@ -2015,20 +2202,32 @@ fn renderTitlebarChar(codepoint: u32, x: f32, y: f32, color: [3]f32) void {
         .{ x0 + w, y0 + h, uv.u1, uv.v0 },
     };
 
-    gl.Uniform3f.?(gl.GetUniformLocation.?(shader_program, "textColor"), color[0], color[1], color[2]);
-    gl.BindTexture.?(c.GL_TEXTURE_2D, g_titlebar_atlas_texture);
+    // Compute projection from current viewport
+    var viewport: [4]c.GLint = undefined;
+    gl.GetIntegerv.?(c.GL_VIEWPORT, &viewport);
+    const vp_w: f32 = @floatFromInt(viewport[2]);
+    const vp_h: f32 = @floatFromInt(viewport[3]);
+    const projection = [16]f32{
+        2.0 / vp_w, 0.0,        0.0,  0.0,
+        0.0,        2.0 / vp_h, 0.0,  0.0,
+        0.0,        0.0,         -1.0, 0.0,
+        -1.0,       -1.0,        0.0,  1.0,
+    };
+
+    // Render with simple color shader (premultiplied alpha + opacity fade)
+    gl.UseProgram.?(simple_color_shader);
+    gl.UniformMatrix4fv.?(gl.GetUniformLocation.?(simple_color_shader, "projection"), 1, c.GL_FALSE, &projection);
+    gl.Uniform1f.?(gl.GetUniformLocation.?(simple_color_shader, "opacity"), opacity);
+    gl.BlendFunc.?(c.GL_ONE, c.GL_ONE_MINUS_SRC_ALPHA);
+    gl.BindTexture.?(c.GL_TEXTURE_2D, g_color_atlas_texture);
     gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
     gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
     gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
     gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6); g_draw_call_count += 1;
-}
 
-/// Get the advance width of a titlebar glyph.
-fn titlebarGlyphAdvance(codepoint: u32) f32 {
-    if (loadTitlebarGlyph(codepoint)) |g| {
-        return @as(f32, @floatFromInt(g.advance >> 6));
-    }
-    return g_titlebar_cell_width;
+    // Restore text shader and standard blend
+    gl.BlendFunc.?(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
+    gl.UseProgram.?(shader_program);
 }
 
 /// Render an icon glyph centered within a button rect, using the icon atlas.
@@ -2197,6 +2396,26 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
             g_tab_close_opacity[tab_idx] = 0;
         }
 
+        // Animate bell indicator opacity
+        if (g_tabs[tab_idx]) |tab| {
+            const surface = tab.surface;
+            if (surface.bell_indicator) {
+                // Fade in
+                surface.bell_opacity = @min(1.0, surface.bell_opacity + TAB_CLOSE_FADE_SPEED * dt);
+
+                // On active tab: after 1s hold, start fading out and clear indicator
+                if (is_active and surface.bell_opacity >= 1.0) {
+                    const elapsed = now_ms - surface.bell_indicator_time;
+                    if (elapsed >= 1000) {
+                        surface.bell_indicator = false;
+                    }
+                }
+            } else {
+                // Fade out
+                surface.bell_opacity = @max(0.0, surface.bell_opacity - TAB_CLOSE_FADE_SPEED * dt);
+            }
+        }
+
         // Inactive tabs: slightly lighter bg with 1px darker inset border
         // Active tab: no border, same as terminal bg (merges with content)
         if (!is_active) {
@@ -2221,7 +2440,7 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
         if (title.len > 0) {
             const text_color = if (is_active) text_active else text_inactive;
             const shortcut_color = [3]f32{ 0.45, 0.45, 0.45 };
-            const tab_pad: f32 = 18;
+            const tab_pad: f32 = 12;
 
             // Shortcut label: "^1" through "^9", "^0" for tab 10
             const has_shortcut = num_tabs > 1 and tab_idx < 10;
@@ -2248,6 +2467,18 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
             var codepoints: [256]u32 = undefined;
             var cp_count: usize = 0;
             var text_width: f32 = 0;
+
+            // Bell indicator opacity (rendered independently of text layout)
+            const bell_opacity: f32 = if (g_tabs[tab_idx]) |t| t.surface.bell_opacity else 0;
+            const has_bell = bell_opacity > 0.01;
+            const bell_emoji_width: f32 = if (has_bell) blk: {
+                if (loadBellEmoji()) |bell| {
+                    const aspect = bell.bmp_w / bell.bmp_h;
+                    break :blk g_titlebar_cell_height * 0.85 * aspect;
+                }
+                break :blk titlebarGlyphAdvance(0x1F514);
+            } else 0;
+
             {
                 const view = std.unicode.Utf8View.initUnchecked(title);
                 var it = view.iterator();
@@ -2261,10 +2492,41 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
 
             const text_y = tb_top + (titlebar_h - g_titlebar_cell_height) / 2;
 
-            if (text_width <= avail_w) {
-                // Fits — center it
-                const text_area = center_region - shortcut_reserved;
-                var text_x = center_offset + (text_area - text_width) / 2;
+            // Left edge the bell must not cross (same padding as close button side)
+            const left_edge = center_offset + tab_pad;
+            const bell_gap: f32 = 4;
+
+            // Compute how much space the bell needs from the left of the text
+            const bell_reserved: f32 = if (has_bell) bell_emoji_width + bell_gap else 0;
+
+            // Check if text + bell would overflow: center the text, see if bell fits
+            const text_area = center_region - shortcut_reserved;
+            const ideal_text_x = center_offset + (text_area - @min(text_width, avail_w)) / 2;
+            const bell_would_be_at = ideal_text_x - bell_reserved;
+            const bell_overflows = has_bell and bell_would_be_at < left_edge;
+
+            // If bell overflows, shrink available text width to make room
+            const effective_avail_w = if (bell_overflows)
+                avail_w - bell_reserved
+            else
+                avail_w;
+
+            if (text_width <= effective_avail_w) {
+                // Fits — center text (accounting for bell space if needed)
+                var text_x: f32 = undefined;
+                if (bell_overflows) {
+                    // Bell at left edge, text right after it
+                    const remaining_area = center_region - shortcut_reserved - bell_reserved - tab_pad;
+                    text_x = left_edge + bell_reserved + (remaining_area - text_width) / 2;
+                } else {
+                    text_x = ideal_text_x;
+                }
+
+                // Render bell emoji just to the left of the text
+                if (has_bell) {
+                    renderBellEmoji(text_x - bell_reserved, text_y, bell_opacity);
+                }
+
                 for (codepoints[0..cp_count]) |cp| {
                     renderTitlebarChar(cp, text_x, text_y, text_color);
                     text_x += titlebarGlyphAdvance(cp);
@@ -2273,7 +2535,7 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
                 // Middle truncation
                 const ellipsis_char: u32 = 0x2026;
                 const ellipsis_w = titlebarGlyphAdvance(ellipsis_char);
-                const text_budget = avail_w - ellipsis_w;
+                const text_budget = effective_avail_w - ellipsis_w;
                 const half_budget = text_budget / 2;
 
                 // Measure codepoints from start
@@ -2298,7 +2560,17 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
                     end_start = j;
                 }
 
-                var text_x = center_offset + tab_pad;
+                const text_x_start = if (bell_overflows)
+                    left_edge + bell_reserved
+                else
+                    left_edge;
+
+                // Render bell emoji
+                if (has_bell) {
+                    renderBellEmoji(text_x_start - bell_reserved, text_y, bell_opacity);
+                }
+
+                var text_x = text_x_start;
                 for (codepoints[0..start_end]) |cp| {
                     renderTitlebarChar(cp, text_x, text_y, text_color);
                     text_x += titlebarGlyphAdvance(cp);
@@ -3883,6 +4155,9 @@ fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void
         if (glyph_face) |old| old.deinit();
         clearGlyphCache(allocator);
         clearFallbackFaces(allocator);
+        g_bell_cache = null;
+        if (g_bell_emoji_face) |f| f.deinit();
+        g_bell_emoji_face = null;
 
         g_font_size = new_font_size;
         preloadCharacters(new_face);
@@ -3935,6 +4210,22 @@ fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void
 fn resetCursorBlink() void {
     g_cursor_blink_visible = true;
     g_last_blink_time = std.time.milliTimestamp();
+}
+
+/// Handle a bell notification from the terminal.
+/// Rate-limited to once per 100ms (matching Ghostty).
+fn handleBell(surface: *Surface, win: *win32_backend.Window, is_active_tab: bool) void {
+    _ = is_active_tab;
+    const now = std.time.milliTimestamp();
+    if (now - surface.last_bell_time < 100) return;
+    surface.last_bell_time = now;
+
+    // Activate bell indicator (shown on both active and background tabs)
+    surface.bell_indicator = true;
+    surface.bell_indicator_time = now;
+
+    win.playBell();
+    win.flashTaskbar();
 }
 
 // ============================================================================
@@ -5089,6 +5380,15 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
         if (g_color_atlas != null) syncAtlasTexture(&g_color_atlas, &g_color_atlas_texture, &g_color_atlas_modified);
         if (g_icon_atlas != null) syncAtlasTexture(&g_icon_atlas, &g_icon_atlas_texture, &g_icon_atlas_modified);
         if (g_titlebar_atlas != null) syncAtlasTexture(&g_titlebar_atlas, &g_titlebar_atlas_texture, &g_titlebar_atlas_modified);
+
+        // Check all tabs for pending bell notifications (set by IO thread)
+        for (0..g_tab_count) |ti| {
+            if (g_tabs[ti]) |tab| {
+                if (tab.surface.bell_pending.swap(false, .acquire)) {
+                    handleBell(tab.surface, win, ti == g_active_tab);
+                }
+            }
+        }
 
         if (activeSurface()) |surface| {
             // Hold terminal mutex only for snapshot

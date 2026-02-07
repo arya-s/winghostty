@@ -56,7 +56,7 @@ pub fn threadMain(surface: *Surface) void {
 
             surface.resetOscBatch();
 
-            var stream = surface.terminal.vtStream();
+            var stream = surface.vtStream();
 
             // Process the first chunk.
             const data = buf[0..bytes_read];
