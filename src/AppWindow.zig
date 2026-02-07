@@ -308,6 +308,8 @@ threadlocal var g_tab_rename_buf: [256]u8 = undefined;
 threadlocal var g_tab_rename_len: usize = 0;
 threadlocal var g_tab_rename_cursor: usize = 0; // byte offset cursor position
 threadlocal var g_tab_rename_select_all: bool = false; // entire text is selected
+threadlocal var g_tab_rename_orig_buf: [256]u8 = undefined; // original title at rename start
+threadlocal var g_tab_rename_orig_len: usize = 0;
 
 fn startTabRename(tab_idx: usize) void {
     if (tab_idx >= g_tab_count) return;
@@ -317,6 +319,9 @@ fn startTabRename(tab_idx: usize) void {
     @memcpy(g_tab_rename_buf[0..len], title[0..len]);
     g_tab_rename_len = len;
     g_tab_rename_cursor = len;
+    // Save original title for comparison on commit
+    @memcpy(g_tab_rename_orig_buf[0..len], title[0..len]);
+    g_tab_rename_orig_len = len;
     g_tab_rename_idx = tab_idx;
     g_tab_rename_active = true;
     g_tab_rename_select_all = true;
@@ -326,8 +331,13 @@ fn commitTabRename() void {
     if (!g_tab_rename_active) return;
     if (g_tab_rename_idx < g_tab_count) {
         if (g_tabs[g_tab_rename_idx]) |tab| {
-            // Empty name clears the override (reverts to automatic title)
-            tab.surface.setTitleOverride(g_tab_rename_buf[0..g_tab_rename_len]);
+            // Only set override if the title was actually changed
+            const changed = g_tab_rename_len != g_tab_rename_orig_len or
+                !std.mem.eql(u8, g_tab_rename_buf[0..g_tab_rename_len], g_tab_rename_orig_buf[0..g_tab_rename_orig_len]);
+            if (changed) {
+                // Empty name clears the override (reverts to automatic title)
+                tab.surface.setTitleOverride(g_tab_rename_buf[0..g_tab_rename_len]);
+            }
         }
     }
     g_tab_rename_active = false;
