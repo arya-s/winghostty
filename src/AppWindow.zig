@@ -605,11 +605,13 @@ threadlocal var g_snap_cols: usize = 0;
 threadlocal var g_cells_valid: bool = false; // true if bg_cells/fg_cells have valid data from a previous rebuild
 threadlocal var g_force_rebuild: bool = true; // set on resize, scroll, selection, theme change
 threadlocal var g_last_cursor_blink_visible: bool = true; // track cursor blink transitions
+
 // Cached cursor state for lock-free rendering (used when tryLock fails)
 threadlocal var g_cached_cursor_x: usize = 0;
 threadlocal var g_cached_cursor_y: usize = 0;
 threadlocal var g_cached_cursor_style: CursorStyle = .block;
 threadlocal var g_cached_cursor_effective: ?CursorStyle = .block;
+threadlocal var g_cached_cursor_visible: bool = true;
 threadlocal var g_cached_viewport_at_bottom: bool = true;
 
 threadlocal var g_last_viewport_active: bool = true; // track viewport position changes (scroll)
@@ -3062,24 +3064,18 @@ fn rebuildCells() void {
 
             var fg_color = sc.fg;
 
-            if (is_cursor) {
+            if (is_cursor and g_cached_cursor_visible) {
+                // Block cursor: invert fg for text under cursor (bg drawn by overlay)
                 if (g_cached_cursor_effective) |effective_style| {
-                    switch (effective_style) {
-                        .block => {
-                            if (bg_cell_count < MAX_CELLS) {
-                                bg_cells[bg_cell_count] = .{ .grid_col = col_f, .grid_row = row_f, .r = g_theme.cursor_color[0], .g = g_theme.cursor_color[1], .b = g_theme.cursor_color[2] };
-                                bg_cell_count += 1;
-                            }
-                            fg_color = g_theme.cursor_text orelse g_theme.background;
-                        },
-                        else => {
-                            if (sc.bg) |bg| {
-                                if (bg_cell_count < MAX_CELLS) {
-                                    bg_cells[bg_cell_count] = .{ .grid_col = col_f, .grid_row = row_f, .r = bg[0], .g = bg[1], .b = bg[2] };
-                                    bg_cell_count += 1;
-                                }
-                            }
-                        },
+                    if (effective_style == .block) {
+                        fg_color = g_theme.cursor_text orelse g_theme.background;
+                    }
+                }
+                // Draw cell background normally (cursor shape drawn by overlay)
+                if (sc.bg) |bg| {
+                    if (bg_cell_count < MAX_CELLS) {
+                        bg_cells[bg_cell_count] = .{ .grid_col = col_f, .grid_row = row_f, .r = bg[0], .g = bg[1], .b = bg[2] };
+                        bg_cell_count += 1;
                     }
                 }
             } else if (is_selected) {
@@ -3251,6 +3247,8 @@ fn updateTerminalCells(terminal: *ghostty_vt.Terminal) bool {
         if (terminal.rows != g_last_rows or terminal.cols != g_last_cols) break :blk true;
         if (selection_active != g_last_selection_active) break :blk true;
         if (g_selecting) break :blk true;
+        // Cursor position changed — need to rebuild so cursor bg is at the right cell
+        if (screen.cursor.x != g_cached_cursor_x or screen.cursor.y != g_cached_cursor_y) break :blk true;
         // Viewport pin changed — scroll happened (matches Ghostty's RenderState viewport_pin comparison)
         if (@as(?*anyopaque, viewport_pin.node) != g_last_viewport_node or
             viewport_pin.y != g_last_viewport_y) break :blk true;
@@ -3277,6 +3275,7 @@ fn updateTerminalCells(terminal: *ghostty_vt.Terminal) bool {
     g_cached_cursor_x = screen.cursor.x;
     g_cached_cursor_y = screen.cursor.y;
     g_cached_viewport_at_bottom = screen.pages.viewport == .active;
+    g_cached_cursor_visible = terminal.modes.get(.cursor_visible);
     const tcs: TerminalCursorStyle = switch (screen.cursor.cursor_style) {
         .bar => .bar,
         .block => .block,
@@ -3375,7 +3374,7 @@ fn drawCells(window_height: f32, offset_x: f32, offset_y: f32) void {
     }
 
     // --- Cursor overlay from cached state ---
-    if (g_cached_viewport_at_bottom) {
+    if (g_cached_viewport_at_bottom and g_cached_cursor_visible) {
         const effective = if (!window_focused)
             CursorStyle.block_hollow
         else if (g_cursor_blink and !g_cursor_blink_visible)
@@ -3406,7 +3405,7 @@ fn drawCells(window_height: f32, offset_x: f32, offset_y: f32) void {
                         g_theme.background,
                     );
                 },
-                .block => {},
+                .block => renderQuad(px, py, cell_width, cell_height, cursor_color),
             }
         }
     }
