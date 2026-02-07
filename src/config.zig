@@ -922,6 +922,8 @@ const default_config_template =
     \\# Cursor
     \\# cursor-style = block
     \\# cursor-style-blink = true
+    \\# cursor-color = #ffffff
+    \\# cursor-text = #000000
     \\
     \\# Theme (name or file path)
     \\# theme =
@@ -929,8 +931,6 @@ const default_config_template =
     \\# Color overrides (override theme colors)
     \\# background = #282c34
     \\# foreground = #ffffff
-    \\# cursor-color = #ffffff
-    \\# cursor-text = #000000
     \\# selection-background = #ffffff
     \\# selection-foreground = #282c34
     \\# palette = 0=#1d1f21
