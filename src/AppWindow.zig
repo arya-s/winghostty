@@ -309,6 +309,25 @@ threadlocal var g_scrollbar_dragging: bool = false; // Currently dragging the th
 threadlocal var g_scrollbar_drag_offset: f32 = 0; // Offset within thumb where drag started
 
 // ============================================================================
+// Resize overlay — shows terminal size during resize (like Ghostty)
+// ============================================================================
+
+const RESIZE_OVERLAY_DURATION_MS: i64 = 750; // How long to show after resize stops
+const RESIZE_OVERLAY_FADE_MS: i64 = 150; // Fade out duration
+const RESIZE_OVERLAY_FIRST_DELAY_MS: i64 = 500; // Delay before first overlay shows
+
+// Global resize overlay state
+threadlocal var g_resize_overlay_visible: bool = false; // Whether overlay should be showing
+threadlocal var g_resize_overlay_last_change: i64 = 0; // When size last changed
+threadlocal var g_resize_overlay_cols: u16 = 0; // Current cols being displayed
+threadlocal var g_resize_overlay_rows: u16 = 0; // Current rows being displayed
+threadlocal var g_resize_overlay_last_cols: u16 = 0; // Last "settled" cols (after timeout)
+threadlocal var g_resize_overlay_last_rows: u16 = 0; // Last "settled" rows (after timeout)
+threadlocal var g_resize_overlay_ready: bool = false; // Set after initial delay
+threadlocal var g_resize_overlay_init_time: i64 = 0; // When window was created
+threadlocal var g_resize_overlay_opacity: f32 = 0; // For fade out animation
+
+// ============================================================================
 // Tab rename — inline editing state
 // ============================================================================
 
@@ -672,6 +691,8 @@ fn computeSplitLayout(
 
         if (resized) {
             g_force_rebuild = true;
+            // Show resize overlay with new dimensions
+            resizeOverlayShow(surface.size.grid.cols, surface.size.grid.rows);
         }
 
         g_split_rects[count] = .{
@@ -4752,6 +4773,160 @@ fn renderScrollbar(window_width: f32, window_height: f32, top_padding: f32) void
     renderScrollbarForSurface(surface, window_width, window_height, top_padding);
 }
 
+// ============================================================================
+// Resize overlay — shows "cols × rows" during terminal resize
+// ============================================================================
+
+/// Trigger the resize overlay to show with the given dimensions.
+/// Called whenever the terminal size changes.
+fn resizeOverlayShow(cols: u16, rows: u16) void {
+    const now = std.time.milliTimestamp();
+
+    // Check if we're past the initial delay (avoid showing during initial window setup)
+    if (!g_resize_overlay_ready) {
+        if (g_resize_overlay_init_time == 0) {
+            g_resize_overlay_init_time = now;
+        }
+        if (now - g_resize_overlay_init_time < RESIZE_OVERLAY_FIRST_DELAY_MS) {
+            // Still in initial delay - update last_cols/rows so we don't flash when ready
+            g_resize_overlay_last_cols = cols;
+            g_resize_overlay_last_rows = rows;
+            return;
+        }
+        g_resize_overlay_ready = true;
+    }
+
+    // Update current size and reset timer
+    g_resize_overlay_cols = cols;
+    g_resize_overlay_rows = rows;
+    g_resize_overlay_last_change = now;
+
+    // Show overlay if size differs from last settled size
+    if (cols != g_resize_overlay_last_cols or rows != g_resize_overlay_last_rows) {
+        g_resize_overlay_visible = true;
+        g_resize_overlay_opacity = 1.0;
+    }
+}
+
+/// Update resize overlay state. Call once per frame.
+/// Handles the timeout logic and fade animation.
+fn resizeOverlayUpdate() void {
+    if (!g_resize_overlay_visible and g_resize_overlay_opacity <= 0) return;
+
+    const now = std.time.milliTimestamp();
+    const elapsed = now - g_resize_overlay_last_change;
+
+    if (g_resize_overlay_visible) {
+        // Check if we should start hiding (size hasn't changed for DURATION_MS)
+        if (elapsed >= RESIZE_OVERLAY_DURATION_MS) {
+            // Timer completed - "settle" the size and start fade out
+            g_resize_overlay_last_cols = g_resize_overlay_cols;
+            g_resize_overlay_last_rows = g_resize_overlay_rows;
+            g_resize_overlay_visible = false;
+            // opacity stays at current value, will fade in next block
+        }
+    }
+
+    // Handle fade out when not visible
+    if (!g_resize_overlay_visible and g_resize_overlay_opacity > 0) {
+        const fade_start = g_resize_overlay_last_change + RESIZE_OVERLAY_DURATION_MS;
+        const fade_elapsed = now - fade_start;
+        if (fade_elapsed >= RESIZE_OVERLAY_FADE_MS) {
+            g_resize_overlay_opacity = 0;
+        } else if (fade_elapsed > 0) {
+            g_resize_overlay_opacity = 1.0 - @as(f32, @floatFromInt(fade_elapsed)) / @as(f32, @floatFromInt(RESIZE_OVERLAY_FADE_MS));
+        }
+    }
+}
+
+/// Render a rounded rectangle with the given color and alpha.
+/// Uses multiple quads to approximate rounded corners.
+fn renderRoundedQuadAlpha(x: f32, y: f32, w: f32, h: f32, radius: f32, color: [3]f32, alpha: f32) void {
+    const r = @min(radius, @min(w, h) / 2); // Clamp radius to half of smallest dimension
+
+    // Main body (center rectangle, full height minus corners)
+    renderQuadAlpha(x + r, y, w - r * 2, h, color, alpha);
+
+    // Left strip (between corners)
+    renderQuadAlpha(x, y + r, r, h - r * 2, color, alpha);
+
+    // Right strip (between corners)
+    renderQuadAlpha(x + w - r, y + r, r, h - r * 2, color, alpha);
+
+    // Approximate corners with small quads (simple 2-step approximation)
+    // Bottom-left corner
+    const r2 = r * 0.7; // Inner radius approximation
+    renderQuadAlpha(x + r - r2, y + r - r2, r2, r2, color, alpha);
+    renderQuadAlpha(x, y + r - r2, r - r2, r2, color, alpha);
+    renderQuadAlpha(x + r - r2, y, r2, r - r2, color, alpha);
+
+    // Bottom-right corner
+    renderQuadAlpha(x + w - r, y + r - r2, r2, r2, color, alpha);
+    renderQuadAlpha(x + w - r + r2, y + r - r2, r - r2, r2, color, alpha);
+    renderQuadAlpha(x + w - r, y, r2, r - r2, color, alpha);
+
+    // Top-left corner
+    renderQuadAlpha(x + r - r2, y + h - r, r2, r2, color, alpha);
+    renderQuadAlpha(x, y + h - r, r - r2, r2, color, alpha);
+    renderQuadAlpha(x + r - r2, y + h - r + r2, r2, r - r2, color, alpha);
+
+    // Top-right corner
+    renderQuadAlpha(x + w - r, y + h - r, r2, r2, color, alpha);
+    renderQuadAlpha(x + w - r + r2, y + h - r, r - r2, r2, color, alpha);
+    renderQuadAlpha(x + w - r, y + h - r + r2, r2, r - r2, color, alpha);
+}
+
+/// Render the resize overlay centered on screen.
+fn renderResizeOverlay(window_width: f32, window_height: f32) void {
+    resizeOverlayUpdate();
+    if (g_resize_overlay_opacity <= 0.01) return;
+
+    // Format the size string: "cols x rows"
+    var buf: [32]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "{d} x {d}", .{ g_resize_overlay_cols, g_resize_overlay_rows }) catch return;
+
+    // Measure text width using titlebar glyph system
+    var text_width: f32 = 0;
+    for (text) |ch| {
+        text_width += titlebarGlyphAdvance(@intCast(ch));
+    }
+    const text_height = g_titlebar_cell_height;
+
+    // Padding around text (compact)
+    const pad_x: f32 = 10;
+    const pad_y: f32 = 6;
+
+    // Box dimensions
+    const box_width = text_width + pad_x * 2;
+    const box_height = text_height + pad_y * 2;
+
+    // Center on screen (in GL coords, y=0 is bottom)
+    const box_x = (window_width - box_width) / 2;
+    const box_y = (window_height - box_height) / 2;
+
+    const alpha = g_resize_overlay_opacity;
+
+    // Enable blending
+    gl.Enable.?(c.GL_BLEND);
+    gl.BlendFunc.?(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
+
+    gl.UseProgram.?(shader_program);
+    gl.BindVertexArray.?(vao);
+
+    // Draw rounded background box (same style as scrollbar track: black with low alpha)
+    const corner_radius: f32 = 6;
+    renderRoundedQuadAlpha(box_x, box_y, box_width, box_height, corner_radius, .{ 0.0, 0.0, 0.0 }, alpha * 0.45);
+
+    // Draw text using titlebar rendering system (dimmed gray text)
+    var x = box_x + pad_x;
+    const y = box_y + pad_y;
+    const text_gray: f32 = 0.6; // Dimmed gray
+    for (text) |ch| {
+        renderTitlebarChar(@intCast(ch), x, y, .{ text_gray, text_gray, text_gray });
+        x += titlebarGlyphAdvance(@intCast(ch));
+    }
+}
+
 /// Check if a point (in client pixel coords, origin top-left) is over the scrollbar.
 fn scrollbarHitTest(xpos: f64, ypos: f64, window_width: f32, window_height: f32, top_padding: f32) bool {
     const bar_right = window_width;
@@ -4995,6 +5170,9 @@ fn onWin32Resize(width: i32, height: i32) void {
         // Clear any pending coalesced resize — we're handling it now
         g_pending_resize = false;
 
+        // Show resize overlay with new dimensions
+        resizeOverlayShow(new_cols, new_rows);
+
         for (0..g_tab_count) |ti| {
             if (g_tabs[ti]) |tab| {
                 // Resize all surfaces in this tab's split tree
@@ -5033,6 +5211,7 @@ fn onWin32Resize(width: i32, height: i32) void {
         renderTitlebar(@floatFromInt(width), @floatFromInt(height), tb);
         drawCells(@floatFromInt(height), padding, padding + tb);
         renderScrollbar(@floatFromInt(width), @floatFromInt(height), padding + tb);
+        renderResizeOverlay(@floatFromInt(width), @floatFromInt(height));
         renderDebugOverlay(@floatFromInt(width));
     } else {
         gl.Viewport.?(0, 0, width, height);
@@ -6523,6 +6702,16 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
                     renderTitlebar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
                     drawCells(@floatFromInt(fb_height), @floatFromInt(pad.left), pad_top);
                     renderScrollbar(@floatFromInt(fb_width), @floatFromInt(fb_height), pad_top);
+
+                    // Render resize overlay centered in content area
+                    // Set viewport to content area for proper centering
+                    const content_height_f = @as(f32, @floatFromInt(fb_height)) - titlebar_offset;
+                    gl.Viewport.?(0, 0, fb_width, @intFromFloat(content_height_f));
+                    setProjection(@floatFromInt(fb_width), content_height_f);
+                    renderResizeOverlay(@floatFromInt(fb_width), content_height_f);
+                    // Restore full viewport
+                    gl.Viewport.?(0, 0, fb_width, fb_height);
+                    setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
                 }
             } else {
                 // Multiple splits: render with scissor/viewport per surface
@@ -6567,6 +6756,11 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
                         // Draw unfocused overlay if not focused
                         if (!is_focused) {
                             renderUnfocusedOverlaySimple(@floatFromInt(rect.width), @floatFromInt(rect.height));
+                        }
+
+                        // Render resize overlay centered in the focused split
+                        if (is_focused) {
+                            renderResizeOverlay(@floatFromInt(rect.width), @floatFromInt(rect.height));
                         }
                     }
 
