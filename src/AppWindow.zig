@@ -582,6 +582,20 @@ const SPLIT_DIVIDER_WIDTH: i32 = 2;
 /// This is the minimum padding applied to all surfaces.
 const DEFAULT_PADDING: u32 = 10;
 
+/// Find the surface under a given point (window coordinates).
+/// Returns null if no surface is found at that position.
+fn surfaceAtPoint(x: i32, y: i32) ?*Surface {
+    for (0..g_split_rect_count) |i| {
+        const rect = g_split_rects[i];
+        if (x >= rect.x and x < rect.x + rect.width and
+            y >= rect.y and y < rect.y + rect.height)
+        {
+            return rect.surface;
+        }
+    }
+    return null;
+}
+
 /// Compute split layout for a tab, returning pixel rects for each surface.
 /// Each surface is resized to fit its allocated area with proper padding.
 /// Returns the number of surfaces (0 if tree is empty).
@@ -4624,24 +4638,23 @@ fn updateFps() void {
 // Scrollbar — macOS-style overlay with fade
 // ============================================================================
 
-/// Compute scrollbar geometry from terminal state.
-/// Returns null if there's no scrollback (nothing to scroll).
-fn scrollbarGeometry(window_height: f32, top_padding: f32) ?struct {
+/// Scrollbar geometry result.
+const ScrollbarGeometry = struct {
     track_x: f32,
     track_y: f32, // bottom of track (GL coords, y=0 is bottom)
     track_h: f32,
     thumb_y: f32,
     thumb_h: f32,
-} {
-    const surface = activeSurface() orelse return null;
+};
+
+/// Compute scrollbar geometry for a specific surface.
+/// Returns null if there's no scrollback (nothing to scroll).
+fn scrollbarGeometryForSurface(surface: *Surface, view_height: f32, top_padding: f32) ?ScrollbarGeometry {
     const sb = surface.terminal.screens.active.pages.scrollbar();
     if (sb.total <= sb.len) return null; // No scrollback, no scrollbar
 
-    const track_x = window_height; // We'll compute from window width — passed separately
-    _ = track_x;
-
-    // Track spans the terminal content area (below titlebar, all the way to bottom)
-    const track_top = window_height - top_padding; // top of terminal area in GL coords
+    // Track spans the terminal content area (below top padding, all the way to bottom)
+    const track_top = view_height - top_padding; // top of terminal area in GL coords
     const track_bottom: f32 = 0; // extend to bottom edge
     const track_h = track_top - track_bottom;
     if (track_h <= 0) return null;
@@ -4661,12 +4674,19 @@ fn scrollbarGeometry(window_height: f32, top_padding: f32) ?struct {
     const thumb_y = thumb_top - thumb_h;
 
     return .{
-        .track_x = 0, // placeholder — caller provides window_width
+        .track_x = 0, // placeholder — caller provides view_width
         .track_y = track_bottom,
         .track_h = track_h,
         .thumb_y = thumb_y,
         .thumb_h = thumb_h,
     };
+}
+
+/// Compute scrollbar geometry from terminal state (uses active surface).
+/// Returns null if there's no scrollback (nothing to scroll).
+fn scrollbarGeometry(window_height: f32, top_padding: f32) ?ScrollbarGeometry {
+    const surface = activeSurface() orelse return null;
+    return scrollbarGeometryForSurface(surface, window_height, top_padding);
 }
 
 /// Show the scrollbar on the active surface (reset fade timer).
@@ -4699,15 +4719,16 @@ fn scrollbarUpdateFade(surface: *Surface) void {
     }
 }
 
-/// Render the scrollbar overlay.
-fn renderScrollbar(window_width: f32, window_height: f32, top_padding: f32) void {
-    const surface = activeSurface() orelse return;
+/// Render the scrollbar overlay for a specific surface within the current viewport.
+/// view_width/view_height are the viewport dimensions (not full window).
+/// top_padding is the padding from the top of the viewport to the terminal content.
+fn renderScrollbarForSurface(surface: *Surface, view_width: f32, view_height: f32, top_padding: f32) void {
     scrollbarUpdateFade(surface);
     if (surface.scrollbar_opacity <= 0.01) return;
 
-    const geo = scrollbarGeometry(window_height, top_padding) orelse return;
+    const geo = scrollbarGeometryForSurface(surface, view_height, top_padding) orelse return;
 
-    const bar_x = window_width - SCROLLBAR_WIDTH;
+    const bar_x = view_width - SCROLLBAR_WIDTH;
     const bar_w = SCROLLBAR_WIDTH;
 
     // Use the shader_program for quad rendering
@@ -4723,6 +4744,12 @@ fn renderScrollbar(window_width: f32, window_height: f32, top_padding: f32) void
     // Thumb: black at 45% opacity
     const thumb_alpha = fade * 0.45;
     renderQuadAlpha(bar_x, geo.thumb_y, bar_w, geo.thumb_h, .{ 0, 0, 0 }, thumb_alpha);
+}
+
+/// Render the scrollbar overlay (uses active surface at full window size).
+fn renderScrollbar(window_width: f32, window_height: f32, top_padding: f32) void {
+    const surface = activeSurface() orelse return;
+    renderScrollbarForSurface(surface, window_width, window_height, top_padding);
 }
 
 /// Check if a point (in client pixel coords, origin top-left) is over the scrollbar.
@@ -5845,15 +5872,20 @@ const win32_input = struct {
     }
 
     fn handleMouseWheel(ev: win32_backend.MouseWheelEvent) void {
-        if (activeSurface()) |surface| {
-            surface.render_state.mutex.lock();
-            defer surface.render_state.mutex.unlock();
-            // WHEEL_DELTA is 120 per notch. Convert to lines (3 lines per notch, like GLFW).
-            const notches = @as(f64, @floatFromInt(ev.delta)) / 120.0;
-            const delta: isize = @intFromFloat(-notches * 3);
-            surface.terminal.scrollViewport(.{ .delta = delta }) catch {};
-        }
-        scrollbarShow();
+        // Scroll the surface under the mouse cursor (like Ghostty), not the focused surface.
+        // Fall back to focused surface if mouse is not over any split.
+        const surface = surfaceAtPoint(ev.xpos, ev.ypos) orelse activeSurface() orelse return;
+
+        surface.render_state.mutex.lock();
+        defer surface.render_state.mutex.unlock();
+        // WHEEL_DELTA is 120 per notch. Convert to lines (3 lines per notch, like GLFW).
+        const notches = @as(f64, @floatFromInt(ev.delta)) / 120.0;
+        const delta: isize = @intFromFloat(-notches * 3);
+        surface.terminal.scrollViewport(.{ .delta = delta }) catch {};
+
+        // Show scrollbar for the scrolled surface
+        surface.scrollbar_opacity = 1.0;
+        surface.scrollbar_show_time = std.time.milliTimestamp();
     }
 
     // --- Clipboard (Win32 native) ---
@@ -6529,6 +6561,9 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
                         const pad = rect.surface.getPadding();
                         drawCells(@floatFromInt(rect.height), @floatFromInt(pad.left), @floatFromInt(pad.top));
 
+                        // Render scrollbar for this surface within its viewport
+                        renderScrollbarForSurface(rect.surface, @floatFromInt(rect.width), @floatFromInt(rect.height), @floatFromInt(pad.top));
+
                         // Draw unfocused overlay if not focused
                         if (!is_focused) {
                             renderUnfocusedOverlaySimple(@floatFromInt(rect.width), @floatFromInt(rect.height));
@@ -6542,9 +6577,6 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
                     // Draw split dividers
                     renderSplitDividers(tab, content_x, content_y, content_w, content_h, @floatFromInt(fb_height));
                 }
-
-                // Render scrollbar for focused surface only
-                renderScrollbar(@floatFromInt(fb_width), @floatFromInt(fb_height), top_padding);
             }
         } else if (!g_post_enabled) {
             gl.Viewport.?(0, 0, fb_width, fb_height);
