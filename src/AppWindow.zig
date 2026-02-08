@@ -659,6 +659,8 @@ fn computeSplitLayout(
 
         // Inset for dividers (only if not at edge)
         const half_div = @divTrunc(SPLIT_DIVIDER_WIDTH, 2);
+        const at_left_edge = slot.x < 0.001;
+        const at_right_edge = slot.x + slot.width >= 0.999;
         if (slot.x > 0.001) {
             px += half_div;
             pw -= half_div;
@@ -674,14 +676,27 @@ fn computeSplitLayout(
             ph -= half_div;
         }
 
+        // Extend splits at left edge to window edge (consistent left margin)
+        if (at_left_edge) {
+            px -= @intCast(DEFAULT_PADDING);
+            pw += @intCast(DEFAULT_PADDING);
+        }
+
+        // Extend splits at right edge to window edge (so scrollbar hugs window edge)
+        if (at_right_edge) {
+            pw += @intCast(DEFAULT_PADDING);
+        }
+
         // Set the surface screen size with padding.
         // The surface computes grid size and balanced padding internally.
+        // Right padding must account for scrollbar width plus gap.
         const surface = entry.surface;
+        const scrollbar_padding: u32 = @intFromFloat(SCROLLBAR_WIDTH + DEFAULT_PADDING);
         const explicit_padding = renderer.size.Padding{
             .top = DEFAULT_PADDING,
             .bottom = DEFAULT_PADDING,
             .left = DEFAULT_PADDING,
-            .right = DEFAULT_PADDING,
+            .right = scrollbar_padding,
         };
 
         const resized = surface.setScreenSize(
