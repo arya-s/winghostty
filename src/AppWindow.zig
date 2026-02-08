@@ -992,11 +992,14 @@ fn splitFocused(direction: SplitTree.Split.Direction) void {
     // Scroll new surface to bottom to ensure prompt is visible
     new_surface.terminal.scrollViewport(.{ .bottom = {} }) catch {};
 
+    // Mark the new surface's render state as dirty to ensure we pick up initial content
+    new_surface.dirty.store(true, .release);
+
     // Trigger resize for all surfaces in the tree to recalculate dimensions
     g_force_rebuild = true;
     g_cells_valid = false;
 
-    std.debug.print("Split created, new focused handle: {}, tree nodes: {}\n", .{ @intFromEnum(new_handle), tab.tree.nodes.len });
+    std.debug.print("Split created: initial size {}x{}, handle: {}, tree nodes: {}\n", .{ split_cols, split_rows, @intFromEnum(new_handle), tab.tree.nodes.len });
 }
 
 /// Close the focused split. If it's the last surface in the tab, close the tab instead.
@@ -3933,11 +3936,23 @@ fn cursorEffectiveStyle(terminal_style: TerminalCursorStyle, terminal_blink: boo
 /// Flag indicating if the surface being rendered is the focused split
 threadlocal var g_split_is_focused: bool = true;
 
+/// Current surface being rendered (for per-surface selection)
+threadlocal var g_current_render_surface: ?*Surface = null;
+
 /// Update terminal cells for a specific surface in a split tree.
 /// is_focused controls cursor appearance (unfocused shows block_hollow).
 fn updateTerminalCellsForSurface(terminal: *ghostty_vt.Terminal, is_focused: bool) bool {
     g_split_is_focused = is_focused;
     return updateTerminalCells(terminal);
+}
+
+/// Get the selection for the current surface being rendered.
+/// Returns the focused surface's selection if no surface is set.
+fn currentRenderSelection() *Selection {
+    if (g_current_render_surface) |surface| {
+        return &surface.selection;
+    }
+    return activeSelection();
 }
 
 /// Update terminal cell buffers from terminal state. Must be called with
@@ -5447,16 +5462,17 @@ fn mouseToCell(xpos: f64, ypos: f64) struct { col: usize, row: usize } {
 // `col` and `row` are screen-relative (viewport) coordinates.
 // Selection rows are stored as absolute scrollback positions.
 fn isCellSelected(col: usize, row: usize) bool {
-    if (!activeSelection().active) return false;
+    const selection = currentRenderSelection();
+    if (!selection.active) return false;
 
     // Convert screen row to absolute
     const vp_off = viewportOffset();
     const abs_row = vp_off + row;
 
-    var start_row = activeSelection().start_row;
-    var start_col = activeSelection().start_col;
-    var end_row = activeSelection().end_row;
-    var end_col = activeSelection().end_col;
+    var start_row = selection.start_row;
+    var start_col = selection.start_col;
+    var end_row = selection.end_row;
+    var end_col = selection.end_col;
 
     // Normalize
     if (start_row > end_row or (start_row == end_row and start_col > end_col)) {
@@ -5871,13 +5887,27 @@ const win32_input = struct {
                     return;
                 }
 
+                // Find which surface was clicked and focus it
+                const clicked_surface = surfaceAtPoint(@intFromFloat(xpos), @intFromFloat(ypos)) orelse activeSurface() orelse return;
+                
+                // Focus the clicked split if different from current focus
+                if (activeTab()) |tab| {
+                    for (0..g_split_rect_count) |i| {
+                        if (g_split_rects[i].surface == clicked_surface) {
+                            tab.focused = g_split_rects[i].handle;
+                            break;
+                        }
+                    }
+                }
+
                 const cell_pos = mouseToCell(xpos, ypos);
                 const abs_row = viewportOffset() + cell_pos.row;
-                activeSelection().start_col = cell_pos.col;
-                activeSelection().start_row = abs_row;
-                activeSelection().end_col = cell_pos.col;
-                activeSelection().end_row = abs_row;
-                activeSelection().active = false;
+                // Start selection on the clicked surface
+                clicked_surface.selection.start_col = cell_pos.col;
+                clicked_surface.selection.start_row = abs_row;
+                clicked_surface.selection.end_col = cell_pos.col;
+                clicked_surface.selection.end_row = abs_row;
+                clicked_surface.selection.active = false;
                 g_selecting = true;
                 g_click_x = xpos;
                 g_click_y = ypos;
@@ -6714,6 +6744,7 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
                         surface.render_state.mutex.lock();
                         defer surface.render_state.mutex.unlock();
                         updateCursorBlink();
+                        g_current_render_surface = surface;
                         needs_rebuild = updateTerminalCells(&surface.terminal);
                     }
                     if (needs_rebuild) rebuildCells();
@@ -6728,6 +6759,7 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
                         surface.render_state.mutex.lock();
                         defer surface.render_state.mutex.unlock();
                         updateCursorBlink();
+                        g_current_render_surface = surface;
                         needs_rebuild = updateTerminalCells(&surface.terminal);
                     }
                     if (needs_rebuild) rebuildCells();
@@ -6776,6 +6808,7 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
                             defer rect.surface.render_state.mutex.unlock();
                             if (is_focused) updateCursorBlink();
                             g_force_rebuild = true;
+                            g_current_render_surface = rect.surface;
                             _ = updateTerminalCellsForSurface(&rect.surface.terminal, is_focused);
                         }
                         rebuildCells();
