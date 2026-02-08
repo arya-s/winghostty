@@ -578,7 +578,12 @@ threadlocal var g_split_rect_count: usize = 0;
 /// Divider width in pixels between split panes
 const SPLIT_DIVIDER_WIDTH: i32 = 2;
 
+/// Default padding for terminal content (pixels).
+/// This is the minimum padding applied to all surfaces.
+const DEFAULT_PADDING: u32 = 10;
+
 /// Compute split layout for a tab, returning pixel rects for each surface.
+/// Each surface is resized to fit its allocated area with proper padding.
 /// Returns the number of surfaces (0 if tree is empty).
 fn computeSplitLayout(
     tab: *const TabState,
@@ -632,18 +637,37 @@ fn computeSplitLayout(
             ph -= half_div;
         }
 
-        // Compute terminal dimensions from pixel size
-        const cols: u16 = if (pw > 0 and cw > 0) @intFromFloat(@max(1, @as(f32, @floatFromInt(pw)) / cw)) else 1;
-        const rows: u16 = if (ph > 0 and ch > 0) @intFromFloat(@max(1, @as(f32, @floatFromInt(ph)) / ch)) else 1;
+        // Set the surface screen size with padding.
+        // The surface computes grid size and balanced padding internally.
+        const surface = entry.surface;
+        const explicit_padding = renderer.size.Padding{
+            .top = DEFAULT_PADDING,
+            .bottom = DEFAULT_PADDING,
+            .left = DEFAULT_PADDING,
+            .right = DEFAULT_PADDING,
+        };
+
+        const resized = surface.setScreenSize(
+            allocator,
+            if (pw > 0) @intCast(pw) else 1,
+            if (ph > 0) @intCast(ph) else 1,
+            cw,
+            ch,
+            explicit_padding,
+        );
+
+        if (resized) {
+            g_force_rebuild = true;
+        }
 
         g_split_rects[count] = .{
             .x = px,
             .y = py,
             .width = pw,
             .height = ph,
-            .cols = cols,
-            .rows = rows,
-            .surface = entry.surface,
+            .cols = surface.size.grid.cols,
+            .rows = surface.size.grid.rows,
+            .surface = surface,
             .handle = entry.handle,
         };
         count += 1;
@@ -848,11 +872,22 @@ fn splitFocused(direction: SplitTree.Split.Direction) void {
         }
     }
 
-    // Create new surface for the split
+    // Compute approximate dimensions for the new split surface.
+    // For a 50/50 split, the new surface gets half the space.
+    // We need reasonable initial dimensions so the PTY/shell starts correctly.
+    const split_cols: u16 = switch (direction) {
+        .left, .right => @max(10, term_cols / 2),
+        .up, .down => term_cols,
+    };
+    const split_rows: u16 = switch (direction) {
+        .left, .right => term_rows,
+        .up, .down => @max(5, term_rows / 2),
+    };
+
     const new_surface = Surface.init(
         allocator,
-        term_cols,
-        term_rows,
+        split_cols,
+        split_rows,
         getShellCmd(),
         g_scrollback_limit,
         g_cursor_style,
@@ -6434,6 +6469,7 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
                 }
             } else if (split_count == 1) {
                 // Single surface (no splits): use original simple rendering path
+                // The surface padding is set by computeSplitLayout, so we use it here
                 if (activeSurface()) |surface| {
                     var needs_rebuild: bool = false;
                     {
@@ -6449,9 +6485,12 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
                     gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
                     gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
 
+                    // Use surface's computed padding (includes titlebar offset from content_y)
+                    const pad = surface.getPadding();
+                    const pad_top = @as(f32, @floatFromInt(pad.top)) + titlebar_offset;
                     renderTitlebar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
-                    drawCells(@floatFromInt(fb_height), padding, top_padding);
-                    renderScrollbar(@floatFromInt(fb_width), @floatFromInt(fb_height), top_padding);
+                    drawCells(@floatFromInt(fb_height), @floatFromInt(pad.left), pad_top);
+                    renderScrollbar(@floatFromInt(fb_width), @floatFromInt(fb_height), pad_top);
                 }
             } else {
                 // Multiple splits: render with scissor/viewport per surface
@@ -6486,9 +6525,9 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
                         }
                         rebuildCells();
 
-                        // Draw cells - viewport handles positioning, so offset is 0
-                        // window_height is the viewport height (rect.height)
-                        drawCells(@floatFromInt(rect.height), 0, 0);
+                        // Draw cells using the surface's computed padding
+                        const pad = rect.surface.getPadding();
+                        drawCells(@floatFromInt(rect.height), @floatFromInt(pad.left), @floatFromInt(pad.top));
 
                         // Draw unfocused overlay if not focused
                         if (!is_focused) {

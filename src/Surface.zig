@@ -98,6 +98,10 @@ pty: Pty,
 selection: Selection,
 render_state: renderer.State,
 
+/// Size information for this surface (screen size, cell size, padding).
+/// Used by the renderer to position content correctly.
+size: renderer.size.Size = .{},
+
 // ============================================================================
 // Per-surface renderer (Ghostty architecture)
 // ============================================================================
@@ -339,6 +343,83 @@ pub fn unref(self: *Surface, allocator: std.mem.Allocator) void {
     if (self.ref_count == 0) {
         self.deinit(allocator);
     }
+}
+
+// ============================================================================
+// Size and Resize
+// ============================================================================
+
+/// Update the surface size and resize the terminal/PTY if needed.
+/// This is called by the split layout computation to set each surface
+/// to its correct dimensions based on the split geometry.
+///
+/// Parameters:
+/// - allocator: Used for terminal resize operations
+/// - screen_width: Total pixel width available for this surface
+/// - screen_height: Total pixel height available for this surface  
+/// - cell_width: Width of a single cell in pixels
+/// - cell_height: Height of a single cell in pixels
+/// - explicit_padding: Minimum padding to apply (from config)
+///
+/// Returns true if the terminal was resized.
+pub fn setScreenSize(
+    self: *Surface,
+    allocator: std.mem.Allocator,
+    screen_width: u32,
+    screen_height: u32,
+    cell_width: f32,
+    cell_height: f32,
+    explicit_padding: renderer.size.Padding,
+) bool {
+    // Update screen size
+    self.size.screen.width = screen_width;
+    self.size.screen.height = screen_height;
+    self.size.cell.width = cell_width;
+    self.size.cell.height = cell_height;
+
+    // Store explicit padding (used for rendering offset)
+    self.size.padding = explicit_padding;
+
+    // Update screen and cell info
+    self.size.screen.width = screen_width;
+    self.size.screen.height = screen_height;
+    self.size.cell.width = cell_width;
+    self.size.cell.height = cell_height;
+
+    // Compute grid size from available space (screen minus padding)
+    const avail_width = screen_width -| explicit_padding.left -| explicit_padding.right;
+    const avail_height = screen_height -| explicit_padding.top -| explicit_padding.bottom;
+
+    const new_cols: u16 = if (avail_width > 0 and cell_width > 0)
+        @intFromFloat(@max(1, @as(f32, @floatFromInt(avail_width)) / cell_width))
+    else
+        1;
+    const new_rows: u16 = if (avail_height > 0 and cell_height > 0)
+        @intFromFloat(@max(1, @as(f32, @floatFromInt(avail_height)) / cell_height))
+    else
+        1;
+
+    self.size.grid.cols = new_cols;
+    self.size.grid.rows = new_rows;
+
+    // Resize terminal if dimensions changed
+    if (self.terminal.cols != new_cols or self.terminal.rows != new_rows) {
+        self.render_state.mutex.lock();
+        defer self.render_state.mutex.unlock();
+
+        self.terminal.resize(allocator, new_cols, new_rows) catch {};
+        self.terminal.scrollViewport(.{ .bottom = {} }) catch {};
+        self.pty.resize(new_cols, new_rows);
+        return true;
+    }
+
+    return false;
+}
+
+/// Get the padding for rendering. Returns the computed padding
+/// which includes both explicit padding and balanced centering.
+pub fn getPadding(self: *const Surface) renderer.size.Padding {
+    return self.size.padding;
 }
 
 // ============================================================================
