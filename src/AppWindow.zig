@@ -327,6 +327,10 @@ threadlocal var g_resize_overlay_ready: bool = false; // Set after initial delay
 threadlocal var g_resize_overlay_init_time: i64 = 0; // When window was created
 threadlocal var g_resize_overlay_opacity: f32 = 0; // For fade out animation
 
+// Resize active state (for cursor hiding) - separate from overlay visibility
+const RESIZE_ACTIVE_TIMEOUT_MS: i64 = 50; // Consider resize "done" after this many ms of no changes
+threadlocal var g_resize_active: bool = false; // True while actively resizing
+
 // ============================================================================
 // Tab rename — inline editing state
 // ============================================================================
@@ -3889,6 +3893,8 @@ fn rebuildCells() void {
 /// Determine effective cursor style (factoring in blink, focus, and split focus).
 /// Returns null during blink-off phase (cursor hidden).
 fn cursorEffectiveStyle(terminal_style: TerminalCursorStyle, terminal_blink: bool) ?CursorStyle {
+    // Hide cursor during active resize to avoid flicker artifacts
+    if (g_resize_active) return null;
     // Unfocused window or tab rename: show hollow block
     if (!window_focused or g_tab_rename_active) return .block_hollow;
     // Unfocused split: show hollow block (no blinking)
@@ -4782,6 +4788,10 @@ fn renderScrollbar(window_width: f32, window_height: f32, top_padding: f32) void
 fn resizeOverlayShow(cols: u16, rows: u16) void {
     const now = std.time.milliTimestamp();
 
+    // Mark resize as active (for cursor hiding)
+    g_resize_active = true;
+    g_resize_overlay_last_change = now;
+
     // Check if we're past the initial delay (avoid showing during initial window setup)
     if (!g_resize_overlay_ready) {
         if (g_resize_overlay_init_time == 0) {
@@ -4796,10 +4806,9 @@ fn resizeOverlayShow(cols: u16, rows: u16) void {
         g_resize_overlay_ready = true;
     }
 
-    // Update current size and reset timer
+    // Update current size
     g_resize_overlay_cols = cols;
     g_resize_overlay_rows = rows;
-    g_resize_overlay_last_change = now;
 
     // Show overlay if size differs from last settled size
     if (cols != g_resize_overlay_last_cols or rows != g_resize_overlay_last_rows) {
@@ -4811,10 +4820,15 @@ fn resizeOverlayShow(cols: u16, rows: u16) void {
 /// Update resize overlay state. Call once per frame.
 /// Handles the timeout logic and fade animation.
 fn resizeOverlayUpdate() void {
-    if (!g_resize_overlay_visible and g_resize_overlay_opacity <= 0) return;
-
     const now = std.time.milliTimestamp();
     const elapsed = now - g_resize_overlay_last_change;
+
+    // Update resize active state (short timeout for cursor to reappear)
+    if (g_resize_active and elapsed >= RESIZE_ACTIVE_TIMEOUT_MS) {
+        g_resize_active = false;
+    }
+
+    if (!g_resize_overlay_visible and g_resize_overlay_opacity <= 0) return;
 
     if (g_resize_overlay_visible) {
         // Check if we should start hiding (size hasn't changed for DURATION_MS)
@@ -4878,6 +4892,11 @@ fn renderRoundedQuadAlpha(x: f32, y: f32, w: f32, h: f32, radius: f32, color: [3
 
 /// Render the resize overlay centered on screen.
 fn renderResizeOverlay(window_width: f32, window_height: f32) void {
+    renderResizeOverlayWithOffset(window_width, window_height, 0);
+}
+
+/// Render the resize overlay centered in the content area (below titlebar).
+fn renderResizeOverlayWithOffset(window_width: f32, window_height: f32, top_offset: f32) void {
     resizeOverlayUpdate();
     if (g_resize_overlay_opacity <= 0.01) return;
 
@@ -4900,9 +4919,10 @@ fn renderResizeOverlay(window_width: f32, window_height: f32) void {
     const box_width = text_width + pad_x * 2;
     const box_height = text_height + pad_y * 2;
 
-    // Center on screen (in GL coords, y=0 is bottom)
+    // Center horizontally, center vertically in content area (below top_offset)
+    const content_height = window_height - top_offset;
     const box_x = (window_width - box_width) / 2;
-    const box_y = (window_height - box_height) / 2;
+    const box_y = (content_height - box_height) / 2; // Centered in content area (GL coords)
 
     const alpha = g_resize_overlay_opacity;
 
@@ -4913,9 +4933,9 @@ fn renderResizeOverlay(window_width: f32, window_height: f32) void {
     gl.UseProgram.?(shader_program);
     gl.BindVertexArray.?(vao);
 
-    // Draw rounded background box (same style as scrollbar track: black with low alpha)
+    // Draw rounded background box (black with alpha, slightly more transparent than scrollbar)
     const corner_radius: f32 = 6;
-    renderRoundedQuadAlpha(box_x, box_y, box_width, box_height, corner_radius, .{ 0.0, 0.0, 0.0 }, alpha * 0.45);
+    renderRoundedQuadAlpha(box_x, box_y, box_width, box_height, corner_radius, .{ 0.0, 0.0, 0.0 }, alpha * 0.35);
 
     // Draw text using titlebar rendering system (dimmed gray text)
     var x = box_x + pad_x;
@@ -6703,15 +6723,8 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
                     drawCells(@floatFromInt(fb_height), @floatFromInt(pad.left), pad_top);
                     renderScrollbar(@floatFromInt(fb_width), @floatFromInt(fb_height), pad_top);
 
-                    // Render resize overlay centered in content area
-                    // Set viewport to content area for proper centering
-                    const content_height_f = @as(f32, @floatFromInt(fb_height)) - titlebar_offset;
-                    gl.Viewport.?(0, 0, fb_width, @intFromFloat(content_height_f));
-                    setProjection(@floatFromInt(fb_width), content_height_f);
-                    renderResizeOverlay(@floatFromInt(fb_width), content_height_f);
-                    // Restore full viewport
-                    gl.Viewport.?(0, 0, fb_width, fb_height);
-                    setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
+                    // Render resize overlay centered in content area (offset for titlebar)
+                    renderResizeOverlayWithOffset(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
                 }
             } else {
                 // Multiple splits: render with scissor/viewport per surface
