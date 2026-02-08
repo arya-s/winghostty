@@ -986,6 +986,12 @@ fn splitFocused(direction: SplitTree.Split.Direction) void {
     // Focus the new surface
     tab.focused = new_handle;
 
+    // Clear resize state to ensure cursor shows and layout is fresh
+    g_resize_active = false;
+
+    // Scroll new surface to bottom to ensure prompt is visible
+    new_surface.terminal.scrollViewport(.{ .bottom = {} }) catch {};
+
     // Trigger resize for all surfaces in the tree to recalculate dimensions
     g_force_rebuild = true;
     g_cells_valid = false;
